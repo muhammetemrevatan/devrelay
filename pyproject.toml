@@ -125,6 +125,16 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "Worker state adapter cannot depend on control integrations or entry points"
+type = "forbidden"
+source_modules = ["devrelay.infrastructure.worker_state"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.worker", "devrelay.bootstrap", "devrelay.config",
+    "devrelay.infrastructure.persistence", "devrelay.infrastructure.jira", "devrelay.infrastructure.github",
+    "sqlalchemy", "alembic", "psycopg", "httpx", "httpx2",
+]
+
+[[tool.importlinter.contracts]]
 name = "GitHub observer reaches persistence only through application ports"
 type = "forbidden"
 source_modules = ["devrelay.infrastructure.github"]
