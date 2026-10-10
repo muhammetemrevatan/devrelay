@@ -19,7 +19,9 @@ cannot create another unresolved delivery for that task/repository.
 A read-only GitHub observer verifies configured repository IDs and target commits,
 and reconciles open pull requests with stored Job/task branch associations.
 Its transport is fixture-tested; no live account connection is implied.
-Live account validation, the Job submission HTTP API, worker dispatch, agent execution, PR publication and
+An optional Job submission API uses a separate operator token and explicit
+repository scope to record queued Jobs. It is disabled by default.
+Live account validation, worker dispatch, agent execution, PR publication and
 deployment automation are not implemented yet.
 
 ## Planned workflow
@@ -144,6 +146,52 @@ tunnel. Keep the server/firewall access restrictions when deploying; a bearer
 token does not encrypt traffic. The control CLI disables URL access logging so
 accidentally supplied query credentials are not written by that logger. Tokens
 in query parameters, cookies or request bodies are never accepted.
+
+## Authenticated Job submission
+
+Configure `DEVRELAY_CONTROL_JOB_SUBMISSION__AUTH_TOKEN`, `ACTOR_ID`, and
+`ALLOWED_REPOSITORY_IDS`, plus complete Jira, database, GitHub observation and
+repository policy settings. The allowed UUIDs must refer to enabled policies.
+Generate a new token using the local command above; do not reuse the import,
+Jira, GitHub or database credential. The actor and repository permissions are
+server-owned settings, not request fields. Rotate/revoke the token through
+configuration and restart. This initial credential has no automatic expiry or
+multi-user account management and must not be given to a coding agent.
+
+```http
+POST /api/v1/jobs
+Authorization: Bearer <submission-token>
+Content-Type: application/json
+
+{"snapshot_id":"<imported-snapshot-uuid>","repository_id":"<allowed-repository-uuid>"}
+```
+
+Only the two UUID fields are accepted. The control service resolves the stored
+snapshot, checks caller/repository scope and current Jira requirements/readiness,
+then verifies the configured GitHub repository, target head and open task PRs.
+Branches, checks, policy, actor and base revision cannot be supplied by the client.
+
+A new durable queued Job returns 201. An authorized exact replay returns 200
+and the original Job without new provider reads. The response contains `job_id`,
+`source_task_id`, `snapshot_id`, `repository_id`, `status` and `created`.
+Both paths use `Cache-Control: no-store`. Missing/wrong credentials return 401,
+disallowed scope 403, and a missing snapshot 404. Changed requirements, missing
+readiness or conflicting deliveries return 409; provider/storage failures return
+502/503. Input rejection and unexpected failures use the same sanitized error
+envelope as task import.
+
+Bodies must be uncompressed JSON and at most 1 KiB, including chunked bodies.
+Authentication precedes body reads; reads have a default five-second deadline.
+At most four submissions per process are admitted by default (configurable from
+one to four); excess requests receive 503 with `Retry-After`. Import and submission
+have separate admission limits and share one bounded control database pool.
+Use HTTPS or a protected loopback tunnel and preserve network access restrictions.
+
+The route is absent unless submission authentication is explicitly configured.
+Startup opens configured resources without provider reads, schema migration or
+database readiness checks. Submission records queued definitions only. Worker
+authentication, durable GitHub numeric binding, fresh pre-execution reconciliation,
+dispatch and execution remain later steps.
 
 ## GitHub observation
 

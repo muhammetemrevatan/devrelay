@@ -6,7 +6,23 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict
 from starlette.responses import JSONResponse
 
-from devrelay.application.ports.task_persistence import TaskPersistenceError
+from devrelay.application.jobs import (
+    JobSubmissionConflict,
+    JobSubmissionRejected,
+    TaskNotReady,
+    TaskRequirementsChanged,
+)
+from devrelay.application.ports.job_persistence import JobPersistenceError
+from devrelay.application.ports.repository_source import (
+    InvalidRepositorySourceData,
+    RepositorySourceAccessDenied,
+    RepositorySourceError,
+    RepositorySourceUnavailable,
+)
+from devrelay.application.ports.task_persistence import (
+    TaskPersistenceError,
+    TaskSnapshotNotFound,
+)
 from devrelay.application.ports.task_source import (
     InvalidTaskSourceData,
     TaskNotFound,
@@ -33,6 +49,16 @@ class ApiErrorCode(StrEnum):
     INVALID_SOURCE = "invalid_source_data"
     STORAGE_UNAVAILABLE = "storage_unavailable"
     INTERNAL_ERROR = "internal_error"
+    SUBMISSION_UNAVAILABLE = "submission_unavailable"
+    SUBMISSION_BUSY = "submission_busy"
+    SUBMISSION_REJECTED = "submission_rejected"
+    SUBMISSION_CONFLICT = "submission_conflict"
+    TASK_NOT_READY = "task_not_ready"
+    TASK_REQUIREMENTS_CHANGED = "task_requirements_changed"
+    REPOSITORY_ACCESS_DENIED = "repository_access_denied"
+    REPOSITORY_UNAVAILABLE = "repository_unavailable"
+    INVALID_REPOSITORY_DATA = "invalid_repository_data"
+    SNAPSHOT_NOT_FOUND = "snapshot_not_found"
 
 
 class ApiErrorDetail(BaseModel):
@@ -48,46 +74,50 @@ class ApiErrorResponse(BaseModel):
     detail: ApiErrorDetail
 
 
-class UnsupportedImportMedia(Exception):
-    """The import body is not uncompressed JSON."""
+class UnsupportedRequestMedia(Exception):
+    """The request body is not uncompressed JSON."""
 
 
-class ImportBodyTooLarge(Exception):
-    """The import body exceeds the configured size bound."""
+class RequestBodyTooLarge(Exception):
+    """The request body exceeds the configured size bound."""
 
 
-class ImportBodyTimeout(Exception):
-    """The import body did not arrive before its read deadline."""
+class RequestBodyTimeout(Exception):
+    """The request body did not arrive before its read deadline."""
 
 
-class ImportBodyInterrupted(Exception):
-    """The client disconnected while the import body was being read."""
+class RequestBodyInterrupted(Exception):
+    """The client disconnected while the request body was being read."""
 
 
 class InvalidImportRequest(Exception):
     """The bounded import body does not satisfy its request schema."""
 
 
+class InvalidSubmissionRequest(Exception):
+    """The bounded submission body does not satisfy its request schema."""
+
+
 _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
-    UnsupportedImportMedia: (
+    UnsupportedRequestMedia: (
         415,
         ApiErrorCode.UNSUPPORTED_MEDIA,
         "Uncompressed application/json is required.",
     ),
-    ImportBodyTooLarge: (
+    RequestBodyTooLarge: (
         413,
         ApiErrorCode.BODY_TOO_LARGE,
-        "Import request exceeds the size limit.",
+        "Request exceeds the size limit.",
     ),
-    ImportBodyTimeout: (
+    RequestBodyTimeout: (
         408,
         ApiErrorCode.BODY_TIMEOUT,
-        "Import request body timed out.",
+        "Request body timed out.",
     ),
-    ImportBodyInterrupted: (
+    RequestBodyInterrupted: (
         400,
         ApiErrorCode.INVALID_REQUEST,
-        "Import request was interrupted.",
+        "Request was interrupted.",
     ),
     InvalidImportRequest: (
         422,
@@ -129,6 +159,61 @@ _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
         503,
         ApiErrorCode.STORAGE_UNAVAILABLE,
         "Task storage is unavailable.",
+    ),
+    InvalidSubmissionRequest: (
+        422,
+        ApiErrorCode.INVALID_REQUEST,
+        "Provide only valid snapshot_id and repository_id values.",
+    ),
+    JobSubmissionRejected: (
+        403,
+        ApiErrorCode.SUBMISSION_REJECTED,
+        "Job submission is outside the allowed scope.",
+    ),
+    JobSubmissionConflict: (
+        409,
+        ApiErrorCode.SUBMISSION_CONFLICT,
+        "Job submission conflicts with an existing delivery.",
+    ),
+    TaskNotReady: (
+        409,
+        ApiErrorCode.TASK_NOT_READY,
+        "Task is not ready for submission.",
+    ),
+    TaskRequirementsChanged: (
+        409,
+        ApiErrorCode.TASK_REQUIREMENTS_CHANGED,
+        "Task requirements changed; import them again.",
+    ),
+    RepositorySourceAccessDenied: (
+        502,
+        ApiErrorCode.REPOSITORY_ACCESS_DENIED,
+        "Repository access failed.",
+    ),
+    RepositorySourceUnavailable: (
+        503,
+        ApiErrorCode.REPOSITORY_UNAVAILABLE,
+        "Repository observation is unavailable.",
+    ),
+    InvalidRepositorySourceData: (
+        502,
+        ApiErrorCode.INVALID_REPOSITORY_DATA,
+        "Repository observation could not be verified.",
+    ),
+    RepositorySourceError: (
+        502,
+        ApiErrorCode.INVALID_REPOSITORY_DATA,
+        "Repository observation failed.",
+    ),
+    JobPersistenceError: (
+        503,
+        ApiErrorCode.STORAGE_UNAVAILABLE,
+        "Job storage is unavailable.",
+    ),
+    TaskSnapshotNotFound: (
+        404,
+        ApiErrorCode.SNAPSHOT_NOT_FOUND,
+        "Task snapshot was not found.",
     ),
 }
 

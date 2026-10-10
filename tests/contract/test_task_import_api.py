@@ -231,7 +231,7 @@ def test_invalid_input_is_not_reflected_or_imported(payload: dict[str, object]) 
             "application/json",
             413,
             "body_too_large",
-            "Import request exceeds the size limit.",
+            "Request exceeds the size limit.",
         ),
         (
             b"x",
