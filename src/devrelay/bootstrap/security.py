@@ -5,6 +5,7 @@ from secrets import compare_digest
 
 from pydantic import SecretStr
 
+from devrelay.application.contracts.claims import InvalidLeaseProof, LeaseProof
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.config.worker_authentication import WorkerRegistrationSettings
 
@@ -16,6 +17,27 @@ def token_verifier(token: SecretStr) -> Callable[[str], bool]:
         return compare_digest(expected, sha256(presented.encode("utf-8")).digest())
 
     return verify
+
+
+def lease_proof_guard(
+    credentials: tuple[SecretStr, ...],
+) -> Callable[[LeaseProof], None]:
+    """Compile known credential reuse checks for future claim composition."""
+    if not credentials:
+        raise ValueError("Lease proof guard requires known credentials.")
+    verifiers = tuple(token_verifier(value) for value in credentials)
+
+    def validate(proof: LeaseProof) -> None:
+        if not isinstance(proof, LeaseProof):
+            raise InvalidLeaseProof("A typed lease proof is required.")
+        presented = proof.reveal()
+        reused = False
+        for verify in verifiers:
+            reused |= verify(presented)
+        if reused:
+            raise InvalidLeaseProof("Lease proof must be separate from credentials.")
+
+    return validate
 
 
 def worker_authenticator(

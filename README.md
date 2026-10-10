@@ -234,6 +234,11 @@ database or provider resources. Future claim requests must independently verify
 authority and expiry using database time. Worker claims, heartbeat fencing,
 assignment recovery, execution and agent isolation remain pending.
 
+Neutral claim contracts provide redacted lease-proof values, worker/request-bound
+verifiers and versioned replay fingerprints. These helpers do not expose a claim
+endpoint or persist assignments. Protected local journaling and atomic database
+coordination are required before a worker can request or execute work.
+
 ## GitHub observation
 
 Optional `DEVRELAY_CONTROL_GITHUB__` settings require a separate read-only token
