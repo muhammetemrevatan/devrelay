@@ -60,6 +60,10 @@ class PrepareJobSubmission:
             )
         if len({p.slug.casefold() for p in policies}) != len(policies):
             raise ValueError("A repository cannot have multiple policy identities.")
+        if any(p.provider_repository_id is None for p in policies) or len(
+            {p.provider_repository_id for p in policies}
+        ) != len(policies):
+            raise ValueError("Repository policies require unique provider identities.")
         self._snapshots = snapshots
         self._source = source
         self._policies = {policy.repository_id: policy for policy in policies}

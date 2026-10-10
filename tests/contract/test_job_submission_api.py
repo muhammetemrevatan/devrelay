@@ -55,7 +55,11 @@ PATH = "/api/v1/jobs"
 class Operation:
     def __init__(self, configuration: ControlSettings) -> None:
         assert configuration.jira is not None
-        policy = repository_policy(configuration.repositories[0], configuration.jira)
+        policy = repository_policy(
+            configuration.repositories[0],
+            configuration.jira,
+            provider_repository_id=123,
+        )
         snapshot = TaskSnapshot(
             id=uuid4(),
             identity=TaskIdentity(
@@ -77,6 +81,7 @@ class Operation:
         job = intent.build_candidate(
             job_id=uuid4(),
             head=RepositoryHead(
+                provider_repository_id=123,
                 repository_id=policy.repository_id,
                 target_branch=policy.target_branch,
                 revision="a" * 40,

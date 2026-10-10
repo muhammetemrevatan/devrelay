@@ -59,7 +59,7 @@ def test_configuration_defaults_to_no_repository_admission() -> None:
 def test_repository_policy_defaults_to_disabled_without_credentials() -> None:
     repo, source = repository(), jira()
 
-    policy = repository_policy(repo, source)
+    policy = repository_policy(repo, source, provider_repository_id=123)
 
     assert not repo.enabled
     assert not policy.enabled
@@ -204,7 +204,7 @@ def test_repository_policy_rejects_foreign_source_scope() -> None:
     source = jira()
 
     with pytest.raises(ValueError):
-        repository_policy(repo, source)
+        repository_policy(repo, source, provider_repository_id=123)
 
 
 def test_repository_json_environment_is_loaded_without_enabling_an_api(

@@ -1,5 +1,6 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
+from uuid import UUID
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine
@@ -22,12 +23,13 @@ from devrelay.config.repositories import RepositorySettings
 
 
 def repository_policy(
-    settings: RepositorySettings, jira: JiraSettings
+    settings: RepositorySettings, jira: JiraSettings, *, provider_repository_id: int
 ) -> RepositoryPolicy:
     if not settings.allowed_project_keys <= jira.allowed_project_keys:
         raise ValueError("Repository source scope exceeds configured Jira scope.")
     return RepositoryPolicy(
         repository_id=settings.repository_id,
+        provider_repository_id=provider_repository_id,
         slug=settings.slug,
         enabled=settings.enabled,
         target_branch=settings.target_branch,
@@ -58,9 +60,19 @@ async def open_job_preparer(
     repositories: tuple[RepositorySettings, ...],
     engine: AsyncEngine,
     *,
+    repository_ids: Mapping[UUID, int],
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[PrepareJobSubmission]:
-    policies = tuple(repository_policy(settings, jira) for settings in repositories)
+    if set(repository_ids) != {settings.repository_id for settings in repositories}:
+        raise ValueError("Repository identity configuration does not match policy.")
+    policies = tuple(
+        repository_policy(
+            settings,
+            jira,
+            provider_repository_id=repository_ids[settings.repository_id],
+        )
+        for settings in repositories
+    )
     async with open_jira_task_source(jira, transport=transport) as source:
         yield PrepareJobSubmission(task_snapshot_reader(engine), source, policies)
 
@@ -72,11 +84,12 @@ async def open_job_submitter(
     engine: AsyncEngine,
     repository_source: RepositorySubmissionSource,
     *,
+    repository_ids: Mapping[UUID, int],
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[SubmitJob]:
     """Require an explicit trusted Git observer; never supply a permissive default."""
     async with open_job_preparer(
-        jira, repositories, engine, transport=transport
+        jira, repositories, engine, repository_ids=repository_ids, transport=transport
     ) as preparer:
         yield SubmitJob(
             preparer,
@@ -101,6 +114,13 @@ async def open_github_job_submitter(
         github, repositories, job_branch_reader(engine), transport=github_transport
     ) as observer:
         async with open_job_submitter(
-            jira, repositories, engine, observer, transport=jira_transport
+            jira,
+            repositories,
+            engine,
+            observer,
+            repository_ids={
+                item.repository_id: item.github_id for item in github.repository_ids
+            },
+            transport=jira_transport,
         ) as submitter:
             yield submitter

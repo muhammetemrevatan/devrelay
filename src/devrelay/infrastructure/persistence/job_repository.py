@@ -25,6 +25,7 @@ from devrelay.infrastructure.persistence.job_mapping import materialize_submissi
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
     JobRecord,
+    RepositoryBindingRecord,
     RepositoryRecord,
 )
 from devrelay.infrastructure.persistence.models import (
@@ -40,16 +41,26 @@ async def read_submission(
 ) -> StoredJobSubmission | None:
     row = (
         await session.execute(
-            select(JobRecord, TaskSnapshotRecord, SourceTaskRecord, RepositoryRecord)
+            select(
+                JobRecord,
+                TaskSnapshotRecord,
+                SourceTaskRecord,
+                RepositoryRecord,
+                RepositoryBindingRecord,
+            )
             .join(TaskSnapshotRecord, JobRecord.snapshot_id == TaskSnapshotRecord.id)
             .join(SourceTaskRecord, JobRecord.source_task_id == SourceTaskRecord.id)
             .join(RepositoryRecord, JobRecord.repository_id == RepositoryRecord.id)
+            .outerjoin(
+                RepositoryBindingRecord,
+                JobRecord.repository_id == RepositoryBindingRecord.repository_id,
+            )
             .where(JobRecord.submission_key == submission_key)
         )
     ).one_or_none()
     if row is None:
         return None
-    record, snapshot, source, repository = row
+    record, snapshot, source, repository, binding = row
     checks = tuple(
         (
             await session.scalars(
@@ -60,7 +71,7 @@ async def read_submission(
             )
         ).all()
     )
-    return materialize_submission(record, snapshot, source, repository, checks)
+    return materialize_submission(record, snapshot, source, repository, checks, binding)
 
 
 class SqlAlchemyJobSubmissionReader:
@@ -107,6 +118,7 @@ class SqlAlchemyJobBranchReader:
                         select(
                             JobRecord.id,
                             JobRecord.repository_id,
+                            JobRecord.provider_repository_id,
                             JobRecord.source_task_id,
                             JobRecord.authorized_branch,
                             JobRecord.coding_branch_prefix,
@@ -120,7 +132,7 @@ class SqlAlchemyJobBranchReader:
                     )
                 ).all()
                 result: list[JobBranchAssociation] = []
-                for job_id, repo_id, source_id, branch, prefix in rows:
+                for job_id, repo_id, provider_id, source_id, branch, prefix in rows:
                     if branch != f"{prefix}/{job_id.hex}":
                         raise JobPersistenceError(
                             "Stored Job branch binding is inconsistent."
@@ -129,6 +141,7 @@ class SqlAlchemyJobBranchReader:
                         JobBranchAssociation(
                             job_id=job_id,
                             repository_id=repo_id,
+                            provider_repository_id=provider_id,
                             source_task_id=source_id,
                             authorized_branch=branch,
                         )
@@ -146,10 +159,15 @@ class SqlAlchemyJobSubmissionRepository:
         self, intent: PreparedJobSubmission, candidate: Job
     ) -> SavedJobSubmission:
         try:
+            if intent.policy.provider_repository_id is None:
+                raise JobSubmissionConflict(
+                    "New submissions require a provider binding."
+                )
             expected = intent.build_candidate(
                 job_id=candidate.id,
                 head=RepositoryHead(
                     repository_id=candidate.repository_id,
+                    provider_repository_id=intent.policy.provider_repository_id,
                     target_branch=candidate.target_branch,
                     revision=candidate.base_revision,
                 ),
@@ -234,15 +252,27 @@ class SqlAlchemyJobSubmissionRepository:
                 )
             policy = intent.policy
             await self._session.execute(
+                insert(RepositoryBindingRecord)
+                .values(
+                    repository_id=policy.repository_id,
+                    provider_repository_id=policy.provider_repository_id,
+                    bound_at=candidate.created_at,
+                )
+                .on_conflict_do_nothing(
+                    index_elements=[RepositoryBindingRecord.repository_id]
+                )
+            )
+            await self._session.execute(
                 insert(JobRecord).values(
                     id=candidate.id,
                     source_task_id=candidate.source_task_id,
                     snapshot_id=candidate.snapshot_id,
                     repository_id=candidate.repository_id,
+                    provider_repository_id=policy.provider_repository_id,
                     submission_key=intent.submission_key,
                     submission_fingerprint=intent.submission_fingerprint,
                     submission_generation=1,
-                    definition_version=1,
+                    definition_version=2,
                     status=candidate.status.value,
                     workflow_version=0,
                     blocks_new_submission=True,

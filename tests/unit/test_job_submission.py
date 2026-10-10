@@ -2,7 +2,7 @@ import asyncio
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from types import TracebackType
-from typing import Self
+from typing import Self, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -42,6 +42,67 @@ from devrelay.domain.tasks import TaskIdentity, TaskSnapshot
 NOW = datetime(2026, 10, 9, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("provider_id", [True, False, 0, -1, 2**63, 1.5, "123"])
+def test_repository_policy_rejects_invalid_numeric_identity(
+    provider_id: object,
+) -> None:
+    policy = repository()
+
+    with pytest.raises(ValueError):
+        replace(policy, provider_repository_id=cast(int, provider_id))
+
+
+@pytest.mark.parametrize("provider_id", [None, True, 0, -1, 2**63, "123"])
+def test_repository_observation_requires_strict_numeric_identity(
+    provider_id: object,
+) -> None:
+    with pytest.raises(ValueError):
+        RepositoryHead(
+            repository_id=uuid4(),
+            provider_repository_id=cast(int, provider_id),
+            target_branch="main",
+            revision="a" * 40,
+        )
+
+
+def test_legacy_definition_cannot_build_a_new_candidate() -> None:
+    prepared = prepare(stored_task(), repository())
+    legacy = replace(
+        prepared, policy=replace(prepared.policy, provider_repository_id=None)
+    )
+    head = RepositoryHead(
+        repository_id=prepared.policy.repository_id,
+        provider_repository_id=123,
+        target_branch="main",
+        revision="a" * 40,
+    )
+
+    with pytest.raises(ValueError):
+        legacy.build_candidate(job_id=uuid4(), head=head, now=NOW)
+
+
+def test_legacy_submission_hashes_match_version_one_golden_reference() -> None:
+    stored = stored_task()
+    policy = replace(
+        repository(),
+        repository_id=UUID("11111111-2222-3333-4444-555555555555"),
+        provider_repository_id=None,
+    )
+
+    legacy = PreparedJobSubmission(
+        stored=stored, policy=policy, actor_id="test-operator"
+    )
+
+    assert (
+        legacy.submission_key
+        == "7daaacc662d581422007946b43c53f6db926e41bff85e4eeafa40de656b003ce"
+    )
+    assert (
+        legacy.submission_fingerprint
+        == "897e6b398d6972f2c6b8853fb8b8cd5fec629f28383b698df1cc6baadef625bf"
+    )
+
+
 def stored_task() -> StoredTaskSnapshot:
     return StoredTaskSnapshot(
         source_task_id=uuid4(),
@@ -63,6 +124,7 @@ def stored_task() -> StoredTaskSnapshot:
 
 def repository() -> RepositoryPolicy:
     return RepositoryPolicy(
+        provider_repository_id=123,
         repository_id=uuid4(),
         slug="example/devrelay",
         enabled=True,
@@ -148,6 +210,7 @@ def candidate(prepared: PreparedJobSubmission) -> Job:
     return prepared.build_candidate(
         job_id=uuid4(),
         head=RepositoryHead(
+            provider_repository_id=123,
             repository_id=prepared.policy.repository_id,
             target_branch=prepared.policy.target_branch,
             revision="a" * 40,
@@ -312,7 +375,17 @@ def test_rename_timestamp_newlines_labels_and_actor_do_not_change_intent() -> No
 
 @pytest.mark.parametrize(
     "change",
-    ["version", "argv", "timeout", "directory", "target", "budget", "scope", "prefix"],
+    [
+        "version",
+        "argv",
+        "timeout",
+        "directory",
+        "target",
+        "budget",
+        "scope",
+        "prefix",
+        "provider_id",
+    ],
 )
 def test_policy_edits_keep_identity_but_conflict_with_pinned_fingerprint(
     change: str,
@@ -321,6 +394,8 @@ def test_policy_edits_keep_identity_but_conflict_with_pinned_fingerprint(
     first = prepare(stored, policy)
     if change == "version":
         policy = replace(policy, version="v2")
+    elif change == "provider_id":
+        policy = replace(policy, provider_repository_id=456)
     elif change in {"argv", "timeout", "directory"}:
         check = policy.checks[0]
         if change == "argv":
@@ -362,6 +437,7 @@ def test_exact_replay_returns_original_even_if_cancelled_or_head_has_moved() -> 
     newer = prepared.build_candidate(
         job_id=uuid4(),
         head=RepositoryHead(
+            provider_repository_id=123,
             repository_id=prepared.policy.repository_id,
             target_branch="main",
             revision="b" * 40,
@@ -436,10 +512,11 @@ def test_wrong_scope_or_snapshot_cannot_return_existing_job(field: str) -> None:
         decide_submission(prepared, SubmissionState(existing=replace(receipt, job=job)))
 
 
-@pytest.mark.parametrize("field", ["repository", "branch", "revision"])
+@pytest.mark.parametrize("field", ["repository", "branch", "revision", "provider_id"])
 def test_candidate_requires_matching_trusted_head(field: str) -> None:
     prepared = prepare(stored_task(), repository())
     head = RepositoryHead(
+        provider_repository_id=123,
         repository_id=prepared.policy.repository_id,
         target_branch="main",
         revision="a" * 40,
@@ -448,6 +525,8 @@ def test_candidate_requires_matching_trusted_head(field: str) -> None:
         head = replace(head, repository_id=uuid4())
     elif field == "branch":
         head = replace(head, target_branch="other")
+    elif field == "provider_id":
+        head = replace(head, provider_repository_id=456)
     else:
         head = replace(head, revision="short")
     candidate_id = uuid4()
@@ -504,18 +583,35 @@ def test_source_failure_propagates_without_retry_or_candidate() -> None:
     assert events == ["stored", "fresh"]
 
 
-@pytest.mark.parametrize("reason", ["duplicate_id", "duplicate_slug"])
+@pytest.mark.parametrize(
+    "reason", ["duplicate_id", "duplicate_slug", "duplicate_provider_id", "unbound"]
+)
 def test_duplicate_repository_identities_are_rejected(reason: str) -> None:
     stored, policy = stored_task(), repository()
     reader = Reader(stored, [])
     source = Source(
         TaskRead(snapshot=stored.snapshot, scope_key="DRY", labels=frozenset()), []
     )
-    policies = (
-        (policy, policy)
-        if reason == "duplicate_id"
-        else (policy, replace(policy, repository_id=uuid4(), slug=policy.slug.upper()))
-    )
+    policies: tuple[RepositoryPolicy, ...]
+    if reason == "duplicate_id":
+        policies = (policy, policy)
+    elif reason == "duplicate_slug":
+        policies = (
+            policy,
+            replace(
+                policy,
+                repository_id=uuid4(),
+                slug=policy.slug.upper(),
+                provider_repository_id=456,
+            ),
+        )
+    elif reason == "duplicate_provider_id":
+        policies = (
+            policy,
+            replace(policy, repository_id=uuid4(), slug="example/other"),
+        )
+    else:
+        policies = (replace(policy, provider_repository_id=None),)
 
     with pytest.raises(ValueError):
         PrepareJobSubmission(reader, source, policies)
@@ -609,6 +705,7 @@ def submitter(
             observation
             or RepositorySubmissionObservation(
                 head=RepositoryHead(
+                    provider_repository_id=123,
                     repository_id=policy.repository_id,
                     target_branch="main",
                     revision="a" * 40,
@@ -670,11 +767,26 @@ def test_exact_replay_skips_freshness_and_git_and_keeps_original_actor() -> None
     assert events == ["stored", "existing"]
 
 
-def test_replayed_policy_conflict_fails_before_freshness_or_transaction() -> None:
+@pytest.mark.parametrize("change", ["policy", "provider_id", "legacy"])
+def test_replayed_policy_conflict_fails_before_freshness_or_transaction(
+    change: str,
+) -> None:
     stored, policy = stored_task(), repository()
     prepared = prepare(stored, policy)
     existing = StoredJobSubmission(intent=prepared, job=candidate(prepared))
-    changed = replace(policy, version="v2")
+    changed = (
+        replace(policy, version="v2")
+        if change == "policy"
+        else replace(policy, provider_repository_id=456)
+    )
+    if change == "legacy":
+        existing = replace(
+            existing,
+            intent=replace(
+                prepared, policy=replace(policy, provider_repository_id=None)
+            ),
+        )
+        changed = policy
     events: list[str] = []
     service = submitter(stored, changed, events, existing=existing)
     authorization = authority(policy)
@@ -697,6 +809,7 @@ def test_failed_submission_does_not_return_success(failure: str) -> None:
     events: list[str] = []
     observation = RepositorySubmissionObservation(
         head=RepositoryHead(
+            provider_repository_id=123,
             repository_id=policy.repository_id,
             target_branch="main",
             revision="a" * 40,

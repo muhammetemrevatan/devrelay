@@ -190,7 +190,7 @@ Use HTTPS or a protected loopback tunnel and preserve network access restriction
 The route is absent unless submission authentication is explicitly configured.
 Startup opens configured resources without provider reads, schema migration or
 database readiness checks. Submission records queued definitions only. Worker
-authentication, durable GitHub numeric binding, fresh pre-execution reconciliation,
+authentication, fresh pre-execution reconciliation,
 dispatch and execution remain later steps.
 
 ## GitHub observation
@@ -211,12 +211,12 @@ released before the next network request. Requests and the complete observation
 have time/byte/page limits; redirects and provider-supplied pagination URLs are
 not followed. No remote write, merge or automatic retry is performed.
 
-This optional composition is available to the submission application use case,
-not a public Job endpoint. GitHub configuration alone opens no client at HTTP
+The optional authenticated Job API uses this submission composition.
+GitHub configuration alone opens no client at HTTP
 startup and enables no new route. Numeric identity is verified against operator
-configuration per observation; the current DB stores UUID/slug, not an immutable
-GitHub numeric binding. Remote reads are non-atomic. Durable numeric identity and
-fresh pre-execution reconciliation remain gates before worker dispatch.
+configuration per observation and pinned durably for new submissions. Stored
+PR associations must have the same numeric ID. Remote reads are non-atomic;
+fresh pre-execution reconciliation remains required before worker dispatch.
 
 ## Task storage
 
@@ -274,15 +274,25 @@ when readiness has subsequently changed. Policy edits conflict with existing int
 
 For new admission, Jira and trusted Git/PR observations finish before the write
 transaction. Storage locks the stable task row, repeats replay/conflict checks,
-and commits repository identity, Job definition and ordered checks together.
+and commits repository identity, numeric binding, Job definition and ordered checks
+together. A local repository UUID and GitHub numeric ID have a one-to-one immutable
+binding. Configuration changes cannot rebind an accepted repository or hide a
+conflicting replay; renames and transfers require explicit reconciliation.
 Database uniqueness and a partial task/repository guard prevent duplicate queued
 deliveries. Full check argv, directories, timeouts, scope, repair limits and
 operator identity are stored; snapshots and definitions are immutable.
 
-The second migration supports queued definitions only. Worker claims, lease/state
+Migration 0003 pins new version-2 definitions to the verified GitHub numeric ID.
+Existing version-1 definitions retain their original fingerprints and a null
+numeric ID; migration does not infer identity from today's configuration. They
+remain readable, but bound policy cannot replay them as verified work. Legacy
+Jobs require trusted reconciliation before any future execution. Downgrade is
+rejected once a numeric binding has been stored, preserving accepted identity.
+
+The migrations support queued definitions only. Worker claims, lease/state
 updates, durable lifecycle history and intentional replay generations require
 later migrations. This submission lock is not the global coding concurrency slot.
-Separate submission authentication remains pending. Composition requires an
+Composition requires an
 explicit trusted observer; the optional GitHub implementation supplies verified
 read-only observations and never a permissive default.
 Import authentication grants import only.
