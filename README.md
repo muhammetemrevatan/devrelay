@@ -23,6 +23,9 @@ An optional Job submission API uses a separate operator token and explicit
 repository scope to record queued Jobs. It is disabled by default.
 Optional configured worker authentication verifies a separate expiring token
 and returns only the authenticated worker's identity and repository scope.
+The domain models assignment acknowledgement, lease renewal/revocation and expiry.
+Expired or revoked assignments retain their reservation until a trusted stop is
+confirmed; these in-memory rules do not implement database claims or concurrency.
 Live account validation, worker dispatch, agent execution, PR publication and
 deployment automation are not implemented yet.
 
