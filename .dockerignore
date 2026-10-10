@@ -1,0 +1,16 @@
+.git
+AGENTS.md
+notes
+.env
+.env.*
+.venv
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.import_linter_cache
+__pycache__
+*.pyc
+**/__pycache__
+**/*.pyc
+dist
+workspaces

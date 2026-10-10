@@ -1,0 +1,22 @@
+{
+  "id": "10007",
+  "key": "DRY-7",
+  "fields": {
+    "summary": "Read a selected task safely",
+    "project": {"id": "10001", "key": "DRY"},
+    "labels": ["agent-ready", "backend"],
+    "updated": "2026-10-09T13:45:00.000+0300",
+    "description": {
+      "version": 1,
+      "type": "doc",
+      "content": [
+        {"type": "paragraph", "content": [{"type": "text", "text": "Read task content without modifying Jira."}]},
+        {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Acceptance criteria"}]},
+        {"type": "bulletList", "content": [
+          {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Use the stable task ID."}]}]},
+          {"type": "listItem", "content": [{"type": "paragraph", "content": [{"type": "text", "text": "Keep credentials out of errors."}]}]}
+        ]}
+      ]
+    }
+  }
+}

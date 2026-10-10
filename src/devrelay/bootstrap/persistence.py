@@ -1,0 +1,94 @@
+from collections.abc import AsyncIterator, Callable
+from contextlib import asynccontextmanager
+
+from sqlalchemy.engine import URL
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
+
+from devrelay.application.ports.job_persistence import (
+    JobBranchReader,
+    JobSubmissionReader,
+    JobSubmissionUnitOfWork,
+)
+from devrelay.application.ports.task_persistence import (
+    TaskSnapshotReader,
+    TaskUnitOfWork,
+)
+from devrelay.config.database import DatabaseSettings
+from devrelay.infrastructure.persistence.job_repository import (
+    SqlAlchemyJobBranchReader,
+    SqlAlchemyJobSubmissionReader,
+)
+from devrelay.infrastructure.persistence.job_unit_of_work import (
+    SqlAlchemyJobSubmissionUnitOfWork,
+)
+from devrelay.infrastructure.persistence.task_reader import SqlAlchemyTaskSnapshotReader
+from devrelay.infrastructure.persistence.unit_of_work import SqlAlchemyTaskUnitOfWork
+
+
+def database_url(settings: DatabaseSettings) -> URL:
+    return URL.create(
+        "postgresql+psycopg",
+        username=settings.username,
+        password=settings.password.get_secret_value(),
+        host=settings.host,
+        port=settings.port,
+        database=settings.database,
+    )
+
+
+@asynccontextmanager
+async def open_database_engine(
+    settings: DatabaseSettings,
+) -> AsyncIterator[AsyncEngine]:
+    engine = create_async_engine(
+        database_url(settings),
+        pool_size=settings.pool_size,
+        max_overflow=0,
+        pool_timeout=settings.connect_timeout_seconds,
+        pool_pre_ping=True,
+        hide_parameters=True,
+        isolation_level="READ COMMITTED",
+        connect_args={
+            "connect_timeout": settings.connect_timeout_seconds,
+            "sslmode": settings.sslmode,
+            "options": (
+                f"-c statement_timeout={settings.statement_timeout_ms} "
+                f"-c lock_timeout={settings.lock_timeout_ms} "
+                f"-c search_path={settings.schema_name} -c timezone=UTC"
+            ),
+        },
+    )
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+def task_unit_of_work_factory(engine: AsyncEngine) -> Callable[[], TaskUnitOfWork]:
+    sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    return lambda: SqlAlchemyTaskUnitOfWork(sessions)
+
+
+def task_snapshot_reader(engine: AsyncEngine) -> TaskSnapshotReader:
+    return SqlAlchemyTaskSnapshotReader(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    )
+
+
+def job_submission_reader(engine: AsyncEngine) -> JobSubmissionReader:
+    return SqlAlchemyJobSubmissionReader(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    )
+
+
+def job_branch_reader(engine: AsyncEngine) -> JobBranchReader:
+    return SqlAlchemyJobBranchReader(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    )
+
+
+def job_submission_unit_of_work_factory(
+    engine: AsyncEngine,
+) -> Callable[[], JobSubmissionUnitOfWork]:
+    sessions = async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    return lambda: SqlAlchemyJobSubmissionUnitOfWork(sessions)

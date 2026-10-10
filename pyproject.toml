@@ -1,0 +1,134 @@
+[project]
+name = "devrelay"
+version = "0.1.0"
+description = "Coordinates Jira tasks, coding workers, pull requests, and deployments."
+readme = "README.md"
+requires-python = ">=3.14,<3.15"
+dependencies = [
+    "alembic>=1.20,<2",
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<1",
+    "psycopg[binary]>=3.3,<4",
+    "pydantic>=2,<3",
+    "pydantic-settings>=2,<3",
+    "sqlalchemy[asyncio]>=2.1,<2.2",
+    "uvicorn>=0.34,<1",
+]
+
+[project.scripts]
+devrelay-control = "devrelay.bootstrap.control:main"
+devrelay-worker = "devrelay.worker.main:main"
+
+[dependency-groups]
+dev = [
+    "httpx2>=2.13.1,<3",
+    "import-linter>=2,<3",
+    "mypy>=1,<3",
+    "pytest>=8,<10",
+    "ruff>=0.11,<1",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.24,<0.13"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+source-include = ["alembic.ini", "migrations/**"]
+source-exclude = ["AGENTS.md", ".env", ".env.*", "notes/**"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP"]
+
+[tool.mypy]
+python_version = "3.14"
+strict = true
+files = ["src", "tests", "migrations"]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--import-mode=importlib -ra"
+markers = ["postgres: requires an explicitly configured disposable PostgreSQL database"]
+
+[tool.importlinter]
+root_package = "devrelay"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "HTTP adapters do not depend on configuration or concrete wiring"
+type = "forbidden"
+source_modules = ["devrelay.api"]
+forbidden_modules = [
+    "devrelay.config", "devrelay.bootstrap", "devrelay.worker", "devrelay.infrastructure",
+    "httpx", "httpx2", "sqlalchemy", "alembic", "psycopg",
+]
+
+[[tool.importlinter.contracts]]
+name = "Configuration cannot depend on entry points or integration clients"
+type = "forbidden"
+source_modules = ["devrelay.config"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.bootstrap", "devrelay.worker",
+    "devrelay.application", "devrelay.infrastructure", "fastapi", "uvicorn", "httpx", "httpx2",
+    "sqlalchemy", "alembic", "psycopg",
+]
+
+[[tool.importlinter.contracts]]
+name = "Worker only reaches composition through its entry point"
+type = "forbidden"
+source_modules = ["devrelay.worker"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.bootstrap", "devrelay.config", "devrelay.infrastructure",
+    "sqlalchemy", "alembic", "psycopg",
+]
+ignore_imports = ["devrelay.worker.main -> devrelay.bootstrap.worker"]
+
+[[tool.importlinter.contracts]]
+name = "Domain cannot import application or outer layers"
+type = "forbidden"
+source_modules = ["devrelay.domain"]
+forbidden_modules = [
+    "devrelay.application", "devrelay.api", "devrelay.worker",
+    "devrelay.config", "devrelay.bootstrap", "devrelay.infrastructure",
+]
+
+[[tool.importlinter.contracts]]
+name = "Application cannot depend on frameworks or outer layers"
+type = "forbidden"
+source_modules = ["devrelay.application"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.worker", "devrelay.config", "devrelay.bootstrap", "devrelay.infrastructure",
+    "fastapi", "pydantic", "pydantic_settings", "uvicorn", "httpx", "httpx2",
+    "sqlalchemy", "alembic", "psycopg",
+]
+
+[[tool.importlinter.contracts]]
+name = "Jira adapter does not import entry points or settings"
+type = "forbidden"
+source_modules = ["devrelay.infrastructure.jira"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.worker", "devrelay.bootstrap", "devrelay.config",
+    "devrelay.infrastructure.persistence", "devrelay.infrastructure.github", "sqlalchemy", "psycopg",
+]
+
+[[tool.importlinter.contracts]]
+name = "Persistence adapter cannot depend on entry points or provider clients"
+type = "forbidden"
+source_modules = ["devrelay.infrastructure.persistence"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.worker", "devrelay.bootstrap", "devrelay.config",
+    "devrelay.infrastructure.jira", "devrelay.infrastructure.github", "httpx", "httpx2",
+]
+
+[[tool.importlinter.contracts]]
+name = "GitHub observer reaches persistence only through application ports"
+type = "forbidden"
+source_modules = ["devrelay.infrastructure.github"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.worker", "devrelay.bootstrap", "devrelay.config",
+    "devrelay.infrastructure.persistence", "devrelay.infrastructure.jira", "sqlalchemy", "psycopg",
+]

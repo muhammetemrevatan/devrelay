@@ -1,0 +1,101 @@
+from enum import StrEnum
+
+from pydantic import Field, IPvAnyAddress, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from devrelay.config.database import DatabaseSettings
+from devrelay.config.github import GitHubSettings
+from devrelay.config.jira import JiraSettings
+from devrelay.config.logging import LogLevel
+from devrelay.config.repositories import RepositorySettings
+from devrelay.config.task_import import TaskImportSettings
+
+
+class RuntimeEnvironment(StrEnum):
+    DEVELOPMENT = "development"
+    TEST = "test"
+    PRODUCTION = "production"
+
+
+class ControlSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="DEVRELAY_CONTROL_",
+        extra="ignore",
+        frozen=True,
+        hide_input_in_errors=True,
+        env_nested_delimiter="__",
+    )
+
+    environment: RuntimeEnvironment = RuntimeEnvironment.DEVELOPMENT
+    host: IPvAnyAddress = Field(default="127.0.0.1", validate_default=True)
+    port: int = Field(default=8000, ge=1, le=65535)
+    log_level: LogLevel = LogLevel.INFO
+    jira: JiraSettings | None = None
+    github: GitHubSettings | None = None
+    database: DatabaseSettings | None = None
+    task_import: TaskImportSettings | None = None
+    repositories: tuple[RepositorySettings, ...] = Field(default=(), max_length=32)
+
+    @model_validator(mode="after")
+    def require_github_scope(self) -> ControlSettings:
+        if self.github is not None:
+            if {item.repository_id for item in self.github.repository_ids} != {
+                item.repository_id for item in self.repositories
+            }:
+                raise ValueError(
+                    "GitHub bindings must match configured repository policy."
+                )
+            other_secrets = (
+                self.jira.api_token if self.jira else None,
+                self.database.password if self.database else None,
+                self.task_import.auth_token if self.task_import else None,
+            )
+            if any(
+                self.github.api_token == secret
+                for secret in other_secrets
+                if secret is not None
+            ):
+                raise ValueError("GitHub observation requires a separate credential.")
+        return self
+
+    @model_validator(mode="after")
+    def require_repository_scope(self) -> ControlSettings:
+        if self.repositories:
+            if self.jira is None or self.database is None:
+                raise ValueError(
+                    "Repository policy requires Jira and database settings."
+                )
+            if len({repo.repository_id for repo in self.repositories}) != len(
+                self.repositories
+            ) or len({repo.slug.casefold() for repo in self.repositories}) != len(
+                self.repositories
+            ):
+                raise ValueError("Repository identities and slugs must be unique.")
+            if any(
+                not repo.allowed_project_keys <= self.jira.allowed_project_keys
+                for repo in self.repositories
+            ):
+                raise ValueError(
+                    "Repository source scope must be inside configured Jira scope."
+                )
+        return self
+
+    @model_validator(mode="after")
+    def require_import_integrations(self) -> ControlSettings:
+        if self.task_import is not None and (
+            self.jira is None or self.database is None
+        ):
+            raise ValueError(
+                "Task import requires complete Jira and database settings."
+            )
+        if self.task_import is not None and self.jira is not None:
+            if self.task_import.auth_token == self.jira.api_token:
+                raise ValueError(
+                    "Import authentication must use a separate credential."
+                )
+        if self.task_import is not None and self.database is not None:
+            if self.task_import.auth_token == self.database.password:
+                raise ValueError(
+                    "Import authentication must use a separate credential."
+                )
+        return self
