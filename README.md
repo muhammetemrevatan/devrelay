@@ -26,6 +26,9 @@ and returns only the authenticated worker's identity and repository scope.
 The domain models assignment acknowledgement, lease renewal/revocation and expiry.
 Expired or revoked assignments retain their reservation until a trusted stop is
 confirmed; these in-memory rules do not implement database claims or concurrency.
+The Windows recovery adapter protects pending claim proofs with user-scoped DPAPI
+and commits them to a private local SQLite journal before returning a request.
+It restores the original request after restart and excludes a second worker process.
 Live account validation, worker dispatch, agent execution, PR publication and
 deployment automation are not implemented yet.
 
@@ -236,8 +239,21 @@ assignment recovery, execution and agent isolation remain pending.
 
 Neutral claim contracts provide redacted lease-proof values, worker/request-bound
 verifiers and versioned replay fingerprints. These helpers do not expose a claim
-endpoint or persist assignments. Protected local journaling and atomic database
-coordination are required before a worker can request or execute work.
+endpoint or persist assignments. The protected Windows journal prepares and
+recovers one pending request; atomic database coordination remains required
+before a worker can request or execute work.
+
+The journal composition requires an explicit absolute directory on a local fixed
+Windows drive, outside repository checkouts and agent workspaces. Its parent must
+exist; the adapter creates the private child directory with access restricted to
+the current Windows identity and SYSTEM. Existing insecure directories, missing
+journals and damaged records fail closed. Proofs are encrypted before SQLite
+writes, including WAL storage, and disk operations run on a dedicated thread.
+There is no plaintext or non-Windows fallback. DPAPI protects data at rest;
+code running as the same Windows identity can decrypt it, so agent isolation
+remains a separate requirement. This adapter is not wired to worker polling or
+the CLI. Assignment acknowledgement, launch intent and completed-request cleanup
+are not implemented yet.
 
 ## GitHub observation
 
