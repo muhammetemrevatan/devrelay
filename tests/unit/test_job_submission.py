@@ -18,6 +18,7 @@ from devrelay.application.contracts.submissions import (
     SubmissionAuthorization,
 )
 from devrelay.application.contracts.tasks import StoredTaskSnapshot, TaskRead
+from devrelay.application.contracts.workflows import JobWorkflowState
 from devrelay.application.jobs import (
     AdmissionAction,
     JobSubmissionConflict,
@@ -654,7 +655,12 @@ class SubmissionUnit:
     ) -> SavedJobSubmission:
         self.events.append("admit")
         return SavedJobSubmission(
-            stored=StoredJobSubmission(intent=intent, job=candidate), created=True
+            stored=StoredJobSubmission(
+                intent=intent,
+                job=candidate,
+                workflow=JobWorkflowState.initial(candidate),
+            ),
+            created=True,
         )
 
     async def __aenter__(self) -> Self:
@@ -749,7 +755,10 @@ def test_new_submission_checks_sources_before_transaction_and_returns_after_comm
 def test_exact_replay_skips_freshness_and_git_and_keeps_original_actor() -> None:
     stored, policy = stored_task(), repository()
     prepared = prepare(stored, policy)
-    existing = StoredJobSubmission(intent=prepared, job=candidate(prepared))
+    job = candidate(prepared)
+    existing = StoredJobSubmission(
+        intent=prepared, job=job, workflow=JobWorkflowState.initial(job)
+    )
     events: list[str] = []
     service = submitter(stored, policy, events, existing=existing, ready=False)
     authorization = replace(authority(policy), actor_id="second-operator")
@@ -767,13 +776,37 @@ def test_exact_replay_skips_freshness_and_git_and_keeps_original_actor() -> None
     assert events == ["stored", "existing"]
 
 
+@pytest.mark.parametrize("mismatch", ["identity", "creation_time"])
+def test_submission_projection_cannot_belong_to_another_definition(
+    mismatch: str,
+) -> None:
+    prepared = prepare(stored_task(), repository())
+    job = candidate(prepared)
+    state = JobWorkflowState.initial(job)
+    unrelated = (
+        replace(state, job_id=uuid4())
+        if mismatch == "identity"
+        else replace(
+            state,
+            created_at=state.created_at + timedelta(seconds=1),
+            updated_at=state.updated_at + timedelta(seconds=1),
+        )
+    )
+
+    with pytest.raises(ValueError, match="accepted definition"):
+        StoredJobSubmission(intent=prepared, job=job, workflow=unrelated)
+
+
 @pytest.mark.parametrize("change", ["policy", "provider_id", "legacy"])
 def test_replayed_policy_conflict_fails_before_freshness_or_transaction(
     change: str,
 ) -> None:
     stored, policy = stored_task(), repository()
     prepared = prepare(stored, policy)
-    existing = StoredJobSubmission(intent=prepared, job=candidate(prepared))
+    job = candidate(prepared)
+    existing = StoredJobSubmission(
+        intent=prepared, job=job, workflow=JobWorkflowState.initial(job)
+    )
     changed = (
         replace(policy, version="v2")
         if change == "policy"

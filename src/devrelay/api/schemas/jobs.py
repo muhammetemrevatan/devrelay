@@ -29,6 +29,6 @@ class JobSubmissionResponse(BaseModel):
             source_task_id=job.source_task_id,
             snapshot_id=job.snapshot_id,
             repository_id=job.repository_id,
-            status=job.status,
+            status=result.stored.workflow.status,
             created=result.created,
         )

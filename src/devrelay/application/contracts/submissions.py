@@ -5,6 +5,7 @@ from datetime import datetime
 from uuid import UUID
 
 from devrelay.application.contracts.tasks import StoredTaskSnapshot
+from devrelay.application.contracts.workflows import JobWorkflowState
 from devrelay.application.tasks import TaskImportPolicy
 from devrelay.domain.jobs.job import Job
 from devrelay.domain.jobs.values import PullRequestReference
@@ -246,6 +247,14 @@ class StoredJobSubmission:
 
     intent: PreparedJobSubmission
     job: Job
+    workflow: JobWorkflowState
+
+    def __post_init__(self) -> None:
+        if (
+            self.workflow.job_id != self.job.id
+            or self.workflow.created_at != self.job.created_at
+        ):
+            raise ValueError("Workflow projection must match the accepted definition.")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

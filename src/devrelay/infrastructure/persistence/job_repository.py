@@ -12,6 +12,7 @@ from devrelay.application.contracts.submissions import (
     SavedJobSubmission,
     StoredJobSubmission,
 )
+from devrelay.application.contracts.workflows import JobWorkflowState, WorkflowEventType
 from devrelay.application.jobs import (
     JobSubmissionConflict,
     SubmissionState,
@@ -33,6 +34,10 @@ from devrelay.infrastructure.persistence.models import (
     TaskSnapshotRecord,
 )
 from devrelay.infrastructure.persistence.task_mapping import materialize_snapshot
+from devrelay.infrastructure.persistence.workflow_models import (
+    JobWorkflowEventRecord,
+    JobWorkflowRecord,
+)
 
 
 async def read_submission(
@@ -47,6 +52,8 @@ async def read_submission(
                 SourceTaskRecord,
                 RepositoryRecord,
                 RepositoryBindingRecord,
+                JobWorkflowRecord,
+                JobWorkflowEventRecord,
             )
             .join(TaskSnapshotRecord, JobRecord.snapshot_id == TaskSnapshotRecord.id)
             .join(SourceTaskRecord, JobRecord.source_task_id == SourceTaskRecord.id)
@@ -55,12 +62,21 @@ async def read_submission(
                 RepositoryBindingRecord,
                 JobRecord.repository_id == RepositoryBindingRecord.repository_id,
             )
+            .outerjoin(JobWorkflowRecord, JobRecord.id == JobWorkflowRecord.job_id)
+            .outerjoin(
+                JobWorkflowEventRecord,
+                (JobWorkflowRecord.job_id == JobWorkflowEventRecord.job_id)
+                & (
+                    JobWorkflowRecord.workflow_version
+                    == JobWorkflowEventRecord.workflow_version
+                ),
+            )
             .where(JobRecord.submission_key == submission_key)
         )
     ).one_or_none()
     if row is None:
         return None
-    record, snapshot, source, repository, binding = row
+    record, snapshot, source, repository, binding, workflow, workflow_event = row
     checks = tuple(
         (
             await session.scalars(
@@ -71,7 +87,9 @@ async def read_submission(
             )
         ).all()
     )
-    return materialize_submission(record, snapshot, source, repository, checks, binding)
+    return materialize_submission(
+        record, snapshot, source, repository, checks, binding, workflow, workflow_event
+    )
 
 
 class SqlAlchemyJobSubmissionReader:
@@ -219,11 +237,11 @@ class SqlAlchemyJobSubmissionRepository:
                 return SavedJobSubmission(stored=existing, created=False)
             blocking: UUID | None = (
                 await self._session.execute(
-                    select(JobRecord.id)
+                    select(JobWorkflowRecord.job_id)
                     .where(
-                        JobRecord.source_task_id == source.id,
-                        JobRecord.repository_id == intent.policy.repository_id,
-                        JobRecord.blocks_new_submission.is_(True),
+                        JobWorkflowRecord.source_task_id == source.id,
+                        JobWorkflowRecord.repository_id == intent.policy.repository_id,
+                        JobWorkflowRecord.blocks_new_submission.is_(True),
                     )
                     .limit(1)
                 )
@@ -309,8 +327,33 @@ class SqlAlchemyJobSubmissionRepository:
                     for index, check in enumerate(policy.checks)
                 ],
             )
+            workflow = JobWorkflowState.initial(candidate)
+            await self._session.execute(
+                insert(JobWorkflowRecord).values(
+                    job_id=workflow.job_id,
+                    source_task_id=candidate.source_task_id,
+                    repository_id=candidate.repository_id,
+                    status=workflow.status.value,
+                    workflow_version=workflow.version,
+                    blocks_new_submission=workflow.blocks_new_submission,
+                    created_at=workflow.created_at,
+                    updated_at=workflow.updated_at,
+                )
+            )
+            await self._session.execute(
+                insert(JobWorkflowEventRecord).values(
+                    job_id=workflow.job_id,
+                    workflow_version=workflow.version,
+                    status=workflow.status.value,
+                    event_type=WorkflowEventType.SUBMITTED.value,
+                    occurred_at=workflow.updated_at,
+                )
+            )
             return SavedJobSubmission(
-                stored=StoredJobSubmission(intent=intent, job=candidate), created=True
+                stored=StoredJobSubmission(
+                    intent=intent, job=candidate, workflow=workflow
+                ),
+                created=True,
             )
         except IntegrityError:
             raise JobSubmissionConflict(

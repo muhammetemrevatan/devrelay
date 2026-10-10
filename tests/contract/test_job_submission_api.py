@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import httpx
@@ -22,6 +22,7 @@ from devrelay.application.contracts.submissions import (
     SubmissionAuthorization,
 )
 from devrelay.application.contracts.tasks import StoredTaskSnapshot
+from devrelay.application.contracts.workflows import JobWorkflowState
 from devrelay.application.jobs import (
     JobSubmissionConflict,
     JobSubmissionRejected,
@@ -44,6 +45,7 @@ from devrelay.bootstrap.persistence import open_database_engine
 from devrelay.config.control import ControlSettings
 from devrelay.config.database import DatabaseSettings
 from devrelay.config.task_import import TaskImportSettings
+from devrelay.domain.jobs.values import JobStatus
 from devrelay.domain.tasks import TaskIdentity, TaskSnapshot
 
 TOKEN = "test_only_submission_token_0123456789abcdefghijklmnop"
@@ -89,7 +91,10 @@ class Operation:
             now=datetime.now(UTC),
         )
         self.result = SavedJobSubmission(
-            stored=StoredJobSubmission(intent=intent, job=job), created=True
+            stored=StoredJobSubmission(
+                intent=intent, job=job, workflow=JobWorkflowState.initial(job)
+            ),
+            created=True,
         )
         self.calls: list[tuple[UUID, UUID, SubmissionAuthorization]] = []
         self.events: list[str] = []
@@ -130,6 +135,28 @@ class Operation:
 
 def app(operation: Operation, configuration: ControlSettings) -> FastAPI:
     return create_app(configuration, submission_resources=operation.resource)
+
+
+def test_response_uses_workflow_projection_without_rewriting_definition(
+    submission_configuration: ControlSettings,
+) -> None:
+    operation = Operation(submission_configuration)
+    accepted = operation.result.stored
+    current = replace(
+        accepted.workflow,
+        status=JobStatus.CLAIMED,
+        version=1,
+        updated_at=accepted.workflow.updated_at + timedelta(seconds=1),
+    )
+    operation.result = SavedJobSubmission(
+        stored=replace(accepted, workflow=current), created=False
+    )
+
+    with TestClient(app(operation, submission_configuration)) as client:
+        response = client.post(PATH, headers=HEADERS, json=operation.payload)
+
+    assert response.status_code == 200 and response.json()["status"] == "claimed"
+    assert accepted.job.status is JobStatus.QUEUED
 
 
 @pytest.mark.parametrize(

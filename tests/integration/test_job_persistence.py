@@ -16,7 +16,7 @@ from pydantic import SecretStr
 from sqlalchemy import delete, event, insert, select, text, update
 from sqlalchemy.engine import Connection
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from devrelay.application.contracts.submissions import (
@@ -58,6 +58,10 @@ from devrelay.infrastructure.persistence.job_models import (
 from devrelay.infrastructure.persistence.models import (
     SourceTaskRecord,
     TaskSnapshotRecord,
+)
+from devrelay.infrastructure.persistence.workflow_models import (
+    JobWorkflowEventRecord,
+    JobWorkflowRecord,
 )
 
 pytestmark = pytest.mark.postgres
@@ -160,6 +164,40 @@ async def counts(engine: AsyncEngine) -> tuple[int, int, int]:
             )
         ).one()
         return int(row[0]), int(row[1]), int(row[2])
+
+
+async def seed_workflows(
+    connection: AsyncConnection, definitions: list[dict[str, Any]]
+) -> None:
+    await connection.execute(
+        insert(JobWorkflowRecord),
+        [
+            {
+                "job_id": item["id"],
+                "source_task_id": item["source_task_id"],
+                "repository_id": item["repository_id"],
+                "status": "queued",
+                "workflow_version": 0,
+                "blocks_new_submission": True,
+                "created_at": item["created_at"],
+                "updated_at": item["created_at"],
+            }
+            for item in definitions
+        ],
+    )
+    await connection.execute(
+        insert(JobWorkflowEventRecord),
+        [
+            {
+                "job_id": item["id"],
+                "workflow_version": 0,
+                "status": "queued",
+                "event_type": "submitted",
+                "occurred_at": item["created_at"],
+            }
+            for item in definitions
+        ],
+    )
 
 
 class FreshSource:
@@ -265,6 +303,8 @@ def test_complete_policy_round_trip_and_constant_query_budget(
                         "repository_bindings",
                         "jobs",
                         "job_checks",
+                        "job_workflows",
+                        "job_workflow_events",
                     )
                 ):
                     statements.append(statement)
@@ -273,7 +313,7 @@ def test_complete_policy_round_trip_and_constant_query_budget(
             try:
                 first = await record(engine, intent)
                 assert first.created
-                assert len(statements) == 8
+                assert len(statements) == 10
                 statements.clear()
                 read = await job_submission_reader(engine).find_by_key(
                     intent.submission_key
@@ -285,6 +325,10 @@ def test_complete_policy_round_trip_and_constant_query_budget(
                     and read.intent.policy.checks == intent.policy.checks
                 )
                 assert read.intent.actor_id == "test-operator"
+                assert read.workflow == first.stored.workflow
+                assert (
+                    read.workflow.version == 0 and read.workflow.blocks_new_submission
+                )
                 assert len(statements) == 2
                 statements.clear()
                 second = await record(
@@ -300,6 +344,279 @@ def test_complete_policy_round_trip_and_constant_query_budget(
             finally:
                 event.remove(engine.sync_engine, "before_cursor_execute", observe)
             assert await counts(engine) == (1, 1, check_count)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("missing", ["job_workflows", "job_workflow_events"])
+def test_incomplete_workflow_submission_cannot_commit(
+    database: DatabaseFactory, missing: str
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            intent = prepared(await save_task(engine), policy())
+
+            def skip(
+                connection: Any,
+                cursor: Any,
+                statement: str,
+                parameters: Any,
+                context: Any,
+                executemany: bool,
+            ) -> tuple[str, Any]:
+                if statement.startswith("INSERT INTO " + missing + " "):
+                    return "SELECT 1", ()
+                return statement, parameters
+
+            event.listen(engine.sync_engine, "before_cursor_execute", skip, retval=True)
+            try:
+                with pytest.raises(JobPersistenceError, match="could not commit"):
+                    await record(engine, intent)
+            finally:
+                event.remove(engine.sync_engine, "before_cursor_execute", skip)
+
+            assert await counts(engine) == (0, 0, 0)
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            "SELECT (SELECT count(*) FROM job_workflows), (SELECT count(*) FROM job_workflow_events)"
+                        )
+                    )
+                ).one()
+                assert tuple(row) == (0, 0)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("table", ["job_workflows", "job_workflow_events"])
+@pytest.mark.parametrize("operation", ["update", "delete"])
+def test_workflow_and_creation_history_reject_unimplemented_mutations(
+    database: DatabaseFactory, table: str, operation: str
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            intent = prepared(await save_task(engine), policy())
+            saved = await record(engine, intent)
+            model = (
+                JobWorkflowRecord
+                if table == "job_workflows"
+                else JobWorkflowEventRecord
+            )
+            statement = (
+                update(model).values(status="queued")
+                if operation == "update"
+                else delete(model)
+            )
+
+            with pytest.raises(IntegrityError):
+                async with engine.begin() as connection:
+                    await connection.execute(statement)
+
+            restored = await job_submission_reader(engine).find_by_key(
+                intent.submission_key
+            )
+            assert restored == saved.stored
+
+    run(scenario())
+
+
+@pytest.mark.parametrize(
+    "damage", ["missing_workflow", "missing_event", "workflow_time", "event_time"]
+)
+def test_reader_fails_closed_on_privileged_workflow_corruption(
+    database: DatabaseFactory, damage: str
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            intent = prepared(await save_task(engine), policy())
+            await record(engine, intent)
+            async with engine.begin() as connection:
+                if damage == "missing_workflow":
+                    await connection.execute(
+                        text("ALTER TABLE jobs DROP CONSTRAINT fk_jobs_workflow")
+                    )
+                    await connection.execute(
+                        text(
+                            "ALTER TABLE job_workflow_events DROP CONSTRAINT fk_job_workflow_events_workflow"
+                        )
+                    )
+                    await connection.execute(
+                        text("DROP TRIGGER job_workflows_no_mutation ON job_workflows")
+                    )
+                    await connection.execute(delete(JobWorkflowRecord))
+                elif damage == "missing_event":
+                    await connection.execute(
+                        text(
+                            "ALTER TABLE job_workflows DROP CONSTRAINT fk_job_workflows_current_event"
+                        )
+                    )
+                    await connection.execute(
+                        text(
+                            "DROP TRIGGER job_workflow_events_no_mutation ON job_workflow_events"
+                        )
+                    )
+                    await connection.execute(delete(JobWorkflowEventRecord))
+                elif damage == "workflow_time":
+                    await connection.execute(
+                        text("DROP TRIGGER job_workflows_no_mutation ON job_workflows")
+                    )
+                    await connection.execute(
+                        text(
+                            "UPDATE job_workflows SET created_at = created_at + interval '1 second', updated_at = updated_at + interval '1 second'"
+                        )
+                    )
+                else:
+                    await connection.execute(
+                        text(
+                            "DROP TRIGGER job_workflow_events_no_mutation ON job_workflow_events"
+                        )
+                    )
+                    await connection.execute(
+                        text(
+                            "UPDATE job_workflow_events SET occurred_at = occurred_at + interval '1 second'"
+                        )
+                    )
+
+            with pytest.raises(JobPersistenceError, match="workflow/history"):
+                await job_submission_reader(engine).find_by_key(intent.submission_key)
+
+            assert isinstance(engine.sync_engine.pool, AsyncAdaptedQueuePool)
+            assert engine.sync_engine.pool.checkedout() == 0
+
+    run(scenario())
+
+
+def test_workflow_migration_preserves_bound_definitions_on_reupgrade(
+    database: DatabaseFactory,
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            intent = prepared(await save_task(engine), policy())
+            saved = await record(engine, intent)
+            before = await header(engine)
+            async with engine.begin() as connection:
+                await connection.run_sync(
+                    lambda sync: migrate_to(
+                        sync, "0003_repository_bindings", downgrade=True
+                    )
+                )
+            async with engine.begin() as connection:
+                await connection.run_sync(lambda sync: migrate_to(sync, "head"))
+
+            restored = await job_submission_reader(engine).find_by_key(
+                intent.submission_key
+            )
+
+            assert restored == saved.stored and await header(engine) == before
+            async with engine.connect() as connection:
+                row = (
+                    await connection.execute(
+                        text(
+                            "SELECT (SELECT count(*) FROM job_workflows), (SELECT count(*) FROM job_workflow_events)"
+                        )
+                    )
+                ).one()
+                assert tuple(row) == (1, 1)
+                indexes = set(
+                    (
+                        await connection.execute(
+                            text(
+                                "SELECT indexname FROM pg_indexes WHERE schemaname = current_schema()"
+                            )
+                        )
+                    ).scalars()
+                )
+                assert "uq_job_workflows_unresolved_task_repository" in indexes
+                assert "uq_jobs_unresolved_task_repository" not in indexes
+
+    run(scenario())
+
+
+def test_workflow_downgrade_refuses_inconsistent_history(
+    database: DatabaseFactory,
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            await record(engine, prepared(await save_task(engine), policy()))
+            async with engine.begin() as connection:
+                await connection.execute(
+                    text("DROP TRIGGER job_workflows_no_mutation ON job_workflows")
+                )
+                await connection.execute(
+                    text(
+                        "UPDATE job_workflows SET created_at = created_at + interval '1 second', updated_at = updated_at + interval '1 second'"
+                    )
+                )
+
+            with pytest.raises(IntegrityError, match="Cannot discard"):
+                async with engine.begin() as connection:
+                    await connection.run_sync(
+                        lambda sync: migrate_to(
+                            sync, "0003_repository_bindings", downgrade=True
+                        )
+                    )
+
+            async with engine.connect() as connection:
+                assert (
+                    await connection.execute(
+                        text("SELECT version_num FROM alembic_version")
+                    )
+                ).scalar_one() == "0004_job_workflows"
+                assert (
+                    await connection.execute(
+                        text("SELECT count(*) FROM job_workflow_events")
+                    )
+                ).scalar_one() == 1
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("mismatch", ["source", "repository"])
+def test_workflow_identity_must_match_immutable_definition(
+    database: DatabaseFactory, mismatch: str
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            repository = policy()
+            await record(engine, prepared(await save_task(engine), repository))
+            values = await header(engine)
+            task = await save_task(engine, external="10006")
+            other = await save_task(engine, external="10007")
+            intent = prepared(task, repository)
+            now = datetime.now(UTC)
+            values.update(
+                id=uuid4(),
+                source_task_id=task.source_task_id,
+                snapshot_id=task.snapshot.id,
+                submission_key=intent.submission_key,
+                submission_fingerprint=intent.submission_fingerprint,
+                created_at=now,
+                updated_at=now,
+            )
+            values["authorized_branch"] = f"devrelay/jobs/{values['id'].hex}"
+            forged = dict(values)
+            forged["source_task_id" if mismatch == "source" else "repository_id"] = (
+                other.source_task_id if mismatch == "source" else uuid4()
+            )
+
+            with pytest.raises(IntegrityError, match="fk_job_workflows_definition"):
+                async with engine.begin() as connection:
+                    await connection.execute(insert(JobRecord).values(**values))
+                    await connection.execute(
+                        insert(JobCheckRecord).values(
+                            job_id=values["id"],
+                            check_id="check_0",
+                            check_count=1,
+                            position=0,
+                            argv=["uv", "run", "pytest"],
+                            working_directory=".",
+                            timeout_seconds=300,
+                        )
+                    )
+                    await seed_workflows(connection, [forged])
+
+            assert await counts(engine) == (1, 1, 1)
 
     run(scenario())
 
@@ -425,6 +742,7 @@ def test_binding_migration_preserves_legacy_definitions_without_backfill(
                     source_task_id=task.source_task_id,
                     snapshot_id=task.snapshot.id,
                 ),
+                workflow=saved.stored.workflow,
             )
             assert (
                 receipt is not None
@@ -498,7 +816,7 @@ def test_downgrade_cannot_discard_accepted_provider_bindings(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0003_repository_bindings"
+                ).scalar_one() == "0004_job_workflows"
 
     run(scenario())
 
@@ -631,8 +949,12 @@ def test_no_commit_rolls_back_repository_job_and_checks(
     run(scenario())
 
 
-def test_failed_check_write_rolls_back_without_sql_or_exception_leak(
+@pytest.mark.parametrize(
+    "table", ["job_checks", "job_workflows", "job_workflow_events"]
+)
+def test_failed_submission_write_rolls_back_without_sql_or_exception_leak(
     database: DatabaseFactory,
+    table: str,
 ) -> None:
     async def scenario() -> None:
         async with database() as engine:
@@ -646,7 +968,7 @@ def test_failed_check_write_rolls_back_without_sql_or_exception_leak(
                 context: Any,
                 executemany: bool,
             ) -> None:
-                if statement.startswith("INSERT INTO job_checks"):
+                if statement.startswith("INSERT INTO " + table + " "):
                     raise SQLAlchemyError("secret-connection-and-sql-details")
 
             event.listen(engine.sync_engine, "before_cursor_execute", fail)
@@ -657,6 +979,15 @@ def test_failed_check_write_rolls_back_without_sql_or_exception_leak(
             finally:
                 event.remove(engine.sync_engine, "before_cursor_execute", fail)
             assert await counts(engine) == (0, 0, 0)
+            async with engine.connect() as connection:
+                assert (
+                    await connection.execute(text("SELECT count(*) FROM job_workflows"))
+                ).scalar_one() == 0
+                assert (
+                    await connection.execute(
+                        text("SELECT count(*) FROM job_workflow_events")
+                    )
+                ).scalar_one() == 0
 
     run(scenario())
 
@@ -920,6 +1251,7 @@ def test_reader_rejects_corrupt_fingerprints_and_releases_connection(
                         timeout_seconds=300,
                     )
                 )
+                await seed_workflows(connection, [values])
             with pytest.raises(JobPersistenceError):
                 await job_submission_reader(engine).find_by_key(intent.submission_key)
             assert isinstance(engine.sync_engine.pool, AsyncAdaptedQueuePool)
@@ -987,15 +1319,17 @@ def test_submission_lookup_plans_on_500_jobs(database: DatabaseFactory) -> None:
                 await connection.execute(insert(TaskSnapshotRecord), snapshots)
                 await connection.execute(insert(JobRecord), jobs)
                 await connection.execute(insert(JobCheckRecord), checks)
+                await seed_workflows(connection, jobs)
                 await connection.execute(text("ANALYZE jobs"))
                 await connection.execute(text("ANALYZE job_checks"))
+                await connection.execute(text("ANALYZE job_workflows"))
                 queries = (
                     (
                         "SELECT j.id, b.provider_repository_id FROM jobs j LEFT JOIN repository_bindings b ON j.repository_id=b.repository_id WHERE j.submission_key=:key",
                         {"key": jobs[250]["submission_key"]},
                     ),
                     (
-                        "SELECT id FROM jobs WHERE source_task_id=:source AND repository_id=:repo AND blocks_new_submission IS TRUE LIMIT 1",
+                        "SELECT job_id FROM job_workflows WHERE source_task_id=:source AND repository_id=:repo AND blocks_new_submission IS TRUE LIMIT 1",
                         {
                             "source": sources[250]["id"],
                             "repo": repository.repository_id,

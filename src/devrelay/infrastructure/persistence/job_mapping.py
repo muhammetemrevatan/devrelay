@@ -5,6 +5,7 @@ from devrelay.application.contracts.submissions import (
     StoredJobSubmission,
 )
 from devrelay.application.contracts.tasks import StoredTaskSnapshot
+from devrelay.application.contracts.workflows import JobWorkflowState, WorkflowEventType
 from devrelay.application.jobs import (
     SubmissionState,
     decide_submission,
@@ -26,6 +27,10 @@ from devrelay.infrastructure.persistence.models import (
     TaskSnapshotRecord,
 )
 from devrelay.infrastructure.persistence.task_mapping import materialize_snapshot
+from devrelay.infrastructure.persistence.workflow_models import (
+    JobWorkflowEventRecord,
+    JobWorkflowRecord,
+)
 
 
 def materialize_submission(
@@ -35,6 +40,8 @@ def materialize_submission(
     repository: RepositoryRecord,
     checks: tuple[JobCheckRecord, ...],
     binding: RepositoryBindingRecord | None,
+    workflow: JobWorkflowRecord | None,
+    workflow_event: JobWorkflowEventRecord | None,
 ) -> StoredJobSubmission:
     if (
         JobStatus(record.status) is not JobStatus.QUEUED
@@ -64,6 +71,25 @@ def materialize_submission(
     ):
         raise JobPersistenceError(
             "Stored submission definition failed integrity validation."
+        )
+    if (
+        workflow is None
+        or workflow_event is None
+        or (workflow.job_id, workflow.source_task_id, workflow.repository_id)
+        != (record.id, record.source_task_id, record.repository_id)
+        or workflow.status != JobStatus.QUEUED.value
+        or workflow.workflow_version != 0
+        or not workflow.blocks_new_submission
+        or workflow.created_at != record.created_at
+        or workflow.updated_at != record.created_at
+        or workflow_event.job_id != workflow.job_id
+        or workflow_event.workflow_version != workflow.workflow_version
+        or workflow_event.status != workflow.status
+        or workflow_event.event_type != WorkflowEventType.SUBMITTED.value
+        or workflow_event.occurred_at != workflow.updated_at
+    ):
+        raise JobPersistenceError(
+            "Stored workflow/history failed integrity validation."
         )
     task = materialize_snapshot(
         snapshot,
@@ -131,6 +157,14 @@ def materialize_submission(
         created_at=record.created_at,
         updated_at=record.updated_at,
     )
-    stored = StoredJobSubmission(intent=intent, job=job)
+    state = JobWorkflowState(
+        job_id=workflow.job_id,
+        status=JobStatus(workflow.status),
+        version=workflow.workflow_version,
+        blocks_new_submission=workflow.blocks_new_submission,
+        created_at=workflow.created_at,
+        updated_at=workflow.updated_at,
+    )
+    stored = StoredJobSubmission(intent=intent, job=job, workflow=state)
     decide_submission(intent, SubmissionState(existing=recorded_submission(stored)))
     return stored
