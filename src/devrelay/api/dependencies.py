@@ -12,6 +12,7 @@ from devrelay.application.contracts.submissions import (
     SavedJobSubmission,
     SubmissionAuthorization,
 )
+from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.tasks import TaskImportResult
 
 type ImportOperation = Callable[[str], Awaitable[TaskImportResult]]
@@ -67,6 +68,11 @@ class JobSubmissionServices(RequestAdmission):
     busy_message: str = "Job submission is busy."
 
 
+@dataclass(slots=True, kw_only=True)
+class WorkerAuthenticationServices:
+    authenticate: Callable[[str], WorkerAuthorization | None] = field(repr=False)
+
+
 bearer = HTTPBearer(
     auto_error=False,
     scheme_name="TaskImportBearer",
@@ -79,18 +85,32 @@ submission_bearer = HTTPBearer(
     description="Operator token scoped to explicit repository Job submission.",
 )
 
+worker_bearer = HTTPBearer(
+    auto_error=False,
+    scheme_name="WorkerBearer",
+    description="Separate expiring token for an explicitly enrolled worker.",
+)
+
+
+def bearer_token(
+    request: Request, credentials: HTTPAuthorizationCredentials | None
+) -> str | None:
+    if (
+        len(request.headers.getlist("authorization")) != 1
+        or credentials is None
+        or len(credentials.credentials) > 128
+    ):
+        return None
+    return credentials.credentials
+
 
 def valid_bearer(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None,
     verify_token: Callable[[str], bool],
 ) -> bool:
-    return (
-        len(request.headers.getlist("authorization")) == 1
-        and credentials is not None
-        and len(credentials.credentials) <= 128
-        and verify_token(credentials.credentials)
-    )
+    presented = bearer_token(request, credentials)
+    return presented is not None and verify_token(presented)
 
 
 async def require_task_import_access(
@@ -129,3 +149,26 @@ async def require_job_submission_access(
             headers={"WWW-Authenticate": "Bearer"},
         )
     return services
+
+
+async def require_worker_access(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(worker_bearer)],
+) -> WorkerAuthorization:
+    services = getattr(request.app.state, "worker_authentication_services", None)
+    if not isinstance(services, WorkerAuthenticationServices):
+        raise api_error(
+            503,
+            ApiErrorCode.WORKER_UNAVAILABLE,
+            "Worker authentication is unavailable.",
+        )
+    presented = bearer_token(request, credentials)
+    authorization = services.authenticate(presented) if presented is not None else None
+    if authorization is None:
+        raise api_error(
+            401,
+            ApiErrorCode.UNAUTHORIZED,
+            "Valid worker authentication is required.",
+            headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+        )
+    return authorization

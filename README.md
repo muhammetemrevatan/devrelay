@@ -21,6 +21,8 @@ and reconciles open pull requests with stored Job/task branch associations.
 Its transport is fixture-tested; no live account connection is implied.
 An optional Job submission API uses a separate operator token and explicit
 repository scope to record queued Jobs. It is disabled by default.
+Optional configured worker authentication verifies a separate expiring token
+and returns only the authenticated worker's identity and repository scope.
 Live account validation, worker dispatch, agent execution, PR publication and
 deployment automation are not implemented yet.
 
@@ -189,9 +191,45 @@ Use HTTPS or a protected loopback tunnel and preserve network access restriction
 
 The route is absent unless submission authentication is explicitly configured.
 Startup opens configured resources without provider reads, schema migration or
-database readiness checks. Submission records queued definitions only. Worker
-authentication, fresh pre-execution reconciliation,
+database readiness checks. Submission records queued definitions only.
+Fresh pre-execution reconciliation,
 dispatch and execution remain later steps.
+
+## Configured worker identity
+
+Worker identity verification is disabled by default. Set
+`DEVRELAY_CONTROL_WORKERS` to an explicit JSON array of registrations containing
+`worker_id`, a separately generated `auth_token`, an aware `expires_at`, `enabled`
+and `allowed_repository_ids`. There may be at most 32 registrations, each scoped
+to 1..32 enabled repository policies with complete GitHub numeric configuration.
+Worker IDs and tokens must be unique; operator and integration credentials cannot
+be reused. Registrations default to disabled.
+
+Generate each worker token locally using `secrets.token_urlsafe(32)`, as in the
+operator setup command. Tokens must be 43..128 URL-safe characters; placeholders
+are rejected. Set the same token in the local `DEVRELAY_WORKER_AUTH_TOKEN` secret.
+`devrelay-worker --check-config` validates local configuration only and makes no
+control request. Keep transport on HTTPS or a protected loopback tunnel.
+
+```http
+GET /api/v1/worker/identity
+Authorization: Bearer <worker-token>
+```
+
+The endpoint derives the worker UUID from the token and returns only its own
+repository scope, credential expiry and protocol version 1, with
+`Cache-Control: no-store`. Body/query/cookie identity or tokens grant no authority.
+Wrong, expired and disabled credentials receive the same sanitized 401 response.
+Expiry is checked against control-process UTC time on every request. Expired
+registrations can load so the service can restart, but cannot authenticate.
+
+To rotate or revoke a token or change scope, replace/remove/disable its
+registration and restart every control process. An old process retains its
+loaded policy until restarted. No registration or token issuance API is exposed.
+The identity endpoint creates no session, lease or assignment and opens no
+database or provider resources. Future claim requests must independently verify
+authority and expiry using database time. Worker claims, heartbeat fencing,
+assignment recovery, execution and agent isolation remain pending.
 
 ## GitHub observation
 
@@ -297,7 +335,7 @@ explicit trusted observer; the optional GitHub implementation supplies verified
 read-only observations and never a permissive default.
 Import authentication grants import only.
 
-There is no Job HTTP endpoint or worker dispatch yet. Preparation/candidate values
+Worker dispatch is not implemented. Preparation/candidate values
 alone do not start work; only the submission use case records a durable Job.
 Repository configuration alone exposes no new route or provider adapter.
 

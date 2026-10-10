@@ -18,7 +18,7 @@ def test_worker_execution_is_explicitly_unavailable(
 def test_configuration_check_does_not_print_credentials(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    token = "test-only-worker-token-0123456789abcdef"
+    token = "test_only_worker_token_0123456789abcdefghijklmnop"
     monkeypatch.setenv("DEVRELAY_WORKER_CONTROL_URL", "http://127.0.0.1:8000")
     monkeypatch.setenv("DEVRELAY_WORKER_AUTH_TOKEN", token)
     monkeypatch.setattr("sys.argv", ["devrelay-worker", "--check-config"])

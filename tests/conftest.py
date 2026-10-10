@@ -1,6 +1,7 @@
 import os
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -19,6 +20,7 @@ from devrelay.config.github import GitHubRepositoryId, GitHubSettings
 from devrelay.config.jira import JiraSettings
 from devrelay.config.job_submission import JobSubmissionSettings
 from devrelay.config.repositories import CheckSettings, RepositorySettings
+from devrelay.config.worker_authentication import WorkerRegistrationSettings
 
 
 @pytest.fixture(autouse=True)
@@ -78,6 +80,24 @@ def submission_configuration() -> ControlSettings:
             allowed_repository_ids=frozenset({repository_id}),
         ),
     )
+
+
+@pytest.fixture
+def worker_configuration(submission_configuration: ControlSettings) -> ControlSettings:
+    values = submission_configuration.model_dump()
+    values["job_submission"] = None
+    values["workers"] = (
+        WorkerRegistrationSettings(
+            worker_id=UUID("22222222-2222-3333-4444-555555555555"),
+            auth_token=SecretStr("test_only_worker_token_0123456789abcdefghijklmnop"),
+            expires_at=datetime(2026, 10, 10, tzinfo=UTC) + timedelta(hours=1),
+            enabled=True,
+            allowed_repository_ids=frozenset(
+                {submission_configuration.repositories[0].repository_id}
+            ),
+        ),
+    )
+    return ControlSettings.model_validate(values)
 
 
 @pytest.fixture
