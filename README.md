@@ -354,6 +354,20 @@ rejected once a numeric binding has been stored, preserving accepted identity.
 The migrations support queued definitions only. Worker claims, lease/state
 updates, durable lifecycle history and intentional replay generations require
 later migrations. This submission lock is not the global coding concurrency slot.
+
+Migration 0004 separates the accepted definition from its current workflow
+projection. Every submission atomically creates its definition, complete checks,
+queued workflow and version-0 creation event. Existing bound and unbound
+definitions are backfilled without changing fingerprints or guessing numeric
+repository identity. The unresolved task/repository guard belongs to the workflow;
+submission responses use its materialized status. Missing or inconsistent
+workflow/history fails closed. This foundation supports queued creation only;
+claims, state transitions and worker execution remain disabled.
+
+Schema and code must be rolled out together: stop control writers, explicitly
+migrate, deploy the matching code, then restart. Old writers that omit workflow
+creation cannot commit. Startup never runs migrations. A queued-only downgrade
+preserves definitions; advanced or inconsistent workflow history blocks it.
 Composition requires an
 explicit trusted observer; the optional GitHub implementation supplies verified
 read-only observations and never a permissive default.

@@ -8,14 +8,12 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
-    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     Uuid,
     func,
-    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.orm import Mapped, mapped_column
@@ -90,12 +88,16 @@ class JobRecord(Base):
             name="uq_jobs_snapshot_repository_generation",
         ),
         UniqueConstraint("id", "required_check_count", name="uq_jobs_id_check_count"),
-        Index(
-            "uq_jobs_unresolved_task_repository",
-            "source_task_id",
-            "repository_id",
-            unique=True,
-            postgresql_where=text("blocks_new_submission IS TRUE"),
+        UniqueConstraint(
+            "id", "source_task_id", "repository_id", name="uq_jobs_definition_identity"
+        ),
+        ForeignKeyConstraint(
+            ["id"],
+            ["job_workflows.job_id"],
+            name="fk_jobs_workflow",
+            deferrable=True,
+            initially="DEFERRED",
+            use_alter=True,
         ),
         CheckConstraint(
             "submission_key ~ '^[0-9a-f]{64}$' AND submission_fingerprint ~ '^[0-9a-f]{64}$'",
