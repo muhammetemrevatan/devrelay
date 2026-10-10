@@ -4,6 +4,8 @@ from pathlib import Path
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from devrelay.config.security import validate_bearer_token
+
 
 class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(
@@ -14,9 +16,14 @@ class WorkerSettings(BaseSettings):
     )
 
     control_url: AnyHttpUrl
-    auth_token: SecretStr = Field(min_length=32)
+    auth_token: SecretStr = Field(min_length=43, max_length=128)
     workspace_root: Path = Path("workspaces")
     poll_interval_seconds: int = Field(default=5, ge=1, le=300)
+
+    @field_validator("auth_token")
+    @classmethod
+    def require_generated_token(cls, value: SecretStr) -> SecretStr:
+        return validate_bearer_token(value)
 
     @field_validator("control_url")
     @classmethod

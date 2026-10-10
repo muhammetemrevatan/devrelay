@@ -36,6 +36,7 @@ from devrelay.application.tasks import TaskImportRejected
 
 class ApiErrorCode(StrEnum):
     UNAUTHORIZED = "unauthorized"
+    WORKER_UNAVAILABLE = "worker_unavailable"
     UNAVAILABLE = "import_unavailable"
     BUSY = "import_busy"
     INVALID_REQUEST = "invalid_request"

@@ -15,16 +15,18 @@ from devrelay.api.dependencies import (
     JobSubmissionServices,
     SubmissionOperation,
     TaskImportServices,
+    WorkerAuthenticationServices,
 )
 from devrelay.api.errors import register_error_handlers
 from devrelay.api.middleware import UnexpectedErrorMiddleware
 from devrelay.api.routes.health import router
 from devrelay.api.routes.jobs import router as jobs_router
 from devrelay.api.routes.tasks import router as tasks_router
+from devrelay.api.routes.workers import router as workers_router
 from devrelay.application.contracts.submissions import SubmissionAuthorization
 from devrelay.bootstrap.jobs import open_github_job_submitter
 from devrelay.bootstrap.persistence import open_database_engine
-from devrelay.bootstrap.security import token_verifier
+from devrelay.bootstrap.security import token_verifier, worker_authenticator
 from devrelay.bootstrap.tasks import open_task_importer
 from devrelay.config.control import ControlSettings, RuntimeEnvironment
 
@@ -77,8 +79,15 @@ def create_app(
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.task_import_services = None
         application.state.job_submission_services = None
+        application.state.worker_authentication_services = None
         async with AsyncExitStack() as stack:
             try:
+                if configuration.workers:
+                    application.state.worker_authentication_services = (
+                        WorkerAuthenticationServices(
+                            authenticate=worker_authenticator(configuration.workers)
+                        )
+                    )
                 engine = None
                 if (
                     configuration.task_import is not None and import_resources is None
@@ -133,6 +142,7 @@ def create_app(
             finally:
                 application.state.task_import_services = None
                 application.state.job_submission_services = None
+                application.state.worker_authentication_services = None
 
     app = FastAPI(
         title="DevRelay",
@@ -150,6 +160,8 @@ def create_app(
         app.include_router(tasks_router)
     if configuration.job_submission is not None:
         app.include_router(jobs_router)
+    if configuration.workers:
+        app.include_router(workers_router)
     return app
 
 

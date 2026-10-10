@@ -6,7 +6,7 @@ from pydantic import ValidationError
 from devrelay.config.control import ControlSettings, RuntimeEnvironment
 from devrelay.config.worker import WorkerSettings
 
-TEST_TOKEN = "test-only-worker-token-0123456789abcdef"
+TEST_TOKEN = "test_only_worker_token_0123456789abcdefghijklmnop"
 
 
 def test_process_environment_namespaces_are_separate(

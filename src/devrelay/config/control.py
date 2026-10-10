@@ -10,6 +10,7 @@ from devrelay.config.job_submission import JobSubmissionSettings
 from devrelay.config.logging import LogLevel
 from devrelay.config.repositories import RepositorySettings
 from devrelay.config.task_import import TaskImportSettings
+from devrelay.config.worker_authentication import WorkerRegistrationSettings
 
 
 class RuntimeEnvironment(StrEnum):
@@ -37,6 +38,40 @@ class ControlSettings(BaseSettings):
     task_import: TaskImportSettings | None = None
     job_submission: JobSubmissionSettings | None = None
     repositories: tuple[RepositorySettings, ...] = Field(default=(), max_length=32)
+    workers: tuple[WorkerRegistrationSettings, ...] = Field(default=(), max_length=32)
+
+    @model_validator(mode="after")
+    def require_worker_scope(self) -> ControlSettings:
+        if not self.workers:
+            return self
+        if self.github is None:
+            raise ValueError(
+                "Worker registration requires configured GitHub identities."
+            )
+        enabled = {repo.repository_id for repo in self.repositories if repo.enabled}
+        if any(not worker.allowed_repository_ids <= enabled for worker in self.workers):
+            raise ValueError(
+                "Worker scope must contain only enabled repository policies."
+            )
+        if len({worker.worker_id for worker in self.workers}) != len(self.workers):
+            raise ValueError("Worker registration requires unique identities.")
+        tokens = {worker.auth_token.get_secret_value() for worker in self.workers}
+        if len(tokens) != len(self.workers):
+            raise ValueError("Worker registration requires separate credentials.")
+        other_secrets = (
+            self.jira.api_token if self.jira else None,
+            self.database.password if self.database else None,
+            self.github.api_token,
+            self.task_import.auth_token if self.task_import else None,
+            self.job_submission.auth_token if self.job_submission else None,
+        )
+        if any(
+            secret.get_secret_value() in tokens
+            for secret in other_secrets
+            if secret is not None
+        ):
+            raise ValueError("Worker authentication requires a separate credential.")
+        return self
 
     @model_validator(mode="after")
     def require_submission_integrations(self) -> ControlSettings:
