@@ -685,7 +685,11 @@ def test_real_storage_job_preparation_reads_fresh_identity_without_db_checkout(
             )
             renamed = True
             async with open_job_preparer(
-                settings, (repo,), engine, transport=transport
+                settings,
+                (repo,),
+                engine,
+                repository_ids={repo.repository_id: 123},
+                transport=transport,
             ) as preparer:
                 prepared = await preparer.execute(
                     snapshot_id=imported.snapshot.id,

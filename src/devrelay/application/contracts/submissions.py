@@ -40,6 +40,7 @@ class RepositoryPolicy:
     """Bootstrap-owned allowlist. These values contain no service credentials."""
 
     repository_id: UUID
+    provider_repository_id: int | None
     slug: str
     enabled: bool
     target_branch: str
@@ -52,6 +53,11 @@ class RepositoryPolicy:
     def __post_init__(self) -> None:
         if not isinstance(self.repository_id, UUID) or type(self.enabled) is not bool:
             raise ValueError("Repository policy requires typed identity and admission.")
+        if self.provider_repository_id is not None and (
+            type(self.provider_repository_id) is not int
+            or not 1 <= self.provider_repository_id <= 2**63 - 1
+        ):
+            raise ValueError("Repository policy requires a positive provider identity.")
         for value, limit in (
             (self.slug, 256),
             (self.target_branch, 256),
@@ -98,8 +104,16 @@ class RepositoryHead:
     """Trusted Git observation, not a client-provided base commit."""
 
     repository_id: UUID
+    provider_repository_id: int
     target_branch: str
     revision: str
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.provider_repository_id) is not int
+            or not 1 <= self.provider_repository_id <= 2**63 - 1
+        ):
+            raise ValueError("Repository observation requires a provider identity.")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -108,6 +122,7 @@ class JobBranchAssociation:
 
     job_id: UUID
     repository_id: UUID
+    provider_repository_id: int | None
     source_task_id: UUID
     authorized_branch: str
 
@@ -152,6 +167,15 @@ class PreparedJobSubmission:
             "generation": 1,
         }
         object.__setattr__(self, "submission_key", _digest(key))
+        # Legacy definitions retain their exact version-1 fingerprint.
+        binding = (
+            {
+                "definition_version": 2,
+                "provider_repository_id": self.policy.provider_repository_id,
+            }
+            if self.policy.provider_repository_id is not None
+            else {}
+        )
         # Actor, capture metadata, candidate ID and moving Git head are not intent.
         # Retried requests resolve the original pinned Job; policy edits conflict.
         object.__setattr__(
@@ -159,6 +183,7 @@ class PreparedJobSubmission:
             "submission_fingerprint",
             _digest(
                 {
+                    **binding,
                     "key": key,
                     "slug": self.policy.slug,
                     "target_branch": self.policy.target_branch,
@@ -195,6 +220,8 @@ class PreparedJobSubmission:
         if (
             head.repository_id != self.policy.repository_id
             or head.target_branch != self.policy.target_branch
+            or self.policy.provider_repository_id is None
+            or head.provider_repository_id != self.policy.provider_repository_id
         ):
             raise ValueError("Repository head does not match submission policy.")
         return Job(

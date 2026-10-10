@@ -136,6 +136,7 @@ class GitHubRepositorySource:
         return RepositorySubmissionObservation(
             head=RepositoryHead(
                 repository_id=binding.repository_id,
+                provider_repository_id=binding.github_id,
                 target_branch=binding.target_branch,
                 revision=reference.object.sha,
             ),
@@ -189,6 +190,7 @@ class GitHubRepositorySource:
         by_id = {association.job_id: association for association in associations}
         if len(by_id) != len(associations) or any(
             association.repository_id != binding.repository_id
+            or association.provider_repository_id != binding.github_id
             or association.job_id not in job_ids
             for association in associations
         ):

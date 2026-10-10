@@ -52,6 +52,7 @@ from devrelay.domain.tasks import TaskIdentity, TaskSnapshot
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
     JobRecord,
+    RepositoryBindingRecord,
     RepositoryRecord,
 )
 from devrelay.infrastructure.persistence.models import (
@@ -96,6 +97,7 @@ async def save_task(
 
 def policy(check_count: int = 1) -> RepositoryPolicy:
     return RepositoryPolicy(
+        provider_repository_id=123,
         repository_id=uuid4(),
         slug="example/devrelay",
         enabled=True,
@@ -131,9 +133,11 @@ def prepared(
 async def record(
     engine: AsyncEngine, intent: PreparedJobSubmission, *, revision: str = "a" * 40
 ) -> SavedJobSubmission:
+    assert intent.policy.provider_repository_id is not None
     candidate = intent.build_candidate(
         job_id=uuid4(),
         head=RepositoryHead(
+            provider_repository_id=intent.policy.provider_repository_id,
             repository_id=intent.policy.repository_id,
             target_branch="main",
             revision=revision,
@@ -198,6 +202,7 @@ class GitSource:
             assert self.engine.sync_engine.pool.checkedout() == 0
         return RepositorySubmissionObservation(
             head=RepositoryHead(
+                provider_repository_id=123,
                 repository_id=repository_id,
                 target_branch=target_branch,
                 revision="a" * 40,
@@ -257,6 +262,7 @@ def test_complete_policy_round_trip_and_constant_query_budget(
                         "source_tasks",
                         "task_snapshots",
                         "repositories",
+                        "repository_bindings",
                         "jobs",
                         "job_checks",
                     )
@@ -267,7 +273,7 @@ def test_complete_policy_round_trip_and_constant_query_budget(
             try:
                 first = await record(engine, intent)
                 assert first.created
-                assert len(statements) == 7
+                assert len(statements) == 8
                 statements.clear()
                 read = await job_submission_reader(engine).find_by_key(
                     intent.submission_key
@@ -294,6 +300,205 @@ def test_complete_policy_round_trip_and_constant_query_budget(
             finally:
                 event.remove(engine.sync_engine, "before_cursor_execute", observe)
             assert await counts(engine) == (1, 1, check_count)
+
+    run(scenario())
+
+
+@pytest.mark.parametrize("collision", ["same_uuid", "same_provider_id"])
+def test_concurrent_repository_binding_conflicts_roll_back_all_new_rows(
+    database: DatabaseFactory, collision: str
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            repository = policy()
+            other = (
+                replace(repository, provider_repository_id=456)
+                if collision == "same_uuid"
+                else replace(repository, repository_id=uuid4(), slug="example/other")
+            )
+            intents = (
+                prepared(await save_task(engine), repository),
+                prepared(await save_task(engine, external="10006"), other),
+            )
+
+            async with asyncio.timeout(15):
+                results = await asyncio.gather(
+                    *(record(engine, intent) for intent in intents),
+                    return_exceptions=True,
+                )
+
+            assert sum(isinstance(item, SavedJobSubmission) for item in results) == 1
+            assert sum(isinstance(item, JobSubmissionConflict) for item in results) == 1
+            assert await counts(engine) == (1, 1, 1)
+            async with engine.connect() as connection:
+                bindings = (
+                    (
+                        await connection.execute(
+                            select(RepositoryBindingRecord.__table__)
+                        )
+                    )
+                    .mappings()
+                    .all()
+                )
+                job = (
+                    (await connection.execute(select(JobRecord.__table__)))
+                    .mappings()
+                    .one()
+                )
+            assert len(bindings) == 1
+            assert bindings[0]["repository_id"] == job["repository_id"]
+            assert (
+                bindings[0]["provider_repository_id"] == job["provider_repository_id"]
+            )
+
+    run(scenario())
+
+
+def migrate_to(
+    connection: Connection, revision: str, *, downgrade: bool = False
+) -> None:
+    config = Config(str(Path(__file__).resolve().parents[2] / "alembic.ini"))
+    config.attributes["connection"] = connection
+    if downgrade:
+        command.downgrade(config, revision)
+    else:
+        command.upgrade(config, revision)
+
+
+def test_binding_migration_preserves_legacy_definitions_without_backfill(
+    database: DatabaseFactory,
+) -> None:
+    async def scenario() -> None:
+        repository = policy()
+        async with database() as template_engine:
+            saved = await record(
+                template_engine, prepared(await save_task(template_engine), repository)
+            )
+            values = await header(template_engine)
+        async with database() as engine:
+            task = await save_task(engine)
+            legacy = prepared(task, replace(repository, provider_repository_id=None))
+            values.pop("provider_repository_id")
+            values.update(
+                source_task_id=task.source_task_id,
+                snapshot_id=task.snapshot.id,
+                definition_version=1,
+                submission_key=legacy.submission_key,
+                submission_fingerprint=legacy.submission_fingerprint,
+            )
+            async with engine.begin() as connection:
+                await connection.run_sync(
+                    lambda sync: migrate_to(
+                        sync, "0002_job_submissions", downgrade=True
+                    )
+                )
+                await connection.execute(
+                    insert(RepositoryRecord).values(
+                        id=repository.repository_id,
+                        provider="github",
+                        slug=repository.slug,
+                    )
+                )
+                await connection.execute(insert(JobRecord).values(**values))
+                await connection.execute(
+                    insert(JobCheckRecord).values(
+                        job_id=values["id"],
+                        check_id="check_0",
+                        check_count=1,
+                        position=0,
+                        argv=list(repository.checks[0].argv),
+                        working_directory=".",
+                        timeout_seconds=300,
+                    )
+                )
+            async with engine.begin() as connection:
+                await connection.run_sync(lambda sync: migrate_to(sync, "head"))
+
+            receipt = await job_submission_reader(engine).find_by_key(
+                legacy.submission_key
+            )
+
+            assert receipt == type(saved.stored)(
+                intent=legacy,
+                job=replace(
+                    saved.stored.job,
+                    source_task_id=task.source_task_id,
+                    snapshot_id=task.snapshot.id,
+                ),
+            )
+            assert (
+                receipt is not None
+                and receipt.intent.policy.provider_repository_id is None
+            )
+            assert (
+                receipt.intent.submission_fingerprint == legacy.submission_fingerprint
+            )
+            async with engine.connect() as connection:
+                assert (
+                    await connection.execute(select(RepositoryBindingRecord.__table__))
+                ).all() == []
+                assert (
+                    await connection.execute(select(JobRecord.definition_version))
+                ).scalar_one() == 1
+            source, git = FreshSource(task, engine), GitSource(engine)
+            with pytest.raises(JobSubmissionConflict):
+                await submit(
+                    submitter(engine, repository, source, git), task, repository
+                )
+            assert source.reads == git.reads == 0
+            async with engine.begin() as connection:
+                await connection.run_sync(
+                    lambda sync: migrate_to(
+                        sync, "0002_job_submissions", downgrade=True
+                    )
+                )
+                await connection.run_sync(lambda sync: migrate_to(sync, "head"))
+            new = await record(
+                engine, prepared(await save_task(engine, external="10006"), repository)
+            )
+            assert new.created
+            unchanged = await job_submission_reader(engine).find_by_key(
+                legacy.submission_key
+            )
+            assert unchanged == receipt
+            associations = await job_branch_reader(engine).find_by_ids(
+                repository_id=repository.repository_id,
+                job_ids=(values["id"], new.stored.job.id),
+            )
+            assert {row.job_id: row.provider_repository_id for row in associations} == {
+                values["id"]: None,
+                new.stored.job.id: 123,
+            }
+
+    run(scenario())
+
+
+def test_downgrade_cannot_discard_accepted_provider_bindings(
+    database: DatabaseFactory,
+) -> None:
+    async def scenario() -> None:
+        async with database() as engine:
+            intent = prepared(await save_task(engine), policy())
+            saved = await record(engine, intent)
+
+            with pytest.raises(IntegrityError):
+                async with engine.begin() as connection:
+                    await connection.run_sync(
+                        lambda sync: migrate_to(
+                            sync, "0002_job_submissions", downgrade=True
+                        )
+                    )
+
+            assert (
+                await job_submission_reader(engine).find_by_key(intent.submission_key)
+                == saved.stored
+            )
+            async with engine.connect() as connection:
+                assert (
+                    await connection.execute(
+                        text("SELECT version_num FROM alembic_version")
+                    )
+                ).scalar_one() == "0003_repository_bindings"
 
     run(scenario())
 
@@ -345,7 +550,10 @@ def test_unresolved_guard_is_scoped_to_task_and_repository(
         async with database() as engine:
             task, first_policy = await save_task(engine), policy()
             second_policy = replace(
-                first_policy, repository_id=uuid4(), slug="example/another"
+                first_policy,
+                repository_id=uuid4(),
+                slug="example/another",
+                provider_repository_id=456,
             )
             first = await record(engine, prepared(task, first_policy))
             second = await record(engine, prepared(task, second_policy))
@@ -356,7 +564,7 @@ def test_unresolved_guard_is_scoped_to_task_and_repository(
     run(scenario())
 
 
-@pytest.mark.parametrize("conflict", ["requirements", "policy"])
+@pytest.mark.parametrize("conflict", ["requirements", "policy", "provider_id"])
 def test_competing_intents_cannot_overwrite_or_create_two_deliveries(
     database: DatabaseFactory, conflict: str
 ) -> None:
@@ -371,6 +579,8 @@ def test_competing_intents_cannot_overwrite_or_create_two_deliveries(
             second_policy = (
                 replace(repository, version="v2")
                 if conflict == "policy"
+                else replace(repository, provider_repository_id=456)
+                if conflict == "provider_id"
                 else repository
             )
             intents = (
@@ -403,6 +613,7 @@ def test_no_commit_rolls_back_repository_job_and_checks(
             candidate = intent.build_candidate(
                 job_id=uuid4(),
                 head=RepositoryHead(
+                    provider_repository_id=123,
                     repository_id=intent.policy.repository_id,
                     target_branch="main",
                     revision="a" * 40,
@@ -412,6 +623,10 @@ def test_no_commit_rolls_back_repository_job_and_checks(
             async with job_submission_unit_of_work_factory(engine)() as unit:
                 assert (await unit.jobs.admit(intent, candidate)).created
             assert await counts(engine) == (0, 0, 0)
+            async with engine.connect() as connection:
+                assert (
+                    await connection.execute(select(RepositoryBindingRecord.__table__))
+                ).all() == []
 
     run(scenario())
 
@@ -477,7 +692,19 @@ async def header(engine: AsyncEngine) -> dict[str, Any]:
 
 
 @pytest.mark.parametrize(
-    "violation", ["source_fk", "unresolved", "incomplete", "count", "position", "argv"]
+    "violation",
+    [
+        "source_fk",
+        "unresolved",
+        "incomplete",
+        "count",
+        "position",
+        "argv",
+        "legacy",
+        "unbound",
+        "provider_fk",
+        "negative_provider",
+    ],
 )
 def test_database_rejects_inconsistent_submission_definitions(
     database: DatabaseFactory, violation: str
@@ -503,6 +730,14 @@ def test_database_rejects_inconsistent_submission_definitions(
             if violation == "source_fk":
                 third = await save_task(engine, external="10008")
                 values["source_task_id"] = third.source_task_id
+            elif violation == "legacy":
+                values.update(definition_version=1, provider_repository_id=None)
+            elif violation == "unbound":
+                values["provider_repository_id"] = None
+            elif violation == "provider_fk":
+                values["provider_repository_id"] = 456
+            elif violation == "negative_provider":
+                values["provider_repository_id"] = -1
             with pytest.raises(IntegrityError):
                 async with engine.begin() as connection:
                     await connection.execute(insert(JobRecord).values(**values))
@@ -525,7 +760,9 @@ def test_database_rejects_inconsistent_submission_definitions(
     run(scenario())
 
 
-@pytest.mark.parametrize("table", ["jobs", "job_checks", "repositories"])
+@pytest.mark.parametrize(
+    "table", ["jobs", "job_checks", "repositories", "repository_bindings"]
+)
 def test_definition_updates_and_deletes_are_rejected(
     database: DatabaseFactory, table: str
 ) -> None:
@@ -536,15 +773,25 @@ def test_definition_updates_and_deletes_are_rejected(
                 "jobs": JobRecord,
                 "job_checks": JobCheckRecord,
                 "repositories": RepositoryRecord,
+                "repository_bindings": RepositoryBindingRecord,
             }[table]
             field = {
                 "jobs": "actor_id",
                 "job_checks": "working_directory",
                 "repositories": "slug",
+                "repository_bindings": "provider_repository_id",
             }[table]
             with pytest.raises(IntegrityError):
                 async with engine.begin() as connection:
-                    await connection.execute(update(model).values(**{field: "changed"}))
+                    await connection.execute(
+                        update(model).values(
+                            **{
+                                field: 456
+                                if table == "repository_bindings"
+                                else "changed"
+                            }
+                        )
+                    )
             with pytest.raises(IntegrityError):
                 async with engine.begin() as connection:
                     await connection.execute(delete(model))
@@ -744,7 +991,7 @@ def test_submission_lookup_plans_on_500_jobs(database: DatabaseFactory) -> None:
                 await connection.execute(text("ANALYZE job_checks"))
                 queries = (
                     (
-                        "SELECT id FROM jobs WHERE submission_key=:key",
+                        "SELECT j.id, b.provider_repository_id FROM jobs j LEFT JOIN repository_bindings b ON j.repository_id=b.repository_id WHERE j.submission_key=:key",
                         {"key": jobs[250]["submission_key"]},
                     ),
                     (

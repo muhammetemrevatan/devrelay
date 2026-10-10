@@ -2,6 +2,7 @@ from datetime import datetime
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -41,9 +42,40 @@ class RepositoryRecord(Base):
     )
 
 
+class RepositoryBindingRecord(Base):
+    __tablename__ = "repository_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider_repository_id", name="uq_repository_bindings_provider_id"
+        ),
+        UniqueConstraint(
+            "repository_id",
+            "provider_repository_id",
+            name="uq_repository_bindings_pair",
+        ),
+        CheckConstraint(
+            "provider_repository_id > 0", name="ck_repository_bindings_positive_id"
+        ),
+    )
+    repository_id: Mapped[UUID] = mapped_column(
+        ForeignKey("repositories.id", ondelete="RESTRICT"), primary_key=True
+    )
+    provider_repository_id: Mapped[int] = mapped_column(BigInteger)
+    bound_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
 class JobRecord(Base):
     __tablename__ = "jobs"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["repository_id", "provider_repository_id"],
+            [
+                "repository_bindings.repository_id",
+                "repository_bindings.provider_repository_id",
+            ],
+            name="fk_jobs_repository_binding",
+            ondelete="RESTRICT",
+        ),
         ForeignKeyConstraint(
             ["snapshot_id", "source_task_id"],
             ["task_snapshots.id", "task_snapshots.source_task_id"],
@@ -70,7 +102,7 @@ class JobRecord(Base):
             name="ck_jobs_submission_hashes",
         ),
         CheckConstraint(
-            "submission_generation = 1 AND definition_version = 1",
+            "submission_generation = 1 AND ((definition_version = 1 AND provider_repository_id IS NULL) OR (definition_version = 2 AND provider_repository_id IS NOT NULL AND provider_repository_id > 0))",
             name="ck_jobs_definition_version",
         ),
         CheckConstraint(
@@ -101,6 +133,7 @@ class JobRecord(Base):
     repository_id: Mapped[UUID] = mapped_column(
         ForeignKey("repositories.id", ondelete="RESTRICT")
     )
+    provider_repository_id: Mapped[int | None] = mapped_column(BigInteger)
     submission_key: Mapped[str] = mapped_column(String(64))
     submission_fingerprint: Mapped[str] = mapped_column(String(64))
     submission_generation: Mapped[int] = mapped_column(Integer)

@@ -93,6 +93,7 @@ def pull_request(
 
 def association() -> JobBranchAssociation:
     return JobBranchAssociation(
+        provider_repository_id=123,
         job_id=JOB_ID,
         repository_id=REPO_ID,
         source_task_id=SOURCE_ID,
@@ -158,6 +159,7 @@ def test_repository_head_is_verified_with_read_only_bounded_requests(
     branches = Branches()
     result = observe(handler([], requests), branches)
     assert result.head.repository_id == REPO_ID
+    assert result.head.provider_repository_id == 123
     assert result.head.revision == "a" * 40
     assert result.unresolved_pull_request is None
     assert branches.calls == []
@@ -223,6 +225,8 @@ def test_other_task_and_unrelated_pr_text_do_not_authorize_or_block() -> None:
         ((), BRANCH),
         ((), "devrelay/jobs/not-a-job"),
         ((replace(association(), repository_id=uuid4()),), BRANCH),
+        ((replace(association(), provider_repository_id=456),), BRANCH),
+        ((replace(association(), provider_repository_id=None),), BRANCH),
         ((replace(association(), authorized_branch="other/branch"),), BRANCH),
         ((association(), association()), BRANCH),
     ],

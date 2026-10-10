@@ -18,6 +18,7 @@ from devrelay.domain.tasks import TaskIdentity
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
     JobRecord,
+    RepositoryBindingRecord,
     RepositoryRecord,
 )
 from devrelay.infrastructure.persistence.models import (
@@ -33,12 +34,24 @@ def materialize_submission(
     source: SourceTaskRecord,
     repository: RepositoryRecord,
     checks: tuple[JobCheckRecord, ...],
+    binding: RepositoryBindingRecord | None,
 ) -> StoredJobSubmission:
     if (
         JobStatus(record.status) is not JobStatus.QUEUED
         or record.workflow_version != 0
         or not record.blocks_new_submission
-        or record.definition_version != 1
+        or record.definition_version not in (1, 2)
+        or (
+            record.definition_version == 1 and record.provider_repository_id is not None
+        )
+        or (
+            record.definition_version == 2
+            and (
+                binding is None
+                or record.provider_repository_id != binding.provider_repository_id
+                or record.repository_id != binding.repository_id
+            )
+        )
         or record.submission_generation != 1
         or len(checks) != record.required_check_count
         or any(
@@ -62,6 +75,7 @@ def materialize_submission(
     )
     policy = RepositoryPolicy(
         repository_id=repository.id,
+        provider_repository_id=record.provider_repository_id,
         slug=record.repository_slug,
         enabled=True,
         target_branch=record.target_branch,
