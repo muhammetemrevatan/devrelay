@@ -121,8 +121,12 @@ jobs:
             const successful = checks === 'success' && container === 'success';
             const status = successful ? 'SUCCESS' : 'FAILED';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const badgeColor = successful ? 'brightgreen' : 'red';
+            const badgeUrl = `https://img.shields.io/badge/CI-${status}-${badgeColor}?style=for-the-badge`;
             const body = [
-              `**CI ${status}**`,
+              `## CI ${status}`,
+              '',
+              `[![CI ${status}](${badgeUrl})](${runUrl})`,
               '',
               `Commit: ${testedHead}`,
               `Run: [CI results](${runUrl}) (attempt ${process.env.GITHUB_RUN_ATTEMPT})`,
