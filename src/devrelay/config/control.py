@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from devrelay.config.database import DatabaseSettings
 from devrelay.config.github import GitHubSettings
 from devrelay.config.jira import JiraSettings
+from devrelay.config.job_submission import JobSubmissionSettings
 from devrelay.config.logging import LogLevel
 from devrelay.config.repositories import RepositorySettings
 from devrelay.config.task_import import TaskImportSettings
@@ -34,7 +35,38 @@ class ControlSettings(BaseSettings):
     github: GitHubSettings | None = None
     database: DatabaseSettings | None = None
     task_import: TaskImportSettings | None = None
+    job_submission: JobSubmissionSettings | None = None
     repositories: tuple[RepositorySettings, ...] = Field(default=(), max_length=32)
+
+    @model_validator(mode="after")
+    def require_submission_integrations(self) -> ControlSettings:
+        submission = self.job_submission
+        if submission is None:
+            return self
+        if self.jira is None or self.database is None or self.github is None:
+            raise ValueError(
+                "Job submission requires complete Jira, database and GitHub settings."
+            )
+        enabled = {repo.repository_id for repo in self.repositories if repo.enabled}
+        if not submission.allowed_repository_ids <= enabled:
+            raise ValueError(
+                "Submission scope must contain only enabled repository policies."
+            )
+        other_secrets = (
+            self.jira.api_token,
+            self.database.password,
+            self.github.api_token,
+            self.task_import.auth_token if self.task_import else None,
+        )
+        if any(
+            submission.auth_token == secret
+            for secret in other_secrets
+            if secret is not None
+        ):
+            raise ValueError(
+                "Submission authentication requires a separate credential."
+            )
+        return self
 
     @model_validator(mode="after")
     def require_github_scope(self) -> ControlSettings:

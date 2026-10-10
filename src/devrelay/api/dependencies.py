@@ -1,23 +1,38 @@
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Annotated
+from typing import Annotated, Protocol
+from uuid import UUID
 
 from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from devrelay.api.errors import ApiErrorCode, api_error
+from devrelay.application.contracts.submissions import (
+    SavedJobSubmission,
+    SubmissionAuthorization,
+)
 from devrelay.application.tasks import TaskImportResult
 
 type ImportOperation = Callable[[str], Awaitable[TaskImportResult]]
 
 
+class SubmissionOperation(Protocol):
+    async def __call__(
+        self,
+        *,
+        snapshot_id: UUID,
+        repository_id: UUID,
+        authorization: SubmissionAuthorization,
+    ) -> SavedJobSubmission: ...
+
+
 @dataclass(slots=True, kw_only=True)
-class TaskImportServices:
-    import_task: ImportOperation
-    verify_token: Callable[[str], bool] = field(repr=False)
+class RequestAdmission:
     max_concurrent_requests: int
     body_timeout_seconds: float
+    busy_code: ApiErrorCode = ApiErrorCode.BUSY
+    busy_message: str = "Task import is busy."
     _active: int = field(default=0, init=False, repr=False)
 
     @contextmanager
@@ -26,8 +41,8 @@ class TaskImportServices:
         if self._active >= self.max_concurrent_requests:
             raise api_error(
                 503,
-                ApiErrorCode.BUSY,
-                "Task import is busy.",
+                self.busy_code,
+                self.busy_message,
                 headers={"Retry-After": "1"},
             )
         self._active += 1
@@ -37,11 +52,45 @@ class TaskImportServices:
             self._active -= 1
 
 
+@dataclass(slots=True, kw_only=True)
+class TaskImportServices(RequestAdmission):
+    import_task: ImportOperation
+    verify_token: Callable[[str], bool] = field(repr=False)
+
+
+@dataclass(slots=True, kw_only=True)
+class JobSubmissionServices(RequestAdmission):
+    submit_job: SubmissionOperation
+    verify_token: Callable[[str], bool] = field(repr=False)
+    authorization: SubmissionAuthorization
+    busy_code: ApiErrorCode = ApiErrorCode.SUBMISSION_BUSY
+    busy_message: str = "Job submission is busy."
+
+
 bearer = HTTPBearer(
     auto_error=False,
     scheme_name="TaskImportBearer",
     description="Operator token scoped to task import.",
 )
+
+submission_bearer = HTTPBearer(
+    auto_error=False,
+    scheme_name="JobSubmissionBearer",
+    description="Operator token scoped to explicit repository Job submission.",
+)
+
+
+def valid_bearer(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None,
+    verify_token: Callable[[str], bool],
+) -> bool:
+    return (
+        len(request.headers.getlist("authorization")) == 1
+        and credentials is not None
+        and len(credentials.credentials) <= 128
+        and verify_token(credentials.credentials)
+    )
 
 
 async def require_task_import_access(
@@ -51,16 +100,32 @@ async def require_task_import_access(
     services = getattr(request.app.state, "task_import_services", None)
     if not isinstance(services, TaskImportServices):
         raise api_error(503, ApiErrorCode.UNAVAILABLE, "Task import is unavailable.")
-    if (
-        len(request.headers.getlist("authorization")) != 1
-        or credentials is None
-        or len(credentials.credentials) > 128
-        or not services.verify_token(credentials.credentials)
-    ):
+    if not valid_bearer(request, credentials, services.verify_token):
         raise api_error(
             401,
             ApiErrorCode.UNAUTHORIZED,
             "Valid import authentication is required.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return services
+
+
+async def require_job_submission_access(
+    request: Request,
+    credentials: Annotated[
+        HTTPAuthorizationCredentials | None, Depends(submission_bearer)
+    ],
+) -> JobSubmissionServices:
+    services = getattr(request.app.state, "job_submission_services", None)
+    if not isinstance(services, JobSubmissionServices):
+        raise api_error(
+            503, ApiErrorCode.SUBMISSION_UNAVAILABLE, "Job submission is unavailable."
+        )
+    if not valid_bearer(request, credentials, services.verify_token):
+        raise api_error(
+            401,
+            ApiErrorCode.UNAUTHORIZED,
+            "Valid submission authentication is required.",
             headers={"WWW-Authenticate": "Bearer"},
         )
     return services

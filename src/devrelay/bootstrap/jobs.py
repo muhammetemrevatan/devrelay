@@ -96,7 +96,7 @@ async def open_github_job_submitter(
     jira_transport: httpx.AsyncBaseTransport | None = None,
     github_transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[SubmitJob]:
-    """Wire optional verified observation; this does not expose submission HTTP."""
+    """Wire a verified observer to persistent queued Job submission."""
     async with open_github_repository_source(
         github, repositories, job_branch_reader(engine), transport=github_transport
     ) as observer:
