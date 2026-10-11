@@ -10,6 +10,7 @@ from devrelay.application.contracts.submissions import (
     SavedJobSubmission,
     StoredJobSubmission,
     SubmissionAuthorization,
+    repository_policy_map,
 )
 from devrelay.application.ports.job_persistence import (
     JobSubmissionReader,
@@ -52,21 +53,9 @@ class PrepareJobSubmission:
         source: TaskReadinessSource,
         policies: tuple[RepositoryPolicy, ...],
     ) -> None:
-        if len(policies) > 32 or len({p.repository_id for p in policies}) != len(
-            policies
-        ):
-            raise ValueError(
-                "Repository policies must be bounded and uniquely identified."
-            )
-        if len({p.slug.casefold() for p in policies}) != len(policies):
-            raise ValueError("A repository cannot have multiple policy identities.")
-        if any(p.provider_repository_id is None for p in policies) or len(
-            {p.provider_repository_id for p in policies}
-        ) != len(policies):
-            raise ValueError("Repository policies require unique provider identities.")
         self._snapshots = snapshots
         self._source = source
-        self._policies = {policy.repository_id: policy for policy in policies}
+        self._policies = repository_policy_map(policies)
 
     async def execute(
         self,

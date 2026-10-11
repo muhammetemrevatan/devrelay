@@ -78,6 +78,20 @@ class RepositoryPolicy:
             raise ValueError("Repository repair budget must be explicit and bounded.")
 
 
+def repository_policy_map(
+    policies: tuple[RepositoryPolicy, ...],
+) -> dict[UUID, RepositoryPolicy]:
+    if len(policies) > 32 or len({p.repository_id for p in policies}) != len(policies):
+        raise ValueError("Repository policies must be bounded and uniquely identified.")
+    if len({p.slug.casefold() for p in policies}) != len(policies):
+        raise ValueError("A repository cannot have multiple policy identities.")
+    if any(p.provider_repository_id is None for p in policies) or len(
+        {p.provider_repository_id for p in policies}
+    ) != len(policies):
+        raise ValueError("Repository policies require unique provider identities.")
+    return {policy.repository_id: policy for policy in policies}
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class SubmissionAuthorization:
     """Trusted caller scope, constructed after separate submission authentication.

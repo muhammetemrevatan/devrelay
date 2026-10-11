@@ -55,6 +55,15 @@ class JobWorkflowRecord(Base):
             unique=True,
             postgresql_where=text("blocks_new_submission IS TRUE"),
         ),
+        Index(
+            "ix_job_workflows_queued_candidate",
+            "repository_id",
+            "created_at",
+            "job_id",
+            postgresql_where=text(
+                "status = 'queued' AND workflow_version = 0 AND blocks_new_submission IS TRUE"
+            ),
+        ),
     )
     job_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     source_task_id: Mapped[UUID] = mapped_column(Uuid)

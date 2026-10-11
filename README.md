@@ -32,6 +32,14 @@ It restores the original request after restart and excludes a second worker proc
 Live account validation, worker dispatch, agent execution, PR publication and
 deployment automation are not implemented yet.
 
+Control-side claim preparation can now read one scoped queued candidate and
+recheck Jira requirements, current repository policy, numeric repository identity,
+pinned target revision and conflicting pull requests before assignment. Provider
+reads run after the database session is released; the observation expires after
+30 seconds. This is an eligibility observation, not a reservation or permission
+to execute. Atomic claims/receipts, acknowledgement and worker polling remain
+pending. Migration 0005 adds only a query-driven queue index and changes no state.
+
 ## Planned workflow
 
 1. Prepare a Jira task with a description and acceptance criteria.
