@@ -62,6 +62,8 @@ class JobWorkflowRecord(Base):
             "((status = 'queued' AND workflow_version = 0 AND updated_at = created_at "
             "AND active_attempt_id IS NULL AND last_attempt_id IS NULL AND last_attempt_number = 0) "
             "OR (status = 'claimed' AND workflow_version = 1 AND active_attempt_id IS NOT NULL "
+            "AND last_attempt_id IS NOT NULL AND active_attempt_id = last_attempt_id AND last_attempt_number = 1) "
+            "OR (status = 'running' AND workflow_version = 2 AND active_attempt_id IS NOT NULL "
             "AND last_attempt_id IS NOT NULL AND active_attempt_id = last_attempt_id AND last_attempt_number = 1))",
             name="ck_job_workflows_claim_state",
         ),
@@ -121,7 +123,10 @@ class JobWorkflowEventRecord(Base):
             "AND attempt_id IS NULL AND previous_version IS NULL AND previous_status IS NULL) "
             "OR (workflow_version = 1 AND status = 'claimed' AND event_type = 'claimed' "
             "AND attempt_id IS NOT NULL AND previous_version IS NOT NULL AND previous_version = 0 "
-            "AND previous_status IS NOT NULL AND previous_status = 'queued')",
+            "AND previous_status IS NOT NULL AND previous_status = 'queued') "
+            "OR (workflow_version = 2 AND status = 'running' AND event_type = 'acknowledged' "
+            "AND attempt_id IS NOT NULL AND previous_version IS NOT NULL AND previous_version = 1 "
+            "AND previous_status IS NOT NULL AND previous_status = 'claimed')",
             name="ck_job_workflow_events_claim_state",
         ),
     )

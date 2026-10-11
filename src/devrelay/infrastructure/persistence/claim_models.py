@@ -71,10 +71,12 @@ class ExecutionAttemptRecord(Base):
         UniqueConstraint("id", "job_id", "worker_id", "claim_request_id"),
         CheckConstraint("attempt_number = 1"),
         CheckConstraint("generation = 1"),
-        CheckConstraint("status = 'claimed'"),
-        CheckConstraint("updated_at = issued_at AND expires_at > issued_at"),
         CheckConstraint(
-            "acknowledged_at IS NULL AND revoked_at IS NULL AND ended_at IS NULL"
+            "expires_at > issued_at AND revoked_at IS NULL AND ended_at IS NULL "
+            "AND ((status = 'claimed' AND updated_at = issued_at AND acknowledged_at IS NULL) "
+            "OR (status = 'running' AND acknowledged_at IS NOT NULL AND updated_at = acknowledged_at "
+            "AND acknowledged_at >= issued_at AND acknowledged_at < expires_at))",
+            name="ck_execution_attempts_ack_state",
         ),
         Index(
             "uq_execution_attempts_open_job",

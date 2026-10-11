@@ -23,6 +23,9 @@ from devrelay.application.jobs import (
 from devrelay.application.ports.job_persistence import JobPersistenceError
 from devrelay.application.ports.task_persistence import TaskPersistenceError
 from devrelay.domain.jobs.job import Job
+from devrelay.infrastructure.persistence.acknowledgement_models import (
+    AcknowledgementReceiptRecord,
+)
 from devrelay.infrastructure.persistence.claim_models import ExecutionAttemptRecord
 from devrelay.infrastructure.persistence.job_mapping import materialize_submission
 from devrelay.infrastructure.persistence.job_models import (
@@ -47,6 +50,7 @@ async def read_submission(
     submission_key: str,
 ) -> StoredJobSubmission | None:
     initial_event = aliased(JobWorkflowEventRecord)
+    claim_event = aliased(JobWorkflowEventRecord)
     row = (
         await session.execute(
             select(
@@ -59,6 +63,8 @@ async def read_submission(
                 JobWorkflowEventRecord,
                 initial_event,
                 ExecutionAttemptRecord,
+                claim_event,
+                AcknowledgementReceiptRecord,
             )
             .join(TaskSnapshotRecord, JobRecord.snapshot_id == TaskSnapshotRecord.id)
             .join(SourceTaskRecord, JobRecord.source_task_id == SourceTaskRecord.id)
@@ -85,6 +91,15 @@ async def read_submission(
                 ExecutionAttemptRecord,
                 JobWorkflowRecord.active_attempt_id == ExecutionAttemptRecord.id,
             )
+            .outerjoin(
+                claim_event,
+                (claim_event.job_id == JobRecord.id)
+                & (claim_event.workflow_version == 1),
+            )
+            .outerjoin(
+                AcknowledgementReceiptRecord,
+                AcknowledgementReceiptRecord.attempt_id == ExecutionAttemptRecord.id,
+            )
             .where(JobRecord.submission_key == submission_key)
         )
     ).one_or_none()
@@ -100,6 +115,8 @@ async def read_submission(
         workflow_event,
         submitted,
         attempt,
+        claimed_event,
+        acknowledgement,
     ) = row
     checks = tuple(
         (
@@ -122,6 +139,8 @@ async def read_submission(
         workflow_event,
         submitted,
         attempt,
+        claimed_event,
+        acknowledgement,
     )
 
 

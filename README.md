@@ -60,8 +60,10 @@ new requests while preserving recovery. Proofs remain worker-owned; the control
 stores scoped verification digests rather than recoverable secrets.
 Migration 0006 supports only initial claims and refuses downgrade after claim
 history exists. Apply migrations explicitly with old writers stopped.
-Acknowledgement, heartbeat and execution remain pending; no polling or agent
-runtime is enabled.
+Control acknowledgement now validates accepted inputs and atomically advances
+Attempt/workflow/history with an immutable replay receipt. Its HTTP endpoint,
+worker response completion, heartbeat and execution remain pending; no polling
+or agent runtime is enabled.
 
 ## Planned workflow
 
@@ -367,11 +369,43 @@ proof bytes, original identities, assignment anchors and no-work markers. Damage
 state or an incomplete upgrade retains the old schema and fails closed. SQLite,
 DPAPI and integrity checks remain on the dedicated journal thread.
 
-This step prepares local input only. The control acknowledgement endpoint,
-atomic claimed-to-running transition, acknowledgement receipt and worker response
-completion are the next integration slice. Heartbeat, containment and runtime
+This step prepares local input only. The control now implements the atomic
+claimed-to-running transition and acknowledgement receipt described below.
+Its HTTP endpoint and worker response completion are the next integration slice.
+Heartbeat, containment and runtime
 selection are also required before launching an agent; the CLI remains a
 configuration validator.
+
+## Control acknowledgement persistence
+
+`AcknowledgeAssignedJob` recovers only the authenticated original assignment,
+validates its snapshot, base revision and complete definition digest off the
+database transaction, and delegates to bounded coordination storage. Bootstrap
+composes this use case only with explicitly enabled worker claims and the existing
+independent-proof credential guard; constructing it opens no connection or provider
+request. No acknowledgement HTTP route is registered yet.
+
+Migration 0007 adds one immutable acknowledgement receipt per Attempt and permits
+only the initial claimed/version-1 to running/version-2 transition. Storage locks
+slot, worker, source task, workflow and Attempt in order, then rechecks scope,
+credential expiry, original proof, generation, workflow version and lease deadline
+using fresh database time. Attempt, workflow, history and receipt commit together.
+Credential expiry is checked again before disclosure; a failed write rolls back
+the entire transition.
+
+Exact repeats return the original acknowledgement timestamp and accepted pins.
+Recovery after lease expiry requires current authentication and reports inactive
+authority; it never renews, replaces or releases the assignment. Original claim,
+assignment input and submission status reads remain available after acknowledgement.
+Definitions, check policy, claim receipt, generation, expiry and coding reservation
+are preserved. Running records acceptance of the assignment; it does not prove an
+agent process started or grant launch permission.
+
+The receipt's unique Attempt key bounds its count by accepted assignments, without
+new polling counters or automatic deletion. Downgrade rejects acknowledged history;
+claim-only data can downgrade and upgrade without losing its original records.
+Apply schema/code changes explicitly with old writers stopped. Migrations do not
+run at startup, and no live rollout is included.
 
 ## GitHub observation
 

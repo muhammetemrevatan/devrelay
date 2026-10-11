@@ -16,6 +16,9 @@ from devrelay.application.tasks import TaskImportPolicy
 from devrelay.domain.jobs.job import Job
 from devrelay.domain.jobs.values import AttemptStatus, JobStatus
 from devrelay.domain.tasks import TaskIdentity
+from devrelay.infrastructure.persistence.acknowledgement_models import (
+    AcknowledgementReceiptRecord,
+)
 from devrelay.infrastructure.persistence.claim_models import ExecutionAttemptRecord
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
@@ -45,6 +48,8 @@ def materialize_submission(
     workflow_event: JobWorkflowEventRecord | None,
     submitted: JobWorkflowEventRecord | None,
     attempt: ExecutionAttemptRecord | None,
+    claimed_event: JobWorkflowEventRecord | None,
+    acknowledgement: AcknowledgementReceiptRecord | None,
 ) -> StoredJobSubmission:
     if (
         JobStatus(record.status) is not JobStatus.QUEUED
@@ -133,7 +138,57 @@ def materialize_submission(
         and attempt.revoked_at is None
         and attempt.ended_at is None
     )
-    if not (queued or claimed):
+    running = (
+        workflow.status == JobStatus.RUNNING.value
+        and workflow.workflow_version == 2
+        and workflow.active_attempt_id is not None
+        and workflow.last_attempt_id == workflow.active_attempt_id
+        and workflow.last_attempt_number == 1
+        and workflow_event.event_type == WorkflowEventType.ACKNOWLEDGED.value
+        and workflow_event.attempt_id == workflow.active_attempt_id
+        and workflow_event.previous_version == 1
+        and workflow_event.previous_status == JobStatus.CLAIMED.value
+        and attempt is not None
+        and attempt.id == workflow.active_attempt_id
+        and attempt.job_id == record.id
+        and attempt.attempt_number == 1
+        and attempt.generation == 1
+        and attempt.status == AttemptStatus.RUNNING.value
+        and attempt.acknowledged_at == workflow.updated_at
+        and attempt.updated_at == workflow.updated_at
+        and attempt.issued_at <= workflow.updated_at < attempt.expires_at
+        and attempt.revoked_at is None
+        and attempt.ended_at is None
+        and claimed_event is not None
+        and claimed_event.status == JobStatus.CLAIMED.value
+        and claimed_event.event_type == WorkflowEventType.CLAIMED.value
+        and claimed_event.workflow_version == 1
+        and claimed_event.job_id == record.id
+        and claimed_event.attempt_id == attempt.id
+        and claimed_event.occurred_at == attempt.issued_at
+        and claimed_event.previous_version == 0
+        and claimed_event.previous_status == JobStatus.QUEUED.value
+        and acknowledgement is not None
+        and acknowledgement.attempt_id == attempt.id
+        and acknowledgement.job_id == record.id
+        and acknowledgement.worker_id == attempt.worker_id
+        and acknowledgement.claim_request_id == attempt.claim_request_id
+        and acknowledgement.generation == 1
+        and acknowledgement.repository_id == record.repository_id
+        and acknowledgement.snapshot_id == record.snapshot_id
+        and acknowledgement.base_revision == record.base_revision
+        and acknowledgement.acknowledged_at == attempt.acknowledged_at
+        and acknowledgement.workflow_version == 2
+        and acknowledgement.expected_workflow_version == 1
+        and acknowledgement.protocol_version == 1
+        and acknowledgement.definition_digest_version == 1
+        and acknowledgement.fingerprint_version == 1
+    )
+    if (queued or claimed) and acknowledgement is not None:
+        raise JobPersistenceError(
+            "Unacknowledged workflow contains acknowledgement history."
+        )
+    if not (queued or claimed or running):
         raise JobPersistenceError("Stored workflow transition is unsupported.")
     task = materialize_snapshot(
         snapshot,
