@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 from fastapi import Request
 from pydantic import BaseModel, ValidationError
@@ -12,6 +13,15 @@ from devrelay.api.errors import (
 )
 
 MAX_BODY_BYTES = 1024
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("Duplicate request key.")
+        value[key] = item
+    return value
 
 
 async def read_json_request[Payload: BaseModel](
@@ -38,8 +48,9 @@ async def read_json_request[Payload: BaseModel](
     except ClientDisconnect:
         raise RequestBodyInterrupted from None
     try:
+        json.loads(body.decode("utf-8"), object_pairs_hook=_unique_object)
         return model.model_validate_json(body)
-    except ValidationError:
+    except ValidationError, ValueError, RecursionError:
         raise invalid_request from None
 
 

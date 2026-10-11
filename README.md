@@ -33,12 +33,12 @@ It restores the original request after restart and excludes a second worker proc
 The local journal also commits correlated no-work completion or stable assignment
 references. No-work permits a new request; an assignment retains the original
 protected proof and blocks a new poll identity, including after restart or lease
-expiry. Repeated replies cannot replace or renew it. Journal version 3 upgrades
-valid version-1 pending and version-2 recovery records without changing their
+expiry. Repeated replies cannot replace or renew it. Journal version 4 upgrades
+valid version-1 pending, version-2 recovery and version-3 intent records without changing their
 ciphertext, original request identity or assignment anchors;
 damaged records fail closed. Recorded assignment metadata is authenticated with a
-local proof-bound integrity tag. These phases do not acknowledge work or launch
-agents, and the worker CLI still validates configuration only. An opt-in claim
+local proof-bound integrity tag. Acknowledgement completion retains historical
+evidence without launch authority; the worker CLI still validates configuration only. An opt-in claim
 API and bounded worker HTTP adapter now connect durable claims to local recovery.
 An assigned worker can also retrieve its complete immutable task/check inputs
 using the original protected claim proof. Payload reads never claim another Job.
@@ -61,9 +61,9 @@ stores scoped verification digests rather than recoverable secrets.
 Migration 0006 supports only initial claims and refuses downgrade after claim
 history exists. Apply migrations explicitly with old writers stopped.
 Control acknowledgement now validates accepted inputs and atomically advances
-Attempt/workflow/history with an immutable replay receipt. Its HTTP endpoint,
-worker response completion, heartbeat and execution remain pending; no polling
-or agent runtime is enabled.
+Attempt/workflow/history with an immutable replay receipt. An authenticated HTTP
+exchange records completion in the worker journal before returning. Heartbeat and
+execution remain pending; no polling or agent runtime is enabled.
 
 ## Planned workflow
 
@@ -286,7 +286,7 @@ There is no plaintext or non-Windows fallback. DPAPI protects data at rest;
 code running as the same Windows identity can decrypt it, so agent isolation
 remains a separate requirement. This adapter is not wired to worker polling or
 the CLI. Local acknowledgement intent is implemented as described below;
-control acknowledgement and launch intent remain pending.
+control acknowledgement is implemented, while launch intent remains pending.
 
 ## Worker claim exchange
 
@@ -345,7 +345,7 @@ Serialization/validation runs off the async event loop. Payload reads preserve t
 original request, receipt, expiry and journal phase. Expired assignments remain
 readable with renewed current authentication and inactive lease metadata. Retrieval
 does not recheck live providers, acknowledge work, renew authority or launch an
-agent. Durable acknowledgement, heartbeat and containment still precede execution.
+agent. Heartbeat and containment still precede execution.
 
 ## Worker acknowledgement intent
 
@@ -357,24 +357,46 @@ expected initial workflow version. The original protected proof and lease anchor
 remain in the journal. Task text and check payloads are not copied into recovery
 storage.
 
-Journal version 3 commits this input and the `acknowledgement_pending` phase
+The journal commits this input and the `acknowledgement_pending` phase
 atomically. Proof-bound integrity links the intent to its assignment; missing or
 changed pins and attempts to erase the intent by regressing the phase fail closed.
 After restart, preparation returns the same recorded input without HTTP, a new
 identity or renewed authority. Duplicate claim responses preserve pending intent.
 Later payload reads must still match its accepted definition digest.
 
-Valid version-1/version-2 journals upgrade in one transaction, preserving protected
+Valid version-1/version-2/version-3 journals upgrade to version 4 in one transaction, preserving protected
 proof bytes, original identities, assignment anchors and no-work markers. Damaged
 state or an incomplete upgrade retains the old schema and fails closed. SQLite,
 DPAPI and integrity checks remain on the dedicated journal thread.
 
 This step prepares local input only. The control now implements the atomic
 claimed-to-running transition and acknowledgement receipt described below.
-Its HTTP endpoint and worker response completion are the next integration slice.
+Its HTTP exchange and worker response completion are described below.
 Heartbeat, containment and runtime
 selection are also required before launching an agent; the CLI remains a
 configuration validator.
+
+## Worker acknowledgement exchange
+
+With worker claims enabled, `POST /api/v1/worker/attempts/{attempt_id}/acknowledgements`
+accepts an `intent` object containing the recorded acknowledgement/claim/Attempt
+UUIDs, generation, snapshot UUID, base revision, full definition digest and the
+protocol/digest/expected workflow versions (all initially 1), plus the original
+`proof`. It uses the worker bearer token and shares claim admission, authentication
+before body reads, the 1-KiB UTF-8 JSON limit, deadline and sanitized error boundary.
+The body Attempt must match the path. Unknown fields, duplicate keys and coerced
+versions are rejected. Responses wrap the nonsecret `AcknowledgementResult` in
+`result`, preserve original expiry and report current recovery/authority metadata.
+
+The explicit worker `acknowledge()` call commits intent before sending HTTP,
+validates the returned original pins, identity, scope and lease anchors, then
+atomically records `acknowledged` completion before returning. Version 4 retains
+the protected claim and intent; the bounded completion row stores only the first
+acknowledgement timestamp and workflow version 2. Proof-bound integrity detects
+completion tampering, erasure and phase regression. Current active/recovered flags
+are never persisted as authority. Repeated calls recover the same control receipt
+and original expiry; a lost response, local write failure or cancellation preserves
+exact input for explicit recovery. There are no automatic retries or execution.
 
 ## Control acknowledgement persistence
 
@@ -383,7 +405,7 @@ validates its snapshot, base revision and complete definition digest off the
 database transaction, and delegates to bounded coordination storage. Bootstrap
 composes this use case only with explicitly enabled worker claims and the existing
 independent-proof credential guard; constructing it opens no connection or provider
-request. No acknowledgement HTTP route is registered yet.
+request. The optional acknowledgement route delegates to this use case.
 
 Migration 0007 adds one immutable acknowledgement receipt per Attempt and permits
 only the initial claimed/version-1 to running/version-2 transition. Storage locks

@@ -8,6 +8,10 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from devrelay.api.errors import ApiErrorCode, api_error
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementResult,
+    WorkerAcknowledgementRequest,
+)
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.assignments import ClaimResult
 from devrelay.application.contracts.claims import WorkerClaimRequest
@@ -37,12 +41,17 @@ type ClaimOperation = Callable[
 type AssignmentOperation = Callable[
     [UUID, WorkerClaimRequest, WorkerAuthorization], Awaitable[AssignmentDelivery]
 ]
+type AcknowledgementOperation = Callable[
+    [WorkerAcknowledgementRequest, WorkerAuthorization],
+    Awaitable[AcknowledgementResult],
+]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WorkerClaimOperations:
     claim: ClaimOperation
     read_assignment: AssignmentOperation
+    acknowledge: AcknowledgementOperation | None = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -94,6 +103,7 @@ class WorkerAuthenticationServices:
 class WorkerClaimServices(RequestAdmission):
     claim_job: ClaimOperation
     read_assignment: AssignmentOperation | None = None
+    acknowledge: AcknowledgementOperation | None = None
     busy_code: ApiErrorCode = ApiErrorCode.CLAIM_BUSY
     busy_message: str = "Worker claims are busy."
 

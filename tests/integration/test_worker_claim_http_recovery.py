@@ -12,6 +12,7 @@ import pytest
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from devrelay.api.dependencies import WorkerClaimOperations
+from devrelay.application.acknowledgements import AcknowledgeAssignedJob
 from devrelay.application.claims import ClaimJob
 from devrelay.application.contracts.eligibility import PreparedJobClaim
 from devrelay.application.contracts.submissions import StoredJobSubmission
@@ -23,7 +24,7 @@ from devrelay.application.contracts.workers import (
 from devrelay.application.ports.control_gateway import ControlUnavailable
 from devrelay.application.worker_claims import PrepareWorkerClaim, RequestWorkerClaim
 from devrelay.bootstrap.control import create_app
-from devrelay.bootstrap.persistence import claim_store
+from devrelay.bootstrap.persistence import acknowledgement_store, claim_store
 from devrelay.bootstrap.worker import open_worker_claim_client
 from devrelay.config.control import ControlSettings
 from devrelay.config.worker import WorkerSettings
@@ -118,6 +119,10 @@ def test_lost_http_response_recovers_original_claim_after_worker_reopen(
                 yield WorkerClaimOperations(
                     claim=claimer.execute,
                     read_assignment=claimer.assignment_reader.execute,
+                    acknowledge=AcknowledgeAssignedJob(
+                        claimer.assignment_reader,
+                        acknowledgement_store(engine, (stored.intent.policy,)),
+                    ).execute,
                 )
 
             app = create_app(configuration, claim_resources=resources)
@@ -226,6 +231,14 @@ def test_lost_http_response_recovers_original_claim_after_worker_reopen(
                         assert delivered.outcome == result.outcome
                         assert (await worker.recover()).assignment == state.assignment
                         assert preparer.calls == 1
+                        intent = await worker.prepare_acknowledgement()
+                        recovered_transport.lose_next = True
+                        with pytest.raises(ControlUnavailable):
+                            await worker.acknowledge()
+                        assert (
+                            await worker.recover()
+                        ).phase is WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING
+                        assert (await worker.recover()).acknowledgement == intent
                     else:
                         assert (
                             state.last_no_work == result.outcome
@@ -236,6 +249,42 @@ def test_lost_http_response_recovers_original_claim_after_worker_reopen(
                         not in (private / "journal.sqlite3").read_bytes()
                     )
                 assert recovered_transport.inputs[0] == lost.inputs[0]
+                if assigned:
+                    final_transport = LostResponse(httpx.ASGITransport(app))
+                    final_transport.lose_next = False
+                    async with open_worker(final_transport) as worker:
+                        acknowledged = await worker.acknowledge()
+                        assert (
+                            acknowledged.recovered
+                            and acknowledged.lease_authority_active
+                        )
+                        state = await worker.recover()
+                        assert state.phase is WorkerRecoveryPhase.ACKNOWLEDGED
+                        assert state.completion is not None
+                        assert (
+                            state.completion.acknowledged_at
+                            == acknowledged.acknowledged_at
+                        )
+                        assert state.assignment == result.outcome
+                        assert (
+                            state.request is not None
+                            and state.request.proof.reveal() == original_proof
+                        )
+                        assert (
+                            final_transport.inputs[0] == recovered_transport.inputs[-1]
+                        )
+                        repeated_ack = await worker.acknowledge()
+                        assert (
+                            repeated_ack.acknowledged_at == acknowledged.acknowledged_at
+                        )
+                        assert (await worker.execute()).outcome == result.outcome
+                        assert (
+                            await worker.recover()
+                        ).phase is WorkerRecoveryPhase.ACKNOWLEDGED
+                        assert (
+                            await worker.fetch_assignment()
+                        ).outcome == result.outcome
+                        assert preparer.calls == 1
                 assert settings.auth_token.get_secret_value() not in repr(result)
 
     asyncio.run(

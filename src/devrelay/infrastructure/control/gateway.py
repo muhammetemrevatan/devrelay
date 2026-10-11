@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import Callable
+from dataclasses import asdict
 from datetime import UTC, datetime, timedelta
 from typing import Literal
 from uuid import UUID
@@ -8,6 +9,10 @@ from uuid import UUID
 import httpx
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementResult,
+    WorkerAcknowledgementRequest,
+)
 from devrelay.application.contracts.assignment_delivery import (
     MAX_ASSIGNMENT_BYTES,
     AssignmentDelivery,
@@ -27,6 +32,7 @@ from devrelay.application.ports.control_gateway import (
     ControlUnavailable,
     InvalidControlResponse,
 )
+from devrelay.infrastructure.control.acknowledgements import AcknowledgementPayload
 from devrelay.infrastructure.control.assignments import DeliveryPayload
 
 
@@ -151,7 +157,7 @@ class HttpControlGateway:
         method: Literal["GET", "POST"],
         path: str,
         *,
-        payload: dict[str, str | int] | None = None,
+        payload: dict[str, object] | None = None,
         max_response_bytes: int | None = None,
     ) -> bytes:
         max_bytes = (
@@ -284,3 +290,35 @@ class HttpControlGateway:
                 ) from None
 
         return await asyncio.to_thread(parse)
+
+    async def acknowledge(
+        self, request: WorkerAcknowledgementRequest, authorization: WorkerAuthorization
+    ) -> AcknowledgementResult:
+        if self._now() >= authorization.credential_expires_at:
+            raise ControlAccessDenied("Control worker authority has expired.")
+        intent = {
+            key: str(value) if isinstance(value, UUID) else value
+            for key, value in asdict(request.intent).items()
+        }
+        body = await self._exchange(
+            "POST",
+            f"api/v1/worker/attempts/{request.intent.attempt_id}/acknowledgements",
+            payload={"intent": intent, "proof": request.claim.proof.reveal()},
+        )
+        try:
+            result = AcknowledgementPayload.model_validate_json(body).result
+            if (
+                result.worker_id != authorization.worker_id
+                or result.repository_id not in authorization.allowed_repository_ids
+                or result.intent != request.intent
+                or (
+                    not result.recovered
+                    and result.expires_at > authorization.credential_expires_at
+                )
+            ):
+                raise ValueError("Uncorrelated acknowledgement response.")
+            return result
+        except ValidationError, ValueError:
+            raise InvalidControlResponse(
+                "Control acknowledgement failed validation."
+            ) from None

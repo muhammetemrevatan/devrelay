@@ -1,6 +1,10 @@
 from typing import Protocol
 from uuid import UUID
 
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementResult,
+    WorkerAcknowledgementRequest,
+)
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.application.contracts.worker_recovery import ClaimExchange
@@ -24,6 +28,10 @@ class ControlClaimRejected(Exception):
 
 
 class ControlGateway(Protocol):
+    async def acknowledge(
+        self, request: WorkerAcknowledgementRequest, authorization: WorkerAuthorization
+    ) -> AcknowledgementResult: ...
+
     async def identify(self) -> WorkerAuthorization: ...
 
     async def claim(

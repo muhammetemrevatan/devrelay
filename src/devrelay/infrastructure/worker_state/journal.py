@@ -14,6 +14,7 @@ from devrelay.application.contracts.claims import (
     WorkerClaimRequest,
 )
 from devrelay.application.contracts.worker_recovery import (
+    AcknowledgementCompletion,
     WorkerClaimOutcome,
     WorkerRecoveryState,
 )
@@ -23,6 +24,7 @@ from devrelay.application.ports.worker_journal import (
     WorkerStateUnavailable,
 )
 from devrelay.infrastructure.worker_state.acknowledgements import save_acknowledgement
+from devrelay.infrastructure.worker_state.completions import save_completion
 from devrelay.infrastructure.worker_state.outcomes import (
     create_outcome_schema,
     recovery_state,
@@ -100,12 +102,12 @@ class SqliteClaimStore:
                 create_outcome_schema(
                     connection, scope.key, prepared=int(pending is not None)
                 )
-            elif existing == (2, scope.key):
+            elif existing in ((2, scope.key), (3, scope.key)):
                 recovery_state(
-                    connection, self._scope, self._read_request(), allow_v2=True
+                    connection, self._scope, self._read_request(), allow_legacy=True
                 )
                 upgrade_outcome_schema(connection, scope.key)
-            elif existing != (3, scope.key):
+            elif existing != (4, scope.key):
                 raise WorkerStateUnavailable(_FAILURE)
             self._read_state()
             connection.execute("COMMIT")
@@ -403,6 +405,64 @@ class SqliteClaimStore:
             self._rollback()
             raise WorkerStateUnavailable(_FAILURE) from None
 
+    def record_acknowledgement(
+        self, request: WorkerClaimRequest, completion: AcknowledgementCompletion
+    ) -> WorkerRecoveryState:
+        connection = self._open()
+        try:
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._read_state()
+            if (
+                not isinstance(completion, AcknowledgementCompletion)
+                or state.request is None
+                or state.assignment is None
+                or state.acknowledgement != completion.intent
+                or request.claim_request_id != state.request.claim_request_id
+            ):
+                raise ClaimReplayConflict(
+                    "Completion requires original acknowledgement input."
+                )
+            verifier = LeaseProofVerifier.from_proof(
+                worker_id=self._scope.worker_id,
+                claim_request_id=state.request.claim_request_id,
+                proof=state.request.proof,
+            )
+            if not verifier.matches(
+                request.proof,
+                worker_id=self._scope.worker_id,
+                claim_request_id=request.claim_request_id,
+            ):
+                raise ClaimReplayConflict("Completion conflicts with original proof.")
+            if state.completion is not None:
+                if state.completion != completion:
+                    raise ClaimReplayConflict(
+                        "Completion conflicts with recorded evidence."
+                    )
+            else:
+                reference = state.assignment.assignment
+                if (
+                    reference is None
+                    or not reference.issued_at
+                    <= completion.acknowledged_at
+                    < reference.expires_at
+                ):
+                    raise ClaimReplayConflict(
+                        "Completion changed original lease bounds."
+                    )
+                save_completion(
+                    connection, self._scope, state.request, state.assignment, completion
+                )
+            result = self._read_state()
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
     def close(self) -> None:
         if self._connection is not None:
             connection, self._connection = self._connection, None
@@ -449,6 +509,16 @@ class AsyncClaimJournal:
 
     def stop_admission(self) -> None:
         self._closed = True
+
+    async def record_acknowledgement(
+        self, request: WorkerClaimRequest, completion: AcknowledgementCompletion
+    ) -> WorkerRecoveryState:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.record_acknowledgement, request, completion
+            )
 
     async def record_outcome(
         self, request: WorkerClaimRequest, outcome: WorkerClaimOutcome

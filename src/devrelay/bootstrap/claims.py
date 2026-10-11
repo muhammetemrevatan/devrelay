@@ -84,7 +84,7 @@ def _claim_configuration(
 def job_acknowledger(
     settings: ControlSettings, engine: AsyncEngine
 ) -> AcknowledgeAssignedJob:
-    """Trusted control use case only; no HTTP route, startup I/O or execution."""
+    """Trusted control use case only; no startup I/O or execution."""
     if settings.worker_claims is None:
         raise ValueError("Acknowledgements require explicitly enabled claims.")
     policies, proof_guard = _claim_configuration(settings)
