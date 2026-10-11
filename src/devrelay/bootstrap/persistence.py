@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from devrelay.application.ports.claim_eligibility import QueuedJobReader
 from devrelay.application.ports.job_persistence import (
     JobBranchReader,
     JobSubmissionReader,
@@ -20,6 +21,9 @@ from devrelay.infrastructure.persistence.job_repository import (
 )
 from devrelay.infrastructure.persistence.job_unit_of_work import (
     SqlAlchemyJobSubmissionUnitOfWork,
+)
+from devrelay.infrastructure.persistence.queued_job_reader import (
+    SqlAlchemyQueuedJobReader,
 )
 from devrelay.infrastructure.persistence.task_reader import SqlAlchemyTaskSnapshotReader
 from devrelay.infrastructure.persistence.unit_of_work import SqlAlchemyTaskUnitOfWork
@@ -77,6 +81,12 @@ def task_snapshot_reader(engine: AsyncEngine) -> TaskSnapshotReader:
 
 def job_submission_reader(engine: AsyncEngine) -> JobSubmissionReader:
     return SqlAlchemyJobSubmissionReader(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    )
+
+
+def queued_job_reader(engine: AsyncEngine) -> QueuedJobReader:
+    return SqlAlchemyQueuedJobReader(
         async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
     )
 

@@ -59,6 +59,7 @@ from devrelay.infrastructure.persistence.models import (
     SourceTaskRecord,
     TaskSnapshotRecord,
 )
+from devrelay.infrastructure.persistence.queued_job_reader import queued_candidate_query
 from devrelay.infrastructure.persistence.workflow_models import (
     JobWorkflowEventRecord,
     JobWorkflowRecord,
@@ -562,7 +563,7 @@ def test_workflow_downgrade_refuses_inconsistent_history(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0004_job_workflows"
+                ).scalar_one() == "0005_queued_candidate_index"
                 assert (
                     await connection.execute(
                         text("SELECT count(*) FROM job_workflow_events")
@@ -816,7 +817,7 @@ def test_downgrade_cannot_discard_accepted_provider_bindings(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0004_job_workflows"
+                ).scalar_one() == "0005_queued_candidate_index"
 
     run(scenario())
 
@@ -1354,6 +1355,37 @@ def test_submission_lookup_plans_on_500_jobs(database: DatabaseFactory) -> None:
                     )
                     print(plan)
                     assert "Index Scan" in plan or "Bitmap" in plan
+
+                candidate_sql = str(
+                    queued_candidate_query(
+                        frozenset({repository.repository_id})
+                    ).compile(
+                        dialect=connection.dialect,
+                        compile_kwargs={"literal_binds": True},
+                    )
+                )
+                await connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+                await connection.execute(
+                    text("DROP INDEX IF EXISTS ix_job_workflows_queued_candidate")
+                )
+                before = "\n".join(
+                    (
+                        await connection.execute(text("EXPLAIN " + candidate_sql))
+                    ).scalars()
+                )
+                await connection.execute(
+                    text(
+                        "CREATE INDEX ix_job_workflows_queued_candidate ON job_workflows (repository_id, created_at, job_id) WHERE status='queued' AND workflow_version=0 AND blocks_new_submission IS TRUE"
+                    )
+                )
+                after = "\n".join(
+                    (
+                        await connection.execute(text("EXPLAIN " + candidate_sql))
+                    ).scalars()
+                )
+                print("Queue before index:\n" + before)
+                print("Queue after index:\n" + after)
+                assert "ix_job_workflows_queued_candidate" in after
 
             statements: list[str] = []
 
