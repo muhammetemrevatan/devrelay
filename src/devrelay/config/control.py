@@ -1,3 +1,4 @@
+import json
 from enum import StrEnum
 
 from pydantic import Field, IPvAnyAddress, model_validator
@@ -11,6 +12,7 @@ from devrelay.config.logging import LogLevel
 from devrelay.config.repositories import RepositorySettings
 from devrelay.config.task_import import TaskImportSettings
 from devrelay.config.worker_authentication import WorkerRegistrationSettings
+from devrelay.config.worker_claims import WorkerClaimsSettings
 
 
 class RuntimeEnvironment(StrEnum):
@@ -39,6 +41,34 @@ class ControlSettings(BaseSettings):
     job_submission: JobSubmissionSettings | None = None
     repositories: tuple[RepositorySettings, ...] = Field(default=(), max_length=32)
     workers: tuple[WorkerRegistrationSettings, ...] = Field(default=(), max_length=32)
+    worker_claims: WorkerClaimsSettings | None = None
+
+    @model_validator(mode="after")
+    def require_claim_integrations(self) -> ControlSettings:
+        if self.worker_claims is not None and (
+            not self.workers
+            or self.database is None
+            or self.jira is None
+            or self.github is None
+            or not any(worker.enabled for worker in self.workers)
+        ):
+            raise ValueError("Worker claims require integrations and enrolled workers.")
+        if self.worker_claims is not None and any(
+            len(
+                json.dumps(
+                    [check.model_dump(mode="json") for check in repository.checks],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+            > 512 * 1024
+            for repository in self.repositories
+            if repository.enabled
+        ):
+            raise ValueError(
+                "Worker claim check policy exceeds assignment delivery bounds."
+            )
+        return self
 
     @model_validator(mode="after")
     def require_worker_scope(self) -> ControlSettings:

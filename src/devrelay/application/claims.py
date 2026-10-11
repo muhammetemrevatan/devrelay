@@ -1,5 +1,6 @@
 from collections.abc import Callable
 
+from devrelay.application.assignment_delivery import ReadAssignedJob
 from devrelay.application.contracts.assignments import ClaimResult
 from devrelay.application.contracts.claims import LeaseProof, WorkerClaimRequest
 from devrelay.application.contracts.workers import WorkerAuthorization
@@ -18,6 +19,7 @@ class ClaimJob:
         self._store = store
         self._preparer = preparer
         self._proof_guard = proof_guard
+        self.assignment_reader = ReadAssignedJob(store, proof_guard)
 
     async def execute(
         self, request: WorkerClaimRequest, authorization: WorkerAuthorization

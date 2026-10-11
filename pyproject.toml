@@ -135,6 +135,16 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+name = "Worker control transport has no control persistence or provider access"
+type = "forbidden"
+source_modules = ["devrelay.infrastructure.control"]
+forbidden_modules = [
+    "devrelay.api", "devrelay.worker", "devrelay.bootstrap", "devrelay.config",
+    "devrelay.infrastructure.persistence", "devrelay.infrastructure.jira", "devrelay.infrastructure.github",
+    "devrelay.infrastructure.worker_state", "sqlalchemy", "alembic", "psycopg",
+]
+
+[[tool.importlinter.contracts]]
 name = "GitHub observer reaches persistence only through application ports"
 type = "forbidden"
 source_modules = ["devrelay.infrastructure.github"]

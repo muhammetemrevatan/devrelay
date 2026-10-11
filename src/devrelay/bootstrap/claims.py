@@ -32,7 +32,7 @@ async def open_claim_preparer(
     jira_transport: httpx.AsyncBaseTransport | None = None,
     github_transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[PrepareJobClaim]:
-    """Control-only composition; never registered as worker execution or an API."""
+    """Control-only bounded provider observations; no worker execution resources."""
     identities = {item.repository_id: item.github_id for item in github.repository_ids}
     if set(identities) != {item.repository_id for item in repositories}:
         raise ValueError("Repository identity configuration does not match policy.")
@@ -58,7 +58,7 @@ async def open_job_claimer(
     jira_transport: httpx.AsyncBaseTransport | None = None,
     github_transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[ClaimJob]:
-    """Explicit control composition; no route, polling or runtime registration."""
+    """Control claim composition; no worker polling or execution resources."""
     if settings.jira is None or settings.github is None or not settings.workers:
         raise ValueError("Claims require provider policies and enrolled workers.")
     credentials = tuple(worker.auth_token for worker in settings.workers) + (

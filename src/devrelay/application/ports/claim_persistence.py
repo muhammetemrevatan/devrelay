@@ -12,11 +12,13 @@ class ClaimPreparer(Protocol):
     ) -> PreparedJobClaim | None: ...
 
 
-class ClaimStore(Protocol):
+class ClaimRecoveryStore(Protocol):
     async def recover(
         self, identity: ClaimRequestIdentity, authorization: WorkerAuthorization
     ) -> ClaimResult | None: ...
 
+
+class ClaimStore(ClaimRecoveryStore, Protocol):
     async def check_admission(self, authorization: WorkerAuthorization) -> None: ...
 
     async def claim(

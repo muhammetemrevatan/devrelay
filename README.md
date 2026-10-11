@@ -30,7 +30,18 @@ lease expiry retains that slot and the unresolved Job guard.
 The Windows recovery adapter protects pending claim proofs with user-scoped DPAPI
 and commits them to a private local SQLite journal before returning a request.
 It restores the original request after restart and excludes a second worker process.
-Live account validation, worker dispatch, agent execution, PR publication and
+The local journal also commits correlated no-work completion or stable assignment
+references. No-work permits a new request; an assignment retains the original
+protected proof and blocks a new poll identity, including after restart or lease
+expiry. Repeated replies cannot replace or renew it. Journal version 2 upgrades
+valid pending version-1 records without changing their ciphertext/request identity;
+damaged records fail closed. Recorded assignment metadata is authenticated with a
+local proof-bound integrity tag. These phases do not acknowledge work or launch
+agents, and the worker CLI still validates configuration only. An opt-in claim
+API and bounded worker HTTP adapter now connect durable claims to local recovery.
+An assigned worker can also retrieve its complete immutable task/check inputs
+using the original protected claim proof. Payload reads never claim another Job.
+Live account validation, automatic polling, agent execution, PR publication and
 deployment automation are not implemented yet.
 
 Control-side claim preparation can now read one scoped queued candidate and
@@ -47,9 +58,9 @@ freshness are checked with database time after locks. New polls have a durable
 new requests while preserving recovery. Proofs remain worker-owned; the control
 stores scoped verification digests rather than recoverable secrets.
 Migration 0006 supports only initial claims and refuses downgrade after claim
-history exists. Apply migrations explicitly with old writers stopped. The claim
-API, worker transport/journal completion phases, acknowledgement, heartbeat and
-execution remain pending; no polling or agent runtime is enabled.
+history exists. Apply migrations explicitly with old writers stopped.
+Acknowledgement, heartbeat and execution remain pending; no polling or agent
+runtime is enabled.
 
 ## Planned workflow
 
@@ -252,15 +263,15 @@ To rotate or revoke a token or change scope, replace/remove/disable its
 registration and restart every control process. An old process retains its
 loaded policy until restarted. No registration or token issuance API is exposed.
 The identity endpoint creates no session, lease or assignment and opens no
-database or provider resources. Future claim requests must independently verify
-authority and expiry using database time. Worker claims, heartbeat fencing,
-assignment recovery, execution and agent isolation remain pending.
+database or provider resources when claims/import/submission are disabled.
+Claims independently verify authority and expiry using database time.
+Heartbeat fencing, execution and agent isolation remain pending.
 
 Neutral claim contracts provide redacted lease-proof values, worker/request-bound
 verifiers and versioned replay fingerprints. These helpers do not expose a claim
 endpoint or persist assignments. The protected Windows journal prepares and
-recovers one pending request; atomic database coordination remains required
-before a worker can request or execute work.
+recovers the original pending or assigned request; the optional API delegates
+assignment to atomic PostgreSQL coordination.
 
 The journal composition requires an explicit absolute directory on a local fixed
 Windows drive, outside repository checkouts and agent workspaces. Its parent must
@@ -271,8 +282,66 @@ writes, including WAL storage, and disk operations run on a dedicated thread.
 There is no plaintext or non-Windows fallback. DPAPI protects data at rest;
 code running as the same Windows identity can decrypt it, so agent isolation
 remains a separate requirement. This adapter is not wired to worker polling or
-the CLI. Assignment acknowledgement, launch intent and completed-request cleanup
-are not implemented yet.
+the CLI. Assignment acknowledgement and launch intent are not implemented yet.
+
+## Worker claim exchange
+
+Claims are disabled by default, independently of the identity endpoint. Set
+`DEVRELAY_CONTROL_WORKER_CLAIMS={}` only with complete Jira/database/GitHub
+configuration and an enabled worker registration. The optional settings
+`max_concurrent_requests` (1..4, default 4) and `body_timeout_seconds` (0.1..15,
+default 5) bound admission/body reads. Composition shares the control database
+pool and closes provider resources on shutdown; startup performs no claim,
+provider read or migration.
+
+`POST /api/v1/worker/claims` uses the separate worker bearer token. Its JSON body
+contains only `claim_request_id`, `protocol_version: 1` and the original canonical
+lease `proof`. Authentication precedes bounded JSON reads (1 KiB). Body-supplied
+worker/repository identities are rejected. Responses carry the authenticated
+worker/request IDs, recorded timestamp, stable assignment references or a typed
+no-work reason, `recovered` and `lease_authority_active`. They never return the
+proof, token or verification digest. Active metadata is not permission to launch;
+this initial endpoint provides recovery references, not task/check execution
+payloads. The separate assignment endpoint below retrieves those accepted inputs.
+
+Exact replay recovers the original receipt without another provider read or lease
+renewal. Conflicting input receives 409; denied scope receives 403; durable
+poll/receipt-budget restrictions receive 429. Body/transport/storage errors use
+the shared sanitized envelope. Keep the original local request after any failure;
+quota exhaustion requires operator attention, not automatic receipt deletion.
+
+Worker bootstrap `open_worker_claim_client` verifies control identity before
+opening its protected journal and exposes a single explicit exchange. It uses
+verified TLS (plain HTTP only on loopback), disables environment proxies and
+redirects, and bounds each response to 16 KiB and each request to 60 seconds.
+It validates the complete response, correlation, scope, protocol and initial
+lease bounds before committing local completion. There are no automatic retries
+or polling; concurrent exchanges are rejected. A lost response/restart retains
+the original request/proof; assigned recovery never creates another poll, even
+after expiry. This composition performs no claim until explicitly invoked and
+does not expose an execution CLI.
+
+An assigned worker may call
+`POST /api/v1/worker/attempts/{attempt_id}/assignment` with the same request UUID,
+protocol and proof. This read-only endpoint recovers an existing receipt only;
+unknown/no-work requests cannot claim work. Current credential/repository scope
+and the original proof are required. The response includes the immutable task
+snapshot, GitHub numeric identity/slug, authorized and target branches, pinned base
+revision, full check argv/directories/timeouts and repair budget. It omits operator
+audit data and all service credentials. Task text remains untrusted data and never
+supplies commands. A definition fingerprint covers the accepted content and pins;
+the worker recomputes it and checks the original journal anchors before returning.
+
+Assignment responses are bounded to 2 MiB. When claims are enabled, the complete
+serialized check policy for each enabled repository must fit 512 KiB; larger
+policies are rejected during configuration validation. These limits accommodate
+the maximum task fields, including JSON escaping. Unsupported oversized historical
+definitions fail closed without returning a partial payload or releasing a slot.
+Serialization/validation runs off the async event loop. Payload reads preserve the
+original request, receipt, expiry and journal phase. Expired assignments remain
+readable with renewed current authentication and inactive lease metadata. Retrieval
+does not recheck live providers, acknowledge work, renew authority or launch an
+agent. Durable acknowledgement, heartbeat and containment still precede execution.
 
 ## GitHub observation
 
@@ -370,9 +439,10 @@ remain readable, but bound policy cannot replay them as verified work. Legacy
 Jobs require trusted reconciliation before any future execution. Downgrade is
 rejected once a numeric binding has been stored, preserving accepted identity.
 
-The migrations support queued definitions only. Worker claims, lease/state
-updates, durable lifecycle history and intentional replay generations require
-later migrations. This submission lock is not the global coding concurrency slot.
+The submission migrations preserve queued definitions. Subsequent workflow/claim
+migrations coordinate current state separately. Intentional replay generations
+and execution transitions require later migrations. The submission lock is
+separate from the global coding concurrency slot.
 
 Migration 0004 separates the accepted definition from its current workflow
 projection. Every submission atomically creates its definition, complete checks,
@@ -380,8 +450,8 @@ queued workflow and version-0 creation event. Existing bound and unbound
 definitions are backfilled without changing fingerprints or guessing numeric
 repository identity. The unresolved task/repository guard belongs to the workflow;
 submission responses use its materialized status. Missing or inconsistent
-workflow/history fails closed. This foundation supports queued creation only;
-claims, state transitions and worker execution remain disabled.
+workflow/history fails closed. Migration 0004 supports queued creation only;
+migration 0006 adds initial claims, while worker execution remains disabled.
 
 Schema and code must be rolled out together: stop control writers, explicitly
 migrate, deploy the matching code, then restart. Old writers that omit workflow
@@ -392,8 +462,9 @@ explicit trusted observer; the optional GitHub implementation supplies verified
 read-only observations and never a permissive default.
 Import authentication grants import only.
 
-Worker dispatch is not implemented. Preparation/candidate values
-alone do not start work; only the submission use case records a durable Job.
+Worker execution is not implemented. Preparation/candidate values
+alone do not start work; submission records a durable Job and opt-in claims
+reserve its initial assignment.
 Repository configuration alone exposes no new route or provider adapter.
 
 ## Container

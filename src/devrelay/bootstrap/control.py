@@ -11,19 +11,24 @@ from fastapi import FastAPI
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from devrelay.api.dependencies import (
+    ClaimOperation,
     ImportOperation,
     JobSubmissionServices,
     SubmissionOperation,
     TaskImportServices,
     WorkerAuthenticationServices,
+    WorkerClaimOperations,
+    WorkerClaimServices,
 )
 from devrelay.api.errors import register_error_handlers
 from devrelay.api.middleware import UnexpectedErrorMiddleware
+from devrelay.api.routes.claims import router as claims_router
 from devrelay.api.routes.health import router
 from devrelay.api.routes.jobs import router as jobs_router
 from devrelay.api.routes.tasks import router as tasks_router
 from devrelay.api.routes.workers import router as workers_router
 from devrelay.application.contracts.submissions import SubmissionAuthorization
+from devrelay.bootstrap.claims import open_job_claimer
 from devrelay.bootstrap.jobs import open_github_job_submitter
 from devrelay.bootstrap.persistence import open_database_engine
 from devrelay.bootstrap.security import token_verifier, worker_authenticator
@@ -34,6 +39,20 @@ type ImportResourceFactory = Callable[[], AbstractAsyncContextManager[ImportOper
 type SubmissionResourceFactory = Callable[
     [], AbstractAsyncContextManager[SubmissionOperation]
 ]
+type ClaimResourceFactory = Callable[
+    [], AbstractAsyncContextManager[ClaimOperation | WorkerClaimOperations]
+]
+
+
+@asynccontextmanager
+async def open_control_claim_operation(
+    settings: ControlSettings,
+    engine: AsyncEngine,
+) -> AsyncIterator[WorkerClaimOperations]:
+    async with open_job_claimer(settings, engine) as claimer:
+        yield WorkerClaimOperations(
+            claim=claimer.execute, read_assignment=claimer.assignment_reader.execute
+        )
 
 
 @asynccontextmanager
@@ -65,6 +84,7 @@ def create_app(
     *,
     import_resources: ImportResourceFactory | None = None,
     submission_resources: SubmissionResourceFactory | None = None,
+    claim_resources: ClaimResourceFactory | None = None,
 ) -> FastAPI:
     configuration = settings if settings is not None else ControlSettings()
     show_docs = configuration.environment != RuntimeEnvironment.PRODUCTION
@@ -74,12 +94,15 @@ def create_app(
         raise ValueError(
             "Submission resources require explicit submission authentication."
         )
+    if claim_resources is not None and configuration.worker_claims is None:
+        raise ValueError("Claim resources require explicitly enabled worker claims.")
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
         application.state.task_import_services = None
         application.state.job_submission_services = None
         application.state.worker_authentication_services = None
+        application.state.worker_claim_services = None
         async with AsyncExitStack() as stack:
             try:
                 if configuration.workers:
@@ -90,10 +113,15 @@ def create_app(
                     )
                 engine = None
                 if (
-                    configuration.task_import is not None and import_resources is None
-                ) or (
-                    configuration.job_submission is not None
-                    and submission_resources is None
+                    (configuration.task_import is not None and import_resources is None)
+                    or (
+                        configuration.job_submission is not None
+                        and submission_resources is None
+                    )
+                    or (
+                        configuration.worker_claims is not None
+                        and claim_resources is None
+                    )
                 ):
                     if configuration.database is None:
                         raise RuntimeError("Control database settings are missing.")
@@ -138,11 +166,32 @@ def create_app(
                         max_concurrent_requests=submission_settings.max_concurrent_requests,
                         body_timeout_seconds=submission_settings.body_timeout_seconds,
                     )
+                claim_settings = configuration.worker_claims
+                if claim_settings is not None:
+                    if claim_resources is not None:
+                        claim_context = claim_resources()
+                    else:
+                        assert engine is not None
+                        claim_context = open_control_claim_operation(
+                            configuration, engine
+                        )
+                    claim_operation = await stack.enter_async_context(claim_context)
+                    application.state.worker_claim_services = WorkerClaimServices(
+                        claim_job=claim_operation.claim
+                        if isinstance(claim_operation, WorkerClaimOperations)
+                        else claim_operation,
+                        read_assignment=claim_operation.read_assignment
+                        if isinstance(claim_operation, WorkerClaimOperations)
+                        else None,
+                        max_concurrent_requests=claim_settings.max_concurrent_requests,
+                        body_timeout_seconds=claim_settings.body_timeout_seconds,
+                    )
                 yield
             finally:
                 application.state.task_import_services = None
                 application.state.job_submission_services = None
                 application.state.worker_authentication_services = None
+                application.state.worker_claim_services = None
 
     app = FastAPI(
         title="DevRelay",
@@ -162,6 +211,8 @@ def create_app(
         app.include_router(jobs_router)
     if configuration.workers:
         app.include_router(workers_router)
+    if configuration.worker_claims is not None:
+        app.include_router(claims_router)
     return app
 
 

@@ -3,9 +3,28 @@ from enum import StrEnum
 from http import HTTPStatus
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict
 from starlette.responses import JSONResponse
 
+from devrelay.application.contracts.assignment_delivery import (
+    AssignmentUnavailable,
+    InvalidAssignmentDefinition,
+)
+from devrelay.application.contracts.assignments import (
+    ClaimAdmissionRejected,
+    ClaimPersistenceError,
+    ClaimScopeRejected,
+)
+from devrelay.application.contracts.claims import (
+    ClaimReplayConflict,
+    InvalidClaimRequest,
+    InvalidLeaseProof,
+)
+from devrelay.application.contracts.eligibility import (
+    ClaimEligibilityRejected,
+    WorkerAuthorityExpired,
+)
 from devrelay.application.jobs import (
     JobSubmissionConflict,
     JobSubmissionRejected,
@@ -60,6 +79,12 @@ class ApiErrorCode(StrEnum):
     REPOSITORY_UNAVAILABLE = "repository_unavailable"
     INVALID_REPOSITORY_DATA = "invalid_repository_data"
     SNAPSHOT_NOT_FOUND = "snapshot_not_found"
+    CLAIM_UNAVAILABLE = "claim_unavailable"
+    CLAIM_BUSY = "claim_busy"
+    CLAIM_ADMISSION_REJECTED = "claim_admission_rejected"
+    CLAIM_SCOPE_REJECTED = "claim_scope_rejected"
+    CLAIM_CONFLICT = "claim_conflict"
+    ASSIGNMENT_UNAVAILABLE = "assignment_unavailable"
 
 
 class ApiErrorDetail(BaseModel):
@@ -99,7 +124,71 @@ class InvalidSubmissionRequest(Exception):
     """The bounded submission body does not satisfy its request schema."""
 
 
+class InvalidWorkerClaimRequest(Exception):
+    """The bounded claim body does not satisfy its request schema."""
+
+
 _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
+    RequestValidationError: (
+        422,
+        ApiErrorCode.INVALID_REQUEST,
+        "Request parameters are invalid.",
+    ),
+    WorkerAuthorityExpired: (
+        401,
+        ApiErrorCode.UNAUTHORIZED,
+        "Valid worker authentication is required.",
+    ),
+    ClaimEligibilityRejected: (
+        409,
+        ApiErrorCode.CLAIM_CONFLICT,
+        "Queued work is not eligible for assignment.",
+    ),
+    AssignmentUnavailable: (
+        404,
+        ApiErrorCode.ASSIGNMENT_UNAVAILABLE,
+        "Assigned receipt is unavailable.",
+    ),
+    InvalidAssignmentDefinition: (
+        503,
+        ApiErrorCode.ASSIGNMENT_UNAVAILABLE,
+        "Assignment delivery is unavailable.",
+    ),
+    InvalidWorkerClaimRequest: (
+        422,
+        ApiErrorCode.INVALID_REQUEST,
+        "Provide only a valid claim request.",
+    ),
+    InvalidClaimRequest: (
+        422,
+        ApiErrorCode.INVALID_REQUEST,
+        "Claim protocol or identity is invalid.",
+    ),
+    InvalidLeaseProof: (
+        422,
+        ApiErrorCode.INVALID_REQUEST,
+        "An independent canonical lease proof is required.",
+    ),
+    ClaimReplayConflict: (
+        409,
+        ApiErrorCode.CLAIM_CONFLICT,
+        "Claim input conflicts with recorded recovery.",
+    ),
+    ClaimAdmissionRejected: (
+        429,
+        ApiErrorCode.CLAIM_ADMISSION_REJECTED,
+        "New claim admission is restricted.",
+    ),
+    ClaimScopeRejected: (
+        403,
+        ApiErrorCode.CLAIM_SCOPE_REJECTED,
+        "Claim is outside current worker authority.",
+    ),
+    ClaimPersistenceError: (
+        503,
+        ApiErrorCode.STORAGE_UNAVAILABLE,
+        "Claim storage is unavailable.",
+    ),
     UnsupportedRequestMedia: (
         415,
         ApiErrorCode.UNSUPPORTED_MEDIA,
@@ -241,7 +330,12 @@ def api_error_response(
     message: str,
 ) -> JSONResponse:
     return JSONResponse(
-        status_code=status, content={"detail": _error_detail(code, message)}
+        status_code=status,
+        content={"detail": _error_detail(code, message)},
+        headers={
+            "Cache-Control": "no-store",
+            **({"WWW-Authenticate": "Bearer"} if status == 401 else {}),
+        },
     )
 
 

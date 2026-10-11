@@ -6,15 +6,44 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
+import httpx
+
 from devrelay.application.contracts.workers import WorkerJournalScope
 from devrelay.application.ports.worker_journal import WorkerStateUnavailable
-from devrelay.application.worker_claims import PrepareWorkerClaim
+from devrelay.application.worker_claims import PrepareWorkerClaim, RequestWorkerClaim
 from devrelay.config.worker import WorkerSettings
+from devrelay.infrastructure.control.gateway import HttpControlGateway
 from devrelay.infrastructure.worker_state.journal import (
     AsyncClaimJournal,
     SqliteClaimStore,
 )
 from devrelay.infrastructure.worker_state.windows import WindowsWorkerSecurity
+
+
+@asynccontextmanager
+async def open_worker_claim_client(
+    settings: WorkerSettings,
+    *,
+    state_directory: Path,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> AsyncIterator[RequestWorkerClaim]:
+    """Verify control identity before opening its journal; perform no claim on startup."""
+    async with httpx.AsyncClient(
+        base_url=str(settings.control_url),
+        headers={"Authorization": f"Bearer {settings.auth_token.get_secret_value()}"},
+        follow_redirects=False,
+        trust_env=False,
+        limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+        transport=transport,
+    ) as client:
+        gateway = HttpControlGateway(client)
+        authorization = await gateway.identify()
+        async with open_worker_journal(
+            settings,
+            worker_id=authorization.worker_id,
+            state_directory=state_directory,
+        ) as preparation:
+            yield RequestWorkerClaim(preparation, gateway, authorization)
 
 
 def validate_worker_configuration(env_file: Path | None = None) -> None:
