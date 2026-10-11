@@ -33,8 +33,9 @@ It restores the original request after restart and excludes a second worker proc
 The local journal also commits correlated no-work completion or stable assignment
 references. No-work permits a new request; an assignment retains the original
 protected proof and blocks a new poll identity, including after restart or lease
-expiry. Repeated replies cannot replace or renew it. Journal version 2 upgrades
-valid pending version-1 records without changing their ciphertext/request identity;
+expiry. Repeated replies cannot replace or renew it. Journal version 3 upgrades
+valid version-1 pending and version-2 recovery records without changing their
+ciphertext, original request identity or assignment anchors;
 damaged records fail closed. Recorded assignment metadata is authenticated with a
 local proof-bound integrity tag. These phases do not acknowledge work or launch
 agents, and the worker CLI still validates configuration only. An opt-in claim
@@ -282,7 +283,8 @@ writes, including WAL storage, and disk operations run on a dedicated thread.
 There is no plaintext or non-Windows fallback. DPAPI protects data at rest;
 code running as the same Windows identity can decrypt it, so agent isolation
 remains a separate requirement. This adapter is not wired to worker polling or
-the CLI. Assignment acknowledgement and launch intent are not implemented yet.
+the CLI. Local acknowledgement intent is implemented as described below;
+control acknowledgement and launch intent remain pending.
 
 ## Worker claim exchange
 
@@ -342,6 +344,34 @@ original request, receipt, expiry and journal phase. Expired assignments remain
 readable with renewed current authentication and inactive lease metadata. Retrieval
 does not recheck live providers, acknowledge work, renew authority or launch an
 agent. Durable acknowledgement, heartbeat and containment still precede execution.
+
+## Worker acknowledgement intent
+
+The composed worker client exposes `prepare_acknowledgement()` to retrieve and
+validate an active assigned definition, then durably pin its snapshot UUID, base
+revision and complete definition digest under one acknowledgement request UUID.
+It also records the original claim/Attempt identity, generation, protocol and
+expected initial workflow version. The original protected proof and lease anchors
+remain in the journal. Task text and check payloads are not copied into recovery
+storage.
+
+Journal version 3 commits this input and the `acknowledgement_pending` phase
+atomically. Proof-bound integrity links the intent to its assignment; missing or
+changed pins and attempts to erase the intent by regressing the phase fail closed.
+After restart, preparation returns the same recorded input without HTTP, a new
+identity or renewed authority. Duplicate claim responses preserve pending intent.
+Later payload reads must still match its accepted definition digest.
+
+Valid version-1/version-2 journals upgrade in one transaction, preserving protected
+proof bytes, original identities, assignment anchors and no-work markers. Damaged
+state or an incomplete upgrade retains the old schema and fails closed. SQLite,
+DPAPI and integrity checks remain on the dedicated journal thread.
+
+This step prepares local input only. The control acknowledgement endpoint,
+atomic claimed-to-running transition, acknowledgement receipt and worker response
+completion are the next integration slice. Heartbeat, containment and runtime
+selection are also required before launching an agent; the CLI remains a
+configuration validator.
 
 ## GitHub observation
 

@@ -1,5 +1,6 @@
 from typing import Protocol
 
+from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
 from devrelay.application.contracts.claims import LeaseProof, WorkerClaimRequest
 from devrelay.application.contracts.worker_recovery import (
     WorkerClaimOutcome,
@@ -23,6 +24,12 @@ class ProofProtector(Protocol):
 
 class WorkerClaimJournal(Protocol):
     async def load_state(self) -> WorkerRecoveryState: ...
+
+    async def get_or_create_acknowledgement(
+        self, request: WorkerClaimRequest, candidate: WorkerAcknowledgementIntent
+    ) -> WorkerAcknowledgementIntent:
+        """Commit pinned intent; exact existing input wins over a fresh identity."""
+        ...
 
     async def load_pending(self) -> WorkerClaimRequest | None: ...
 

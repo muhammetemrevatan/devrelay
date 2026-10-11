@@ -4,6 +4,7 @@ from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
+from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
 from devrelay.application.contracts.assignments import ClaimResult, NoWorkReason
 from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.domain.jobs.values import _utc, _uuid
@@ -112,6 +113,7 @@ class WorkerRecoveryPhase(StrEnum):
     IDLE = "idle"
     PENDING = "pending"
     ASSIGNED = "assigned"
+    ACKNOWLEDGEMENT_PENDING = "acknowledgement_pending"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -120,6 +122,7 @@ class WorkerRecoveryState:
     request: WorkerClaimRequest | None = field(default=None, repr=False)
     assignment: WorkerClaimOutcome | None = None
     last_no_work: WorkerClaimOutcome | None = None
+    acknowledgement: WorkerAcknowledgementIntent | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, WorkerRecoveryPhase):
@@ -136,7 +139,10 @@ class WorkerRecoveryState:
             raise ValueError("Unresolved recovery requires the original request.")
         if self.phase is WorkerRecoveryPhase.PENDING and self.assignment is not None:
             raise ValueError("Pending recovery cannot contain an assignment.")
-        if self.phase is WorkerRecoveryPhase.ASSIGNED:
+        if self.phase in (
+            WorkerRecoveryPhase.ASSIGNED,
+            WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING,
+        ):
             if (
                 not isinstance(self.assignment, WorkerClaimOutcome)
                 or self.assignment.assignment is None
@@ -144,3 +150,17 @@ class WorkerRecoveryState:
                 or self.assignment.claim_request_id != self.request.claim_request_id
             ):
                 raise ValueError("Assigned recovery requires matching stable anchors.")
+        if self.phase is WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING:
+            reference = self.assignment.assignment if self.assignment else None
+            if (
+                not isinstance(self.acknowledgement, WorkerAcknowledgementIntent)
+                or self.request is None
+                or reference is None
+                or self.acknowledgement.claim_request_id
+                != self.request.claim_request_id
+                or self.acknowledgement.attempt_id != reference.attempt_id
+                or self.acknowledgement.generation != reference.generation
+            ):
+                raise ValueError("Pending acknowledgement requires original anchors.")
+        elif self.acknowledgement is not None:
+            raise ValueError("Acknowledgement input requires its durable phase.")

@@ -14,28 +14,62 @@ from devrelay.application.contracts.worker_recovery import (
 )
 from devrelay.application.contracts.workers import WorkerJournalScope
 from devrelay.application.ports.worker_journal import WorkerStateUnavailable
+from devrelay.infrastructure.worker_state.acknowledgements import (
+    acknowledgement_assignment_integrity,
+    create_acknowledgement_schema,
+    read_acknowledgement,
+)
 
 _FAILURE = "Worker recovery journal is unavailable."
+
+
+def _create_metadata(
+    connection: sqlite3.Connection,
+    scope: bytes,
+    *,
+    prepared: int,
+    phase: str,
+    completed: int,
+) -> None:
+    connection.execute("""
+      CREATE TABLE metadata (
+        slot INTEGER PRIMARY KEY CHECK (slot = 1),
+        version INTEGER NOT NULL CHECK (version = 3),
+        scope BLOB NOT NULL CHECK (length(scope) = 32),
+        prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
+        phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned', 'acknowledgement_pending')),
+        completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
+        CHECK ((phase = 'idle' AND prepared = 0) OR (phase IN ('pending', 'assigned', 'acknowledgement_pending') AND prepared = 1))
+      )
+    """)
+    connection.execute(
+        "INSERT INTO metadata VALUES (1, 3, ?, ?, ?, ?)",
+        (scope, prepared, phase, completed),
+    )
+
+
+def upgrade_outcome_schema(connection: sqlite3.Connection, scope: bytes) -> None:
+    row = connection.execute(
+        "SELECT prepared, phase, completed FROM metadata WHERE slot = 1"
+    ).fetchone()
+    if row is None:
+        raise WorkerStateUnavailable(_FAILURE)
+    connection.execute("DROP TABLE metadata")
+    _create_metadata(connection, scope, prepared=row[0], phase=row[1], completed=row[2])
+    create_acknowledgement_schema(connection)
 
 
 def create_outcome_schema(
     connection: sqlite3.Connection, scope: bytes, *, prepared: int
 ) -> None:
-    connection.execute("""
-      CREATE TABLE metadata (
-        slot INTEGER PRIMARY KEY CHECK (slot = 1),
-        version INTEGER NOT NULL CHECK (version = 2),
-        scope BLOB NOT NULL CHECK (length(scope) = 32),
-        prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
-        phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned')),
-        completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
-        CHECK ((phase = 'idle' AND prepared = 0) OR (phase IN ('pending', 'assigned') AND prepared = 1))
-      )
-    """)
-    connection.execute(
-        "INSERT INTO metadata VALUES (1, 2, ?, ?, ?, 0)",
-        (scope, prepared, "pending" if prepared else "idle"),
+    _create_metadata(
+        connection,
+        scope,
+        prepared=prepared,
+        phase="pending" if prepared else "idle",
+        completed=0,
     )
+    create_acknowledgement_schema(connection)
     connection.execute("""
       CREATE TABLE assignment (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -87,11 +121,17 @@ def recovery_state(
     connection: sqlite3.Connection,
     scope: WorkerJournalScope,
     request: WorkerClaimRequest | None,
+    *,
+    allow_v2: bool = False,
 ) -> WorkerRecoveryState:
     header = connection.execute(
         "SELECT version, scope, prepared, phase, completed FROM metadata WHERE slot = 1"
     ).fetchone()
-    if header is None or header[:2] != (2, scope.key):
+    if (
+        header is None
+        or header[0] not in ((2, 3) if allow_v2 else (3,))
+        or header[1] != scope.key
+    ):
         raise WorkerStateUnavailable(_FAILURE)
     _, _, prepared, phase, completed = header
     if (
@@ -106,9 +146,9 @@ def recovery_state(
     finished = connection.execute(
         "SELECT request_id, protocol_version, verifier, reason, recorded_at FROM completed_no_work WHERE slot = 1"
     ).fetchone()
-    if bool(completed) != (finished is not None) or (phase == "assigned") != (
-        assigned is not None
-    ):
+    if bool(completed) != (finished is not None) or (
+        phase in ("assigned", "acknowledgement_pending")
+    ) != (assigned is not None):
         raise WorkerStateUnavailable(_FAILURE)
     previous = None
     if finished is not None:
@@ -127,6 +167,7 @@ def recovery_state(
         ):
             raise WorkerStateUnavailable(_FAILURE)
     outcome = None
+    acknowledgement = None
     if assigned is not None:
         (
             request_id,
@@ -153,20 +194,34 @@ def recovery_state(
             recorded_at=reference.issued_at,
             assignment=reference,
         )
-        if (
-            request is None
-            or type(integrity) is not bytes
-            or len(integrity) != 32
-            or not hmac.compare_digest(
-                integrity, assignment_integrity(scope, request, outcome)
+        if request is None:
+            raise WorkerStateUnavailable(_FAILURE)
+        acknowledgement = (
+            read_acknowledgement(connection, scope, request, outcome)
+            if header[0] == 3
+            else None
+        )
+        expected_integrity = (
+            assignment_integrity(scope, request, outcome)
+            if acknowledgement is None
+            else acknowledgement_assignment_integrity(
+                scope, request, outcome, acknowledgement
             )
+        )
+        if (
+            type(integrity) is not bytes
+            or len(integrity) != 32
+            or not hmac.compare_digest(integrity, expected_integrity)
         ):
             raise WorkerStateUnavailable(_FAILURE)
+    elif header[0] == 3:
+        acknowledgement = read_acknowledgement(connection, scope, request, outcome)
     return WorkerRecoveryState(
         phase=WorkerRecoveryPhase(phase),
         request=request,
         assignment=outcome,
         last_no_work=previous,
+        acknowledgement=acknowledgement,
     )
 
 

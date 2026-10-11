@@ -5,6 +5,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.assignments import NoWorkReason
 from devrelay.application.contracts.claims import WorkerClaimRequest
@@ -45,6 +46,11 @@ class Journal:
             request=self.pending,
             last_no_work=self.completed,
         )
+
+    async def get_or_create_acknowledgement(
+        self, request: WorkerClaimRequest, candidate: WorkerAcknowledgementIntent
+    ) -> WorkerAcknowledgementIntent:
+        raise WorkerStateUnavailable("This fake has no assigned journal.")
 
     async def load_pending(self) -> WorkerClaimRequest | None:
         return self.pending
