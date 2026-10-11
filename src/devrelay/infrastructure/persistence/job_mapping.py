@@ -14,8 +14,9 @@ from devrelay.application.jobs import (
 from devrelay.application.ports.job_persistence import JobPersistenceError
 from devrelay.application.tasks import TaskImportPolicy
 from devrelay.domain.jobs.job import Job
-from devrelay.domain.jobs.values import JobStatus
+from devrelay.domain.jobs.values import AttemptStatus, JobStatus
 from devrelay.domain.tasks import TaskIdentity
+from devrelay.infrastructure.persistence.claim_models import ExecutionAttemptRecord
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
     JobRecord,
@@ -42,6 +43,8 @@ def materialize_submission(
     binding: RepositoryBindingRecord | None,
     workflow: JobWorkflowRecord | None,
     workflow_event: JobWorkflowEventRecord | None,
+    submitted: JobWorkflowEventRecord | None,
+    attempt: ExecutionAttemptRecord | None,
 ) -> StoredJobSubmission:
     if (
         JobStatus(record.status) is not JobStatus.QUEUED
@@ -75,22 +78,63 @@ def materialize_submission(
     if (
         workflow is None
         or workflow_event is None
+        or submitted is None
+        or submitted.job_id != record.id
+        or submitted.workflow_version != 0
+        or submitted.event_type != WorkflowEventType.SUBMITTED.value
+        or submitted.status != JobStatus.QUEUED.value
+        or submitted.occurred_at != record.created_at
         or (workflow.job_id, workflow.source_task_id, workflow.repository_id)
         != (record.id, record.source_task_id, record.repository_id)
-        or workflow.status != JobStatus.QUEUED.value
-        or workflow.workflow_version != 0
         or not workflow.blocks_new_submission
         or workflow.created_at != record.created_at
-        or workflow.updated_at != record.created_at
+        or workflow.updated_at < record.created_at
         or workflow_event.job_id != workflow.job_id
         or workflow_event.workflow_version != workflow.workflow_version
         or workflow_event.status != workflow.status
-        or workflow_event.event_type != WorkflowEventType.SUBMITTED.value
         or workflow_event.occurred_at != workflow.updated_at
     ):
         raise JobPersistenceError(
             "Stored workflow/history failed integrity validation."
         )
+    queued = (
+        workflow.status == JobStatus.QUEUED.value
+        and workflow.workflow_version == 0
+        and workflow.updated_at == record.created_at
+        and workflow.active_attempt_id is None
+        and workflow.last_attempt_id is None
+        and workflow.last_attempt_number == 0
+        and workflow_event.event_type == WorkflowEventType.SUBMITTED.value
+        and workflow_event.attempt_id is None
+        and workflow_event.previous_version is None
+        and workflow_event.previous_status is None
+        and attempt is None
+    )
+    claimed = (
+        workflow.status == JobStatus.CLAIMED.value
+        and workflow.workflow_version == 1
+        and workflow.active_attempt_id is not None
+        and workflow.last_attempt_id == workflow.active_attempt_id
+        and workflow.last_attempt_number == 1
+        and workflow_event.event_type == WorkflowEventType.CLAIMED.value
+        and workflow_event.attempt_id == workflow.active_attempt_id
+        and workflow_event.previous_version == 0
+        and workflow_event.previous_status == JobStatus.QUEUED.value
+        and attempt is not None
+        and attempt.id == workflow.active_attempt_id
+        and attempt.job_id == record.id
+        and attempt.attempt_number == workflow.last_attempt_number
+        and attempt.generation == 1
+        and attempt.status == AttemptStatus.CLAIMED.value
+        and attempt.issued_at == workflow.updated_at
+        and attempt.updated_at == attempt.issued_at
+        and attempt.expires_at > attempt.issued_at
+        and attempt.acknowledged_at is None
+        and attempt.revoked_at is None
+        and attempt.ended_at is None
+    )
+    if not (queued or claimed):
+        raise JobPersistenceError("Stored workflow transition is unsupported.")
     task = materialize_snapshot(
         snapshot,
         TaskIdentity(

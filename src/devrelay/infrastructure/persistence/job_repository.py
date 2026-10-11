@@ -4,6 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import aliased
 
 from devrelay.application.contracts.submissions import (
     JobBranchAssociation,
@@ -22,6 +23,7 @@ from devrelay.application.jobs import (
 from devrelay.application.ports.job_persistence import JobPersistenceError
 from devrelay.application.ports.task_persistence import TaskPersistenceError
 from devrelay.domain.jobs.job import Job
+from devrelay.infrastructure.persistence.claim_models import ExecutionAttemptRecord
 from devrelay.infrastructure.persistence.job_mapping import materialize_submission
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
@@ -44,6 +46,7 @@ async def read_submission(
     session: AsyncSession,
     submission_key: str,
 ) -> StoredJobSubmission | None:
+    initial_event = aliased(JobWorkflowEventRecord)
     row = (
         await session.execute(
             select(
@@ -54,6 +57,8 @@ async def read_submission(
                 RepositoryBindingRecord,
                 JobWorkflowRecord,
                 JobWorkflowEventRecord,
+                initial_event,
+                ExecutionAttemptRecord,
             )
             .join(TaskSnapshotRecord, JobRecord.snapshot_id == TaskSnapshotRecord.id)
             .join(SourceTaskRecord, JobRecord.source_task_id == SourceTaskRecord.id)
@@ -71,12 +76,31 @@ async def read_submission(
                     == JobWorkflowEventRecord.workflow_version
                 ),
             )
+            .outerjoin(
+                initial_event,
+                (initial_event.job_id == JobRecord.id)
+                & (initial_event.workflow_version == 0),
+            )
+            .outerjoin(
+                ExecutionAttemptRecord,
+                JobWorkflowRecord.active_attempt_id == ExecutionAttemptRecord.id,
+            )
             .where(JobRecord.submission_key == submission_key)
         )
     ).one_or_none()
     if row is None:
         return None
-    record, snapshot, source, repository, binding, workflow, workflow_event = row
+    (
+        record,
+        snapshot,
+        source,
+        repository,
+        binding,
+        workflow,
+        workflow_event,
+        submitted,
+        attempt,
+    ) = row
     checks = tuple(
         (
             await session.scalars(
@@ -88,7 +112,16 @@ async def read_submission(
         ).all()
     )
     return materialize_submission(
-        record, snapshot, source, repository, checks, binding, workflow, workflow_event
+        record,
+        snapshot,
+        source,
+        repository,
+        checks,
+        binding,
+        workflow,
+        workflow_event,
+        submitted,
+        attempt,
     )
 
 

@@ -18,30 +18,24 @@ from sqlalchemy.pool import AsyncAdaptedQueuePool
 
 from devrelay.application.claim_eligibility import PrepareJobClaim
 from devrelay.application.contracts.submissions import (
-    CheckPolicy,
-    PreparedJobSubmission,
     RepositoryHead,
-    RepositoryPolicy,
     RepositorySubmissionObservation,
-    StoredJobSubmission,
     SubmissionAuthorization,
 )
-from devrelay.application.contracts.tasks import StoredTaskSnapshot, TaskRead
+from devrelay.application.contracts.tasks import TaskRead
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.ports.job_persistence import JobPersistenceError
-from devrelay.application.tasks import TaskImportPolicy
 from devrelay.bootstrap.claims import open_claim_preparer
 from devrelay.bootstrap.jobs import open_github_job_submitter
 from devrelay.bootstrap.persistence import (
     job_submission_reader,
-    job_submission_unit_of_work_factory,
     queued_job_reader,
-    task_unit_of_work_factory,
 )
 from devrelay.bootstrap.tasks import open_task_importer
 from devrelay.config.control import ControlSettings
-from devrelay.domain.tasks import TaskIdentity, TaskSnapshot
+from devrelay.domain.tasks import TaskIdentity
 from devrelay.infrastructure.persistence.job_models import JobRecord
+from tests.integration.job_fixtures import save_job
 
 pytestmark = pytest.mark.postgres
 DatabaseFactory = Callable[[], AbstractAsyncContextManager[AsyncEngine]]
@@ -52,75 +46,6 @@ def run(scenario: Coroutine[object, object, None]) -> None:
         scenario,
         loop_factory=asyncio.SelectorEventLoop if sys.platform == "win32" else None,
     )
-
-
-async def save_job(
-    engine: AsyncEngine,
-    *,
-    check_count: int = 1,
-    repository: RepositoryPolicy | None = None,
-    created_at: datetime | None = None,
-    job_id: UUID | None = None,
-) -> StoredJobSubmission:
-    now = created_at or datetime.now(UTC)
-    task = TaskSnapshot(
-        id=uuid4(),
-        identity=TaskIdentity(
-            provider="jira", site_id="test-site", external_id=uuid4().hex
-        ),
-        display_key="DRY-5",
-        title="Implement a feature",
-        description="Keep requirements stable.",
-        acceptance_criteria=("Pass configured checks.",),
-        captured_at=now,
-    )
-    async with task_unit_of_work_factory(engine)() as unit:
-        saved = await unit.tasks.save_snapshot(task)
-        await unit.commit()
-    policy = repository or RepositoryPolicy(
-        repository_id=uuid4(),
-        provider_repository_id=123,
-        slug="example/devrelay",
-        enabled=True,
-        target_branch="master",
-        coding_branch_prefix="devrelay/jobs",
-        version="v1",
-        task_scope=TaskImportPolicy(
-            provider="jira", site_id="test-site", allowed_scope_keys=frozenset({"DRY"})
-        ),
-        checks=tuple(
-            CheckPolicy(
-                id=f"check_{index}",
-                argv=("pytest",),
-                working_directory=".",
-                timeout_seconds=300,
-            )
-            for index in range(check_count)
-        ),
-        max_repair_cycles=2,
-    )
-    intent = PreparedJobSubmission(
-        stored=StoredTaskSnapshot(
-            source_task_id=saved.source_task_id, snapshot=saved.snapshot
-        ),
-        policy=policy,
-        actor_id="test-operator",
-    )
-    assert policy.provider_repository_id is not None
-    candidate = intent.build_candidate(
-        job_id=job_id or uuid4(),
-        head=RepositoryHead(
-            repository_id=policy.repository_id,
-            provider_repository_id=policy.provider_repository_id,
-            target_branch=policy.target_branch,
-            revision="a" * 40,
-        ),
-        now=now,
-    )
-    async with job_submission_unit_of_work_factory(engine)() as unit:
-        result = await unit.jobs.admit(intent, candidate)
-        await unit.commit()
-    return result.stored
 
 
 def assert_pool_released(engine: AsyncEngine) -> None:

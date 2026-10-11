@@ -443,7 +443,9 @@ def test_reader_fails_closed_on_privileged_workflow_corruption(
                         )
                     )
                     await connection.execute(
-                        text("DROP TRIGGER job_workflows_no_mutation ON job_workflows")
+                        text(
+                            "DROP TRIGGER job_workflows_claim_transition ON job_workflows"
+                        )
                     )
                     await connection.execute(delete(JobWorkflowRecord))
                 elif damage == "missing_event":
@@ -460,7 +462,14 @@ def test_reader_fails_closed_on_privileged_workflow_corruption(
                     await connection.execute(delete(JobWorkflowEventRecord))
                 elif damage == "workflow_time":
                     await connection.execute(
-                        text("DROP TRIGGER job_workflows_no_mutation ON job_workflows")
+                        text(
+                            "DROP TRIGGER job_workflows_claim_transition ON job_workflows"
+                        )
+                    )
+                    await connection.execute(
+                        text(
+                            "DROP TRIGGER job_workflows_updated_history ON job_workflows"
+                        )
                     )
                     await connection.execute(
                         text(
@@ -542,7 +551,10 @@ def test_workflow_downgrade_refuses_inconsistent_history(
             await record(engine, prepared(await save_task(engine), policy()))
             async with engine.begin() as connection:
                 await connection.execute(
-                    text("DROP TRIGGER job_workflows_no_mutation ON job_workflows")
+                    text("DROP TRIGGER job_workflows_claim_transition ON job_workflows")
+                )
+                await connection.execute(
+                    text("DROP TRIGGER job_workflows_updated_history ON job_workflows")
                 )
                 await connection.execute(
                     text(
@@ -563,7 +575,7 @@ def test_workflow_downgrade_refuses_inconsistent_history(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0005_queued_candidate_index"
+                ).scalar_one() == "0006_atomic_claims"
                 assert (
                     await connection.execute(
                         text("SELECT count(*) FROM job_workflow_events")
@@ -817,7 +829,7 @@ def test_downgrade_cannot_discard_accepted_provider_bindings(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0005_queued_candidate_index"
+                ).scalar_one() == "0006_atomic_claims"
 
     run(scenario())
 
