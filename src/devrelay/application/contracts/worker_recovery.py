@@ -1,0 +1,146 @@
+from dataclasses import dataclass, field
+from datetime import datetime
+from enum import StrEnum
+from typing import Literal
+from uuid import UUID
+
+from devrelay.application.contracts.assignments import ClaimResult, NoWorkReason
+from devrelay.application.contracts.claims import WorkerClaimRequest
+from devrelay.domain.jobs.values import _utc, _uuid
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AssignmentReference:
+    """Stable claim recovery anchors; not acknowledgement or launch permission."""
+
+    worker_id: UUID
+    job_id: UUID
+    repository_id: UUID
+    attempt_id: UUID
+    generation: int
+    issued_at: datetime
+    expires_at: datetime
+
+    def __post_init__(self) -> None:
+        for value in (self.worker_id, self.job_id, self.repository_id, self.attempt_id):
+            _uuid(value)
+        if type(self.generation) is not int or self.generation != 1:
+            raise ValueError("Initial assignment generation must be one.")
+        for name in ("issued_at", "expires_at"):
+            object.__setattr__(self, name, _utc(getattr(self, name)))
+        if self.expires_at <= self.issued_at:
+            raise ValueError("Assignment expiry must follow issuance.")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerClaimOutcome:
+    """Trusted control response projection for the local journal, with no secret.
+
+    Transport must authenticate control and validate the complete response before
+    deriving this projection. Only stable references are stored; accepted task and
+    check payloads can be recovered from control using the original request/proof.
+    """
+
+    worker_id: UUID
+    claim_request_id: UUID
+    recorded_at: datetime
+    assignment: AssignmentReference | None = None
+    no_work: NoWorkReason | None = None
+    protocol_version: Literal[1] = 1
+
+    def __post_init__(self) -> None:
+        _uuid(self.worker_id)
+        _uuid(self.claim_request_id)
+        object.__setattr__(self, "recorded_at", _utc(self.recorded_at))
+        if type(self.protocol_version) is not int or self.protocol_version != 1:
+            raise ValueError("Claim outcome protocol is unsupported.")
+        if self.assignment is None:
+            if not isinstance(self.no_work, NoWorkReason):
+                raise ValueError("No-work requires a typed recorded reason.")
+        elif (
+            not isinstance(self.assignment, AssignmentReference)
+            or self.no_work is not None
+            or self.assignment.worker_id != self.worker_id
+            or self.assignment.issued_at != self.recorded_at
+        ):
+            raise ValueError("Assignment outcome must match the recorded worker claim.")
+
+    @classmethod
+    def from_result(
+        cls, result: ClaimResult, *, worker_id: UUID, claim_request_id: UUID
+    ) -> WorkerClaimOutcome:
+        reference = None
+        if result.attempt is not None and result.stored is not None:
+            lease = result.attempt.lease
+            reference = AssignmentReference(
+                worker_id=lease.worker_id,
+                job_id=result.attempt.job_id,
+                repository_id=result.stored.job.repository_id,
+                attempt_id=result.attempt.id,
+                generation=lease.generation,
+                issued_at=lease.issued_at,
+                expires_at=lease.expires_at,
+            )
+        return cls(
+            worker_id=worker_id,
+            claim_request_id=claim_request_id,
+            recorded_at=result.recorded_at,
+            assignment=reference,
+            no_work=result.no_work,
+        )
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ClaimExchange:
+    """Recovery references only; payload retrieval and execution are separate gates."""
+
+    outcome: WorkerClaimOutcome
+    recovered: bool
+    lease_authority_active: bool
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.outcome, WorkerClaimOutcome)
+            or type(self.recovered) is not bool
+            or type(self.lease_authority_active) is not bool
+            or (self.outcome.assignment is None and self.lease_authority_active)
+        ):
+            raise ValueError("Claim exchange requires coherent recovery metadata.")
+
+
+class WorkerRecoveryPhase(StrEnum):
+    IDLE = "idle"
+    PENDING = "pending"
+    ASSIGNED = "assigned"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerRecoveryState:
+    phase: WorkerRecoveryPhase
+    request: WorkerClaimRequest | None = field(default=None, repr=False)
+    assignment: WorkerClaimOutcome | None = None
+    last_no_work: WorkerClaimOutcome | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.phase, WorkerRecoveryPhase):
+            raise ValueError("Worker recovery phase must be typed.")
+        if self.last_no_work is not None and (
+            not isinstance(self.last_no_work, WorkerClaimOutcome)
+            or self.last_no_work.no_work is None
+        ):
+            raise ValueError("Completed no-work requires a recorded no-work outcome.")
+        if self.phase is WorkerRecoveryPhase.IDLE:
+            if self.request is not None or self.assignment is not None:
+                raise ValueError("Idle recovery cannot contain an active claim.")
+        elif not isinstance(self.request, WorkerClaimRequest):
+            raise ValueError("Unresolved recovery requires the original request.")
+        if self.phase is WorkerRecoveryPhase.PENDING and self.assignment is not None:
+            raise ValueError("Pending recovery cannot contain an assignment.")
+        if self.phase is WorkerRecoveryPhase.ASSIGNED:
+            if (
+                not isinstance(self.assignment, WorkerClaimOutcome)
+                or self.assignment.assignment is None
+                or self.request is None
+                or self.assignment.claim_request_id != self.request.claim_request_id
+            ):
+                raise ValueError("Assigned recovery requires matching stable anchors.")

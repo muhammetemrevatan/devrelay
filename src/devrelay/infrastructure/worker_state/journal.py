@@ -12,10 +12,20 @@ from devrelay.application.contracts.claims import (
     LeaseProofVerifier,
     WorkerClaimRequest,
 )
+from devrelay.application.contracts.worker_recovery import (
+    WorkerClaimOutcome,
+    WorkerRecoveryState,
+)
 from devrelay.application.contracts.workers import WorkerJournalScope
 from devrelay.application.ports.worker_journal import (
     ProofProtector,
     WorkerStateUnavailable,
+)
+from devrelay.infrastructure.worker_state.outcomes import (
+    create_outcome_schema,
+    recovery_state,
+    save_assignment,
+    save_no_work,
 )
 
 _FAILURE = "Worker recovery journal is unavailable."
@@ -59,29 +69,37 @@ class SqliteClaimStore:
             mode = connection.execute("PRAGMA journal_mode=WAL").fetchone()
             connection.execute("PRAGMA synchronous=FULL")
             connection.execute("PRAGMA trusted_schema=OFF")
+            connection.execute("PRAGMA wal_autocheckpoint=32")
+            connection.execute("PRAGMA journal_size_limit=131072")
             if mode != ("wal",) or connection.execute(
                 "PRAGMA synchronous"
             ).fetchone() != (2,):
                 raise WorkerStateUnavailable(_FAILURE)
+            if connection.execute("PRAGMA wal_autocheckpoint").fetchone() != (
+                32,
+            ) or connection.execute("PRAGMA journal_size_limit").fetchone() != (
+                131072,
+            ):
+                raise WorkerStateUnavailable(_FAILURE)
             connection.execute("BEGIN IMMEDIATE")
             if new:
-                connection.execute(
-                    "CREATE TABLE metadata (slot INTEGER PRIMARY KEY CHECK (slot = 1), version INTEGER NOT NULL CHECK (version = 1), scope BLOB NOT NULL CHECK (length(scope) = 32), prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)))"
-                )
-                connection.execute(
-                    "INSERT INTO metadata VALUES (1, 1, ?, 0)", (scope.key,)
-                )
+                create_outcome_schema(connection, scope.key, prepared=0)
                 connection.execute(
                     "CREATE TABLE pending_claim (slot INTEGER PRIMARY KEY CHECK (slot = 1), request_id TEXT NOT NULL CHECK (length(request_id) = 36), protocol_version INTEGER NOT NULL CHECK (protocol_version = 1), ciphertext BLOB NOT NULL CHECK (length(ciphertext) BETWEEN 1 AND 4096), verifier BLOB NOT NULL CHECK (length(verifier) = 32))"
                 )
             existing = connection.execute(
                 "SELECT version, scope FROM metadata WHERE slot = 1"
             ).fetchone()
-            if existing != (1, scope.key):
+            if existing == (1, scope.key):
+                # Validate the old record/proof before an atomic, lossless upgrade.
+                pending = self._read_request()
+                connection.execute("DROP TABLE metadata")
+                create_outcome_schema(
+                    connection, scope.key, prepared=int(pending is not None)
+                )
+            elif existing != (2, scope.key):
                 raise WorkerStateUnavailable(_FAILURE)
-            connection.execute(
-                "SELECT request_id, protocol_version, ciphertext, verifier FROM pending_claim WHERE slot = 1"
-            )
+            self._read_state()
             connection.execute("COMMIT")
             self._verify_files()
             self._read()
@@ -109,7 +127,7 @@ class SqliteClaimStore:
             b"devrelay.pending-proof.v1\x00" + self._scope.key + request_id.bytes
         ).digest()
 
-    def _read(self) -> WorkerClaimRequest | None:
+    def _read_request(self) -> WorkerClaimRequest | None:
         prepared = (
             self._open()
             .execute("SELECT prepared FROM metadata WHERE slot = 1")
@@ -159,6 +177,19 @@ class SqliteClaimStore:
             raise WorkerStateUnavailable(_FAILURE)
         return WorkerClaimRequest(claim_request_id=request_id, proof=proof)
 
+    def _read_state(self) -> WorkerRecoveryState:
+        return recovery_state(self._open(), self._scope, self._read_request())
+
+    def _read(self) -> WorkerClaimRequest | None:
+        return self._read_state().request
+
+    def load_state(self) -> WorkerRecoveryState:
+        try:
+            self._verify_files()
+            return self._read_state()
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            raise WorkerStateUnavailable(_FAILURE) from None
+
     def load_pending(self) -> WorkerClaimRequest | None:
         try:
             self._verify_files()
@@ -191,6 +222,12 @@ class SqliteClaimStore:
                         )
                 connection.execute("COMMIT")
                 return pending
+            previous = self._read_state().last_no_work
+            if (
+                previous is not None
+                and previous.claim_request_id == candidate.claim_request_id
+            ):
+                raise ClaimReplayConflict("Completed claim identity cannot be reused.")
             try:
                 ciphertext = self._protector.protect(
                     candidate.proof, context=self._context(candidate.claim_request_id)
@@ -213,9 +250,82 @@ class SqliteClaimStore:
                     verifier.digest,
                 ),
             )
-            connection.execute("UPDATE metadata SET prepared = 1 WHERE slot = 1")
+            connection.execute(
+                "UPDATE metadata SET prepared = 1, phase = 'pending' WHERE slot = 1"
+            )
             connection.execute("COMMIT")
             return candidate
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
+    def record_outcome(
+        self, request: WorkerClaimRequest, outcome: WorkerClaimOutcome
+    ) -> WorkerRecoveryState:
+        connection = self._open()
+        try:
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            if (
+                not isinstance(request, WorkerClaimRequest)
+                or not isinstance(outcome, WorkerClaimOutcome)
+                or outcome.worker_id != self._scope.worker_id
+                or outcome.claim_request_id != request.claim_request_id
+                or outcome.protocol_version != request.protocol_version
+            ):
+                raise ClaimReplayConflict(
+                    "Claim outcome is outside the original request scope."
+                )
+            state = self._read_state()
+            pending = state.request
+            if pending is None or pending.claim_request_id != request.claim_request_id:
+                if state.last_no_work != outcome:
+                    raise ClaimReplayConflict(
+                        "Claim outcome does not match local recovery state."
+                    )
+                digest = connection.execute(
+                    "SELECT verifier FROM completed_no_work WHERE slot = 1"
+                ).fetchone()
+                if digest is None:
+                    raise WorkerStateUnavailable(_FAILURE)
+                verifier = LeaseProofVerifier(
+                    worker_id=self._scope.worker_id,
+                    claim_request_id=request.claim_request_id,
+                    digest=digest[0],
+                )
+            else:
+                verifier = LeaseProofVerifier.from_proof(
+                    worker_id=self._scope.worker_id,
+                    claim_request_id=pending.claim_request_id,
+                    proof=pending.proof,
+                )
+            if not verifier.matches(
+                request.proof,
+                worker_id=self._scope.worker_id,
+                claim_request_id=request.claim_request_id,
+            ):
+                raise ClaimReplayConflict(
+                    "Claim outcome conflicts with the original proof."
+                )
+            if (
+                pending is not None
+                and pending.claim_request_id == request.claim_request_id
+            ):
+                if state.assignment is not None:
+                    if state.assignment != outcome:
+                        raise ClaimReplayConflict(
+                            "Claim outcome conflicts with the recorded assignment."
+                        )
+                elif outcome.assignment is not None:
+                    save_assignment(connection, self._scope, request, outcome)
+                else:
+                    save_no_work(connection, outcome, verifier.digest)
+            result = self._read_state()
+            connection.execute("COMMIT")
+            return result
         except ClaimReplayConflict:
             self._rollback()
             raise
@@ -250,6 +360,14 @@ class AsyncClaimJournal:
         self._closed = False
         self._admission = asyncio.Lock()
 
+    async def load_state(self) -> WorkerRecoveryState:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.load_state
+            )
+
     async def load_pending(self) -> WorkerClaimRequest | None:
         async with self._admission:
             if self._closed:
@@ -270,3 +388,13 @@ class AsyncClaimJournal:
 
     def stop_admission(self) -> None:
         self._closed = True
+
+    async def record_outcome(
+        self, request: WorkerClaimRequest, outcome: WorkerClaimOutcome
+    ) -> WorkerRecoveryState:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.record_outcome, request, outcome
+            )

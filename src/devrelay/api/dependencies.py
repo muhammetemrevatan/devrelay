@@ -8,6 +8,9 @@ from fastapi import Depends, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from devrelay.api.errors import ApiErrorCode, api_error
+from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
+from devrelay.application.contracts.assignments import ClaimResult
+from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.application.contracts.submissions import (
     SavedJobSubmission,
     SubmissionAuthorization,
@@ -26,6 +29,20 @@ class SubmissionOperation(Protocol):
         repository_id: UUID,
         authorization: SubmissionAuthorization,
     ) -> SavedJobSubmission: ...
+
+
+type ClaimOperation = Callable[
+    [WorkerClaimRequest, WorkerAuthorization], Awaitable[ClaimResult]
+]
+type AssignmentOperation = Callable[
+    [UUID, WorkerClaimRequest, WorkerAuthorization], Awaitable[AssignmentDelivery]
+]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerClaimOperations:
+    claim: ClaimOperation
+    read_assignment: AssignmentOperation
 
 
 @dataclass(slots=True, kw_only=True)
@@ -71,6 +88,25 @@ class JobSubmissionServices(RequestAdmission):
 @dataclass(slots=True, kw_only=True)
 class WorkerAuthenticationServices:
     authenticate: Callable[[str], WorkerAuthorization | None] = field(repr=False)
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkerClaimServices(RequestAdmission):
+    claim_job: ClaimOperation
+    read_assignment: AssignmentOperation | None = None
+    busy_code: ApiErrorCode = ApiErrorCode.CLAIM_BUSY
+    busy_message: str = "Worker claims are busy."
+
+
+async def require_worker_claim_services(
+    request: Request,
+) -> WorkerClaimServices:
+    services = getattr(request.app.state, "worker_claim_services", None)
+    if not isinstance(services, WorkerClaimServices):
+        raise api_error(
+            503, ApiErrorCode.CLAIM_UNAVAILABLE, "Worker claims unavailable."
+        )
+    return services
 
 
 bearer = HTTPBearer(
