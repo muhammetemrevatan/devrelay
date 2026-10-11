@@ -1,16 +1,21 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from devrelay.application.acknowledgements import AcknowledgeAssignedJob
+from devrelay.application.assignment_delivery import ReadAssignedJob
 from devrelay.application.claim_eligibility import PrepareJobClaim
 from devrelay.application.claims import ClaimJob
 from devrelay.application.contracts.assignments import ClaimLimits
+from devrelay.application.contracts.claims import LeaseProof
+from devrelay.application.contracts.submissions import RepositoryPolicy
 from devrelay.bootstrap.github import open_github_repository_source
 from devrelay.bootstrap.jira import open_jira_task_source
 from devrelay.bootstrap.jobs import repository_policy
 from devrelay.bootstrap.persistence import (
+    acknowledgement_store,
     claim_store,
     job_branch_reader,
     queued_job_reader,
@@ -49,16 +54,9 @@ async def open_claim_preparer(
             yield PrepareJobClaim(queued_job_reader(engine), source, observer, policies)
 
 
-@asynccontextmanager
-async def open_job_claimer(
+def _claim_configuration(
     settings: ControlSettings,
-    engine: AsyncEngine,
-    *,
-    limits: ClaimLimits | None = None,
-    jira_transport: httpx.AsyncBaseTransport | None = None,
-    github_transport: httpx.AsyncBaseTransport | None = None,
-) -> AsyncIterator[ClaimJob]:
-    """Control claim composition; no worker polling or execution resources."""
+) -> tuple[tuple[RepositoryPolicy, ...], Callable[[LeaseProof], None]]:
     if settings.jira is None or settings.github is None or not settings.workers:
         raise ValueError("Claims require provider policies and enrolled workers.")
     credentials = tuple(worker.auth_token for worker in settings.workers) + (
@@ -80,6 +78,35 @@ async def open_job_claimer(
         )
         for item in settings.repositories
     )
+    return policies, lease_proof_guard(credentials)
+
+
+def job_acknowledger(
+    settings: ControlSettings, engine: AsyncEngine
+) -> AcknowledgeAssignedJob:
+    """Trusted control use case only; no HTTP route, startup I/O or execution."""
+    if settings.worker_claims is None:
+        raise ValueError("Acknowledgements require explicitly enabled claims.")
+    policies, proof_guard = _claim_configuration(settings)
+    return AcknowledgeAssignedJob(
+        ReadAssignedJob(claim_store(engine, policies), proof_guard),
+        acknowledgement_store(engine, policies),
+    )
+
+
+@asynccontextmanager
+async def open_job_claimer(
+    settings: ControlSettings,
+    engine: AsyncEngine,
+    *,
+    limits: ClaimLimits | None = None,
+    jira_transport: httpx.AsyncBaseTransport | None = None,
+    github_transport: httpx.AsyncBaseTransport | None = None,
+) -> AsyncIterator[ClaimJob]:
+    """Control claim composition; no worker polling or execution resources."""
+    if settings.jira is None or settings.github is None:
+        raise ValueError("Claims require provider policies.")
+    policies, proof_guard = _claim_configuration(settings)
     async with open_claim_preparer(
         settings.jira,
         settings.github,
@@ -91,5 +118,5 @@ async def open_job_claimer(
         yield ClaimJob(
             claim_store(engine, policies, limits),
             preparer,
-            lease_proof_guard(credentials),
+            proof_guard,
         )

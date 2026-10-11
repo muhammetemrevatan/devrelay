@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import datetime, timedelta
 from uuid import UUID, uuid4
 
@@ -5,6 +6,11 @@ from sqlalchemy import func, insert, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementIdentity,
+    AcknowledgementRejected,
+    AcknowledgementResult,
+)
 from devrelay.application.contracts.assignments import (
     ClaimAdmissionRejected,
     ClaimLimits,
@@ -34,6 +40,9 @@ from devrelay.application.contracts.workflows import JobWorkflowState, WorkflowE
 from devrelay.application.ports.job_persistence import JobPersistenceError
 from devrelay.domain.jobs.attempt import ExecutionAttempt, Lease
 from devrelay.domain.jobs.values import AttemptStatus, JobStatus
+from devrelay.infrastructure.persistence.acknowledgement_models import (
+    AcknowledgementReceiptRecord,
+)
 from devrelay.infrastructure.persistence.claim_models import (
     ClaimReceiptRecord,
     DispatchSlotRecord,
@@ -52,8 +61,8 @@ from devrelay.infrastructure.persistence.workflow_models import (
 class SqlAlchemyClaimStore:
     """Singleton serialization, bounded SQL and commit-before-disclosure.
 
-    This supports only initial claims. Expiry never releases the slot; subsequent
-    transitions need their own domain/evidence migration and trusted containment.
+    Initial claims and acknowledgements retain the same reservation. Expiry never
+    releases the slot; later transitions require their own evidence and containment.
     """
 
     def __init__(
@@ -284,6 +293,211 @@ class SqlAlchemyClaimStore:
                 self._admit(slot, worker, now)
         except SQLAlchemyError, ValueError, TypeError:
             raise ClaimPersistenceError("Claim admission storage failed.") from None
+
+    async def acknowledge(
+        self,
+        identity: AcknowledgementIdentity,
+        authorization: WorkerAuthorization,
+        *,
+        definition_digest: str,
+    ) -> AcknowledgementResult:
+        try:
+            async with self._sessions.begin() as session:
+                await self._timeouts(session)
+                slot = await self._slot(session, lock=True)
+                await self._worker(session, authorization.worker_id, lock=True)
+                recovered = await self._replay(
+                    session, identity.claim, authorization, await self._clock(session)
+                )
+                if (
+                    recovered is None
+                    or recovered.stored is None
+                    or recovered.attempt is None
+                ):
+                    raise AcknowledgementRejected("Original assignment is required.")
+                stored, attempt, intent = (
+                    recovered.stored,
+                    recovered.attempt,
+                    identity.intent,
+                )
+                if (
+                    attempt.id != intent.attempt_id
+                    or slot.reserved_attempt_id != attempt.id
+                    or stored.job.snapshot_id != intent.snapshot_id
+                    or stored.job.base_revision != intent.base_revision
+                    or definition_digest != intent.definition_digest
+                ):
+                    raise AcknowledgementRejected(
+                        "Acknowledgement differs from original assignment."
+                    )
+                await session.execute(
+                    select(SourceTaskRecord.id)
+                    .where(SourceTaskRecord.id == stored.job.source_task_id)
+                    .with_for_update()
+                )
+                workflow = (
+                    await session.scalars(
+                        select(JobWorkflowRecord)
+                        .where(JobWorkflowRecord.job_id == stored.job.id)
+                        .with_for_update()
+                    )
+                ).one()
+                record = (
+                    await session.scalars(
+                        select(ExecutionAttemptRecord)
+                        .where(ExecutionAttemptRecord.id == attempt.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).one()
+                now = await self._clock(session)
+                scope = self._authorize(authorization, now)
+                if stored.job.repository_id not in scope:
+                    raise ClaimScopeRejected(
+                        "Acknowledgement is outside current scope."
+                    )
+                receipt = (
+                    await session.scalars(
+                        select(AcknowledgementReceiptRecord).where(
+                            AcknowledgementReceiptRecord.worker_id
+                            == authorization.worker_id,
+                            AcknowledgementReceiptRecord.request_id
+                            == intent.acknowledgement_request_id,
+                        )
+                    )
+                ).one_or_none()
+                if receipt is not None:
+                    identity.require_replay(receipt.fingerprint)
+                    if (
+                        receipt.attempt_id != attempt.id
+                        or receipt.job_id != stored.job.id
+                        or receipt.claim_request_id != intent.claim_request_id
+                        or receipt.snapshot_id != intent.snapshot_id
+                        or receipt.base_revision != intent.base_revision
+                        or receipt.definition_digest != intent.definition_digest
+                        or receipt.repository_id != stored.job.repository_id
+                        or record.status != AttemptStatus.RUNNING.value
+                        or record.acknowledged_at != receipt.acknowledged_at
+                        or workflow.workflow_version != 2
+                        or workflow.status != JobStatus.RUNNING.value
+                        or workflow.updated_at != receipt.acknowledged_at
+                    ):
+                        raise ClaimPersistenceError(
+                            "Acknowledgement history is inconsistent."
+                        )
+                    result = AcknowledgementResult(
+                        worker_id=authorization.worker_id,
+                        job_id=stored.job.id,
+                        repository_id=stored.job.repository_id,
+                        intent=intent,
+                        acknowledged_at=receipt.acknowledged_at,
+                        expires_at=record.expires_at,
+                        recovered=True,
+                        lease_authority_active=now < record.expires_at,
+                    )
+                else:
+                    if (
+                        record.status != AttemptStatus.CLAIMED.value
+                        or record.acknowledged_at is not None
+                        or record.worker_id != authorization.worker_id
+                        or record.claim_request_id != intent.claim_request_id
+                        or record.generation != intent.generation
+                        or now >= record.expires_at
+                        or workflow.workflow_version != intent.expected_workflow_version
+                        or workflow.status != JobStatus.CLAIMED.value
+                        or workflow.active_attempt_id != attempt.id
+                        or workflow.updated_at != record.issued_at
+                    ):
+                        raise AcknowledgementRejected(
+                            "Initial acknowledgement authority is unavailable."
+                        )
+                    acknowledged = attempt.acknowledge(
+                        worker_id=authorization.worker_id,
+                        generation=intent.generation,
+                        now=now,
+                    )
+                    job = stored.job.claim(
+                        attempt.id, now=attempt.lease.issued_at
+                    ).begin_execution(attempt.id, now=now)
+                    await session.execute(
+                        update(ExecutionAttemptRecord)
+                        .where(
+                            ExecutionAttemptRecord.id == attempt.id,
+                            ExecutionAttemptRecord.status
+                            == AttemptStatus.CLAIMED.value,
+                        )
+                        .values(
+                            status=acknowledged.status.value,
+                            updated_at=now,
+                            acknowledged_at=now,
+                        )
+                    )
+                    await session.execute(
+                        update(JobWorkflowRecord)
+                        .where(
+                            JobWorkflowRecord.job_id == stored.job.id,
+                            JobWorkflowRecord.workflow_version
+                            == intent.expected_workflow_version,
+                        )
+                        .values(
+                            status=job.status.value,
+                            workflow_version=job.workflow_version,
+                            updated_at=now,
+                        )
+                    )
+                    await session.execute(
+                        insert(JobWorkflowEventRecord).values(
+                            job_id=stored.job.id,
+                            workflow_version=2,
+                            status=JobStatus.RUNNING.value,
+                            event_type=WorkflowEventType.ACKNOWLEDGED.value,
+                            occurred_at=now,
+                            attempt_id=attempt.id,
+                            previous_version=1,
+                            previous_status=JobStatus.CLAIMED.value,
+                        )
+                    )
+                    await session.execute(
+                        insert(AcknowledgementReceiptRecord).values(
+                            worker_id=authorization.worker_id,
+                            request_id=intent.acknowledgement_request_id,
+                            attempt_id=attempt.id,
+                            job_id=stored.job.id,
+                            repository_id=stored.job.repository_id,
+                            claim_request_id=intent.claim_request_id,
+                            generation=intent.generation,
+                            snapshot_id=intent.snapshot_id,
+                            base_revision=intent.base_revision,
+                            definition_digest=intent.definition_digest,
+                            definition_digest_version=1,
+                            protocol_version=1,
+                            fingerprint_version=1,
+                            fingerprint=identity.fingerprint,
+                            expected_workflow_version=1,
+                            workflow_version=2,
+                            acknowledged_at=now,
+                        )
+                    )
+                    result = AcknowledgementResult(
+                        worker_id=authorization.worker_id,
+                        job_id=stored.job.id,
+                        repository_id=stored.job.repository_id,
+                        intent=intent,
+                        acknowledged_at=now,
+                        expires_at=record.expires_at,
+                        recovered=False,
+                        lease_authority_active=True,
+                    )
+                disclosure_time = await self._clock(session)
+                self._authorize(authorization, disclosure_time)
+                result = replace(
+                    result, lease_authority_active=disclosure_time < result.expires_at
+                )
+            return result
+        except ClaimReplayConflict:
+            raise
+        except SQLAlchemyError, ValueError, TypeError, JobPersistenceError:
+            raise ClaimPersistenceError("Acknowledgement storage failed.") from None
 
     async def claim(
         self,

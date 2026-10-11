@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async
 
 from devrelay.application.contracts.assignments import ClaimLimits
 from devrelay.application.contracts.submissions import RepositoryPolicy
+from devrelay.application.ports.acknowledgement_persistence import AcknowledgementStore
 from devrelay.application.ports.claim_eligibility import QueuedJobReader
 from devrelay.application.ports.claim_persistence import ClaimStore
 from devrelay.application.ports.job_persistence import (
@@ -104,6 +105,14 @@ def claim_store(
         async_sessionmaker(engine, expire_on_commit=False, autoflush=False),
         policies,
         limits,
+    )
+
+
+def acknowledgement_store(
+    engine: AsyncEngine, policies: tuple[RepositoryPolicy, ...]
+) -> AcknowledgementStore:
+    return SqlAlchemyClaimStore(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False), policies
     )
 
 

@@ -10,6 +10,7 @@ from devrelay.domain.jobs.values import JobStatus, _utc, _uuid
 class WorkflowEventType(StrEnum):
     SUBMITTED = "submitted"
     CLAIMED = "claimed"
+    ACKNOWLEDGED = "acknowledged"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
