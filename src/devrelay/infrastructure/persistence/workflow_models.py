@@ -22,6 +22,22 @@ class JobWorkflowRecord(Base):
     __tablename__ = "job_workflows"
     __table_args__ = (
         ForeignKeyConstraint(
+            ["active_attempt_id", "job_id"],
+            ["execution_attempts.id", "execution_attempts.job_id"],
+            name="fk_workflow_active_attempt",
+            deferrable=True,
+            initially="DEFERRED",
+            use_alter=True,
+        ),
+        ForeignKeyConstraint(
+            ["last_attempt_id", "job_id"],
+            ["execution_attempts.id", "execution_attempts.job_id"],
+            name="fk_workflow_last_attempt",
+            deferrable=True,
+            initially="DEFERRED",
+            use_alter=True,
+        ),
+        ForeignKeyConstraint(
             ["job_id", "source_task_id", "repository_id"],
             ["jobs.id", "jobs.source_task_id", "jobs.repository_id"],
             name="fk_job_workflows_definition",
@@ -42,11 +58,12 @@ class JobWorkflowRecord(Base):
             use_alter=True,
         ),
         CheckConstraint(
-            "status = 'queued' AND workflow_version = 0 AND blocks_new_submission IS TRUE",
-            name="ck_job_workflows_initial_state",
-        ),
-        CheckConstraint(
-            "created_at = updated_at", name="ck_job_workflows_initial_chronology"
+            "blocks_new_submission IS TRUE AND updated_at >= created_at AND "
+            "((status = 'queued' AND workflow_version = 0 AND updated_at = created_at "
+            "AND active_attempt_id IS NULL AND last_attempt_id IS NULL AND last_attempt_number = 0) "
+            "OR (status = 'claimed' AND workflow_version = 1 AND active_attempt_id IS NOT NULL "
+            "AND last_attempt_id IS NOT NULL AND active_attempt_id = last_attempt_id AND last_attempt_number = 1))",
+            name="ck_job_workflows_claim_state",
         ),
         Index(
             "uq_job_workflows_unresolved_task_repository",
@@ -73,11 +90,21 @@ class JobWorkflowRecord(Base):
     blocks_new_submission: Mapped[bool] = mapped_column(Boolean)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    active_attempt_id: Mapped[UUID | None] = mapped_column(Uuid)
+    last_attempt_id: Mapped[UUID | None] = mapped_column(Uuid)
+    last_attempt_number: Mapped[int] = mapped_column(BigInteger, server_default="0")
 
 
 class JobWorkflowEventRecord(Base):
     __tablename__ = "job_workflow_events"
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["attempt_id", "job_id"],
+            ["execution_attempts.id", "execution_attempts.job_id"],
+            name="fk_workflow_event_attempt",
+            deferrable=True,
+            initially="DEFERRED",
+        ),
         ForeignKeyConstraint(
             ["job_id"],
             ["job_workflows.job_id"],
@@ -90,8 +117,12 @@ class JobWorkflowEventRecord(Base):
             "job_id", "workflow_version", "status", name="uq_job_workflow_events_state"
         ),
         CheckConstraint(
-            "workflow_version = 0 AND status = 'queued' AND event_type = 'submitted'",
-            name="ck_job_workflow_events_initial_state",
+            "(workflow_version = 0 AND status = 'queued' AND event_type = 'submitted' "
+            "AND attempt_id IS NULL AND previous_version IS NULL AND previous_status IS NULL) "
+            "OR (workflow_version = 1 AND status = 'claimed' AND event_type = 'claimed' "
+            "AND attempt_id IS NOT NULL AND previous_version IS NOT NULL AND previous_version = 0 "
+            "AND previous_status IS NOT NULL AND previous_status = 'queued')",
+            name="ck_job_workflow_events_claim_state",
         ),
     )
     job_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
@@ -99,3 +130,6 @@ class JobWorkflowEventRecord(Base):
     status: Mapped[str] = mapped_column(String(32))
     event_type: Mapped[str] = mapped_column(String(32))
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    attempt_id: Mapped[UUID | None] = mapped_column(Uuid)
+    previous_version: Mapped[int | None] = mapped_column(BigInteger)
+    previous_status: Mapped[str | None] = mapped_column(String(32))

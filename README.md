@@ -25,7 +25,8 @@ Optional configured worker authentication verifies a separate expiring token
 and returns only the authenticated worker's identity and repository scope.
 The domain models assignment acknowledgement, lease renewal/revocation and expiry.
 Expired or revoked assignments retain their reservation until a trusted stop is
-confirmed; these in-memory rules do not implement database claims or concurrency.
+confirmed. Durable initial claims now serialize assignment through one coding slot;
+lease expiry retains that slot and the unresolved Job guard.
 The Windows recovery adapter protects pending claim proofs with user-scoped DPAPI
 and commits them to a private local SQLite journal before returning a request.
 It restores the original request after restart and excludes a second worker process.
@@ -37,8 +38,18 @@ recheck Jira requirements, current repository policy, numeric repository identit
 pinned target revision and conflicting pull requests before assignment. Provider
 reads run after the database session is released; the observation expires after
 30 seconds. This is an eligibility observation, not a reservation or permission
-to execute. Atomic claims/receipts, acknowledgement and worker polling remain
-pending. Migration 0005 adds only a query-driven queue index and changes no state.
+to execute. An explicit control use case commits the Attempt, claimed workflow,
+history event, slot and immutable request receipt in one PostgreSQL transaction.
+Exact replay recovers the original assignment or no-work result, skips provider
+reads and never renews a lease. Current scope/credential expiry and observation
+freshness are checked with database time after locks. New polls have a durable
+30-second boundary and finite receipt/enrollment limits; quota exhaustion blocks
+new requests while preserving recovery. Proofs remain worker-owned; the control
+stores scoped verification digests rather than recoverable secrets.
+Migration 0006 supports only initial claims and refuses downgrade after claim
+history exists. Apply migrations explicitly with old writers stopped. The claim
+API, worker transport/journal completion phases, acknowledgement, heartbeat and
+execution remain pending; no polling or agent runtime is enabled.
 
 ## Planned workflow
 

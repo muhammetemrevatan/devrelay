@@ -9,10 +9,12 @@ from sqlalchemy.engine import Connection
 
 from devrelay.bootstrap.persistence import open_database_engine
 from devrelay.config.control import ControlSettings
+from devrelay.infrastructure.persistence.claim_models import ClaimReceiptRecord
 from devrelay.infrastructure.persistence.job_models import JobRecord
 from devrelay.infrastructure.persistence.workflow_models import JobWorkflowRecord
 
 assert JobWorkflowRecord.metadata is JobRecord.metadata
+assert ClaimReceiptRecord.metadata is JobRecord.metadata
 
 
 def migrate(connection: Connection) -> None:

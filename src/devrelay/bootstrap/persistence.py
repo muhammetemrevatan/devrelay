@@ -4,7 +4,10 @@ from contextlib import asynccontextmanager
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from devrelay.application.contracts.assignments import ClaimLimits
+from devrelay.application.contracts.submissions import RepositoryPolicy
 from devrelay.application.ports.claim_eligibility import QueuedJobReader
+from devrelay.application.ports.claim_persistence import ClaimStore
 from devrelay.application.ports.job_persistence import (
     JobBranchReader,
     JobSubmissionReader,
@@ -15,6 +18,7 @@ from devrelay.application.ports.task_persistence import (
     TaskUnitOfWork,
 )
 from devrelay.config.database import DatabaseSettings
+from devrelay.infrastructure.persistence.claim_store import SqlAlchemyClaimStore
 from devrelay.infrastructure.persistence.job_repository import (
     SqlAlchemyJobBranchReader,
     SqlAlchemyJobSubmissionReader,
@@ -88,6 +92,18 @@ def job_submission_reader(engine: AsyncEngine) -> JobSubmissionReader:
 def queued_job_reader(engine: AsyncEngine) -> QueuedJobReader:
     return SqlAlchemyQueuedJobReader(
         async_sessionmaker(engine, expire_on_commit=False, autoflush=False)
+    )
+
+
+def claim_store(
+    engine: AsyncEngine,
+    policies: tuple[RepositoryPolicy, ...],
+    limits: ClaimLimits | None = None,
+) -> ClaimStore:
+    return SqlAlchemyClaimStore(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False),
+        policies,
+        limits,
     )
 
 
