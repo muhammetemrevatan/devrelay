@@ -4,7 +4,6 @@ import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from secrets import compare_digest
-from typing import Literal
 from uuid import UUID
 
 from devrelay.application.contracts.claims import (
@@ -33,8 +32,8 @@ class WorkerAcknowledgementIntent:
     base_revision: str
     definition_digest: str
     expected_workflow_version: int = 1
-    definition_digest_version: Literal[1] = 1
-    protocol_version: Literal[1] = 1
+    definition_digest_version: int = 1
+    protocol_version: int = 1
 
     def __post_init__(self) -> None:
         for identity in (

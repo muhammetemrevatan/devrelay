@@ -12,6 +12,10 @@ from devrelay.api.dependencies import (
 )
 from devrelay.api.errors import InvalidWorkerClaimRequest, error_responses
 from devrelay.api.request_body import json_body_schema, read_json_request
+from devrelay.api.schemas.acknowledgements import (
+    WorkerAcknowledgementPayload,
+    WorkerAcknowledgementResponse,
+)
 from devrelay.api.schemas.claims import (
     AssignmentDeliveryResponse,
     WorkerClaimPayload,
@@ -82,3 +86,34 @@ async def read_assignment(
             attempt_id, claim_request, authorization
         )
         return await asyncio.to_thread(AssignmentDeliveryResponse.render, delivery)
+
+
+@router.post(
+    "/attempts/{attempt_id}/acknowledgements",
+    response_model=WorkerAcknowledgementResponse,
+    responses=error_responses(
+        HTTPStatus.UNAUTHORIZED, HTTPStatus.INTERNAL_SERVER_ERROR
+    ),
+    openapi_extra=json_body_schema(WorkerAcknowledgementPayload),
+)
+async def acknowledge_assignment(
+    attempt_id: UUID,
+    request: Request,
+    response: Response,
+    authorization: Annotated[WorkerAuthorization, Depends(require_worker_access)],
+    services: Annotated[WorkerClaimServices, Depends(require_worker_claim_services)],
+) -> WorkerAcknowledgementResponse:
+    with services.admit_request():
+        payload = await read_json_request(
+            request,
+            services.body_timeout_seconds,
+            WorkerAcknowledgementPayload,
+            InvalidWorkerClaimRequest,
+        )
+        if services.acknowledge is None:
+            raise AssignmentUnavailable("Assignment acknowledger is unavailable.")
+        result = await services.acknowledge(
+            payload.to_request(attempt_id), authorization
+        )
+    response.headers["Cache-Control"] = "no-store"
+    return WorkerAcknowledgementResponse(result=result)

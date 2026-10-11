@@ -5,11 +5,16 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementResult,
+    WorkerAcknowledgementIntent,
+    WorkerAcknowledgementRequest,
+)
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.assignments import NoWorkReason
 from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.application.contracts.worker_recovery import (
+    AcknowledgementCompletion,
     ClaimExchange,
     WorkerClaimOutcome,
     WorkerRecoveryPhase,
@@ -32,6 +37,11 @@ NOW = datetime(2026, 10, 11, tzinfo=UTC)
 
 
 class Journal:
+    async def record_acknowledgement(
+        self, request: WorkerClaimRequest, completion: AcknowledgementCompletion
+    ) -> WorkerRecoveryState:
+        raise WorkerStateUnavailable("This fake has no assigned journal.")
+
     def __init__(self, calls: list[str]) -> None:
         self.calls = calls
         self.pending: WorkerClaimRequest | None = None
@@ -74,6 +84,11 @@ class Journal:
 
 
 class Gateway:
+    async def acknowledge(
+        self, request: WorkerAcknowledgementRequest, authorization: WorkerAuthorization
+    ) -> AcknowledgementResult:
+        raise AssertionError("This fixture only tests claim exchange.")
+
     def __init__(self, authorization: WorkerAuthorization, calls: list[str]) -> None:
         self.authorization = authorization
         self.calls = calls

@@ -1,7 +1,11 @@
 import asyncio
 from uuid import uuid4
 
-from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementResult,
+    WorkerAcknowledgementIntent,
+    WorkerAcknowledgementRequest,
+)
 from devrelay.application.contracts.assignment_delivery import (
     AssignmentDelivery,
     AssignmentUnavailable,
@@ -12,13 +16,17 @@ from devrelay.application.contracts.claims import (
     WorkerClaimRequest,
 )
 from devrelay.application.contracts.worker_recovery import (
+    AcknowledgementCompletion,
     ClaimExchange,
     WorkerClaimOutcome,
     WorkerRecoveryPhase,
     WorkerRecoveryState,
 )
 from devrelay.application.contracts.workers import WorkerAuthorization
-from devrelay.application.ports.control_gateway import ControlGateway
+from devrelay.application.ports.control_gateway import (
+    ControlGateway,
+    InvalidControlResponse,
+)
 from devrelay.application.ports.worker_journal import (
     WorkerClaimJournal,
     WorkerStateBusy,
@@ -42,6 +50,11 @@ class PrepareWorkerClaim:
 
     async def recover(self) -> WorkerRecoveryState:
         return await self._journal.load_state()
+
+    async def record_acknowledgement(
+        self, request: WorkerClaimRequest, completion: AcknowledgementCompletion
+    ) -> WorkerRecoveryState:
+        return await self._journal.record_acknowledgement(request, completion)
 
     async def record_outcome(
         self, request: WorkerClaimRequest, outcome: WorkerClaimOutcome
@@ -118,6 +131,7 @@ class RequestWorkerClaim:
             not in (
                 WorkerRecoveryPhase.ASSIGNED,
                 WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING,
+                WorkerRecoveryPhase.ACKNOWLEDGED,
             )
             or state.request is None
             or state.assignment is None
@@ -156,3 +170,38 @@ class RequestWorkerClaim:
                 return state.acknowledgement
             delivery = await self._fetch_assignment(state)
             return await self._preparation.prepare_acknowledgement(delivery)
+
+    async def acknowledge(self) -> AcknowledgementResult:
+        """Explicit exchange; commit historical evidence before returning."""
+        if self._lock.locked():
+            raise WorkerStateBusy("A worker claim exchange is already active.")
+        async with self._lock:
+            state = await self._preparation.recover()
+            if state.acknowledgement is None:
+                delivery = await self._fetch_assignment(state)
+                await self._preparation.prepare_acknowledgement(delivery)
+                state = await self._preparation.recover()
+            if (
+                state.request is None
+                or state.assignment is None
+                or state.acknowledgement is None
+            ):
+                raise AssignmentUnavailable(
+                    "Durable acknowledgement input is required."
+                )
+            result = await self._gateway.acknowledge(
+                WorkerAcknowledgementRequest(
+                    intent=state.acknowledgement, claim=state.request
+                ),
+                self._authorization,
+            )
+            try:
+                completion = AcknowledgementCompletion.from_result(
+                    result, state.assignment, state.acknowledgement
+                )
+            except ValueError:
+                raise InvalidControlResponse(
+                    "Control acknowledgement changed original anchors."
+                ) from None
+            await self._preparation.record_acknowledgement(state.request, completion)
+            return result

@@ -3,6 +3,7 @@ from typing import Protocol
 from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
 from devrelay.application.contracts.claims import LeaseProof, WorkerClaimRequest
 from devrelay.application.contracts.worker_recovery import (
+    AcknowledgementCompletion,
     WorkerClaimOutcome,
     WorkerRecoveryState,
 )
@@ -23,6 +24,10 @@ class ProofProtector(Protocol):
 
 
 class WorkerClaimJournal(Protocol):
+    async def record_acknowledgement(
+        self, request: WorkerClaimRequest, completion: AcknowledgementCompletion
+    ) -> WorkerRecoveryState: ...
+
     async def load_state(self) -> WorkerRecoveryState: ...
 
     async def get_or_create_acknowledgement(

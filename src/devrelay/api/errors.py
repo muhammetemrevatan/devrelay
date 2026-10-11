@@ -7,6 +7,7 @@ from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, ConfigDict
 from starlette.responses import JSONResponse
 
+from devrelay.application.contracts.acknowledgements import AcknowledgementRejected
 from devrelay.application.contracts.assignment_delivery import (
     AssignmentUnavailable,
     InvalidAssignmentDefinition,
@@ -85,6 +86,7 @@ class ApiErrorCode(StrEnum):
     CLAIM_SCOPE_REJECTED = "claim_scope_rejected"
     CLAIM_CONFLICT = "claim_conflict"
     ASSIGNMENT_UNAVAILABLE = "assignment_unavailable"
+    ACKNOWLEDGEMENT_REJECTED = "acknowledgement_rejected"
 
 
 class ApiErrorDetail(BaseModel):
@@ -129,6 +131,11 @@ class InvalidWorkerClaimRequest(Exception):
 
 
 _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
+    AcknowledgementRejected: (
+        409,
+        ApiErrorCode.ACKNOWLEDGEMENT_REJECTED,
+        "Assignment acknowledgement was rejected.",
+    ),
     RequestValidationError: (
         422,
         ApiErrorCode.INVALID_REQUEST,

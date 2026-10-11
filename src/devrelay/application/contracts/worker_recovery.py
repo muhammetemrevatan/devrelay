@@ -4,7 +4,10 @@ from enum import StrEnum
 from typing import Literal
 from uuid import UUID
 
-from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
+from devrelay.application.contracts.acknowledgements import (
+    AcknowledgementResult,
+    WorkerAcknowledgementIntent,
+)
 from devrelay.application.contracts.assignments import ClaimResult, NoWorkReason
 from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.domain.jobs.values import _utc, _uuid
@@ -114,6 +117,49 @@ class WorkerRecoveryPhase(StrEnum):
     PENDING = "pending"
     ASSIGNED = "assigned"
     ACKNOWLEDGEMENT_PENDING = "acknowledgement_pending"
+    ACKNOWLEDGED = "acknowledged"
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AcknowledgementCompletion:
+    """Historical completion only; current authority is never persisted."""
+
+    intent: WorkerAcknowledgementIntent
+    acknowledged_at: datetime
+    workflow_version: int = 2
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "acknowledged_at", _utc(self.acknowledged_at))
+        if (
+            not isinstance(self.intent, WorkerAcknowledgementIntent)
+            or type(self.workflow_version) is not int
+            or self.workflow_version != 2
+        ):
+            raise ValueError("Completion requires typed acknowledgement evidence.")
+
+    @classmethod
+    def from_result(
+        cls,
+        result: AcknowledgementResult,
+        outcome: WorkerClaimOutcome,
+        intent: WorkerAcknowledgementIntent,
+    ) -> AcknowledgementCompletion:
+        reference = outcome.assignment
+        if (
+            reference is None
+            or result.intent != intent
+            or result.worker_id != outcome.worker_id
+            or result.job_id != reference.job_id
+            or result.repository_id != reference.repository_id
+            or result.expires_at != reference.expires_at
+            or not reference.issued_at <= result.acknowledged_at < reference.expires_at
+        ):
+            raise ValueError("Completion changed original assignment anchors.")
+        return cls(
+            intent=intent,
+            acknowledged_at=result.acknowledged_at,
+            workflow_version=result.workflow_version,
+        )
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -123,6 +169,7 @@ class WorkerRecoveryState:
     assignment: WorkerClaimOutcome | None = None
     last_no_work: WorkerClaimOutcome | None = None
     acknowledgement: WorkerAcknowledgementIntent | None = None
+    completion: AcknowledgementCompletion | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, WorkerRecoveryPhase):
@@ -142,6 +189,7 @@ class WorkerRecoveryState:
         if self.phase in (
             WorkerRecoveryPhase.ASSIGNED,
             WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING,
+            WorkerRecoveryPhase.ACKNOWLEDGED,
         ):
             if (
                 not isinstance(self.assignment, WorkerClaimOutcome)
@@ -150,7 +198,10 @@ class WorkerRecoveryState:
                 or self.assignment.claim_request_id != self.request.claim_request_id
             ):
                 raise ValueError("Assigned recovery requires matching stable anchors.")
-        if self.phase is WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING:
+        if self.phase in (
+            WorkerRecoveryPhase.ACKNOWLEDGEMENT_PENDING,
+            WorkerRecoveryPhase.ACKNOWLEDGED,
+        ):
             reference = self.assignment.assignment if self.assignment else None
             if (
                 not isinstance(self.acknowledgement, WorkerAcknowledgementIntent)
@@ -164,3 +215,16 @@ class WorkerRecoveryState:
                 raise ValueError("Pending acknowledgement requires original anchors.")
         elif self.acknowledgement is not None:
             raise ValueError("Acknowledgement input requires its durable phase.")
+        if self.phase is WorkerRecoveryPhase.ACKNOWLEDGED:
+            reference = self.assignment.assignment if self.assignment else None
+            if (
+                not isinstance(self.completion, AcknowledgementCompletion)
+                or self.completion.intent != self.acknowledgement
+                or reference is None
+                or not reference.issued_at
+                <= self.completion.acknowledged_at
+                < reference.expires_at
+            ):
+                raise ValueError("Completed acknowledgement requires original anchors.")
+        elif self.completion is not None:
+            raise ValueError("Completion requires its durable phase.")
