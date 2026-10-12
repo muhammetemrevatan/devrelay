@@ -24,6 +24,12 @@ from devrelay.infrastructure.worker_state.completions import (
     create_completion_schema,
     read_completion,
 )
+from devrelay.infrastructure.worker_state.heartbeats import (
+    bind_heartbeats,
+    create_heartbeat_schema,
+    heartbeat_integrity,
+    read_heartbeats,
+)
 
 _FAILURE = "Worker recovery journal is unavailable."
 
@@ -39,7 +45,7 @@ def _create_metadata(
     connection.execute("""
       CREATE TABLE metadata (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
-        version INTEGER NOT NULL CHECK (version = 4),
+        version INTEGER NOT NULL CHECK (version = 5),
         scope BLOB NOT NULL CHECK (length(scope) = 32),
         prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
         phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned', 'acknowledgement_pending', 'acknowledged')),
@@ -48,12 +54,16 @@ def _create_metadata(
       )
     """)
     connection.execute(
-        "INSERT INTO metadata VALUES (1, 4, ?, ?, ?, ?)",
+        "INSERT INTO metadata VALUES (1, 5, ?, ?, ?, ?)",
         (scope, prepared, phase, completed),
     )
 
 
-def upgrade_outcome_schema(connection: sqlite3.Connection, scope: bytes) -> None:
+def upgrade_outcome_schema(
+    connection: sqlite3.Connection,
+    scope: WorkerJournalScope,
+    state: WorkerRecoveryState,
+) -> None:
     version = connection.execute(
         "SELECT version FROM metadata WHERE slot = 1"
     ).fetchone()
@@ -63,10 +73,20 @@ def upgrade_outcome_schema(connection: sqlite3.Connection, scope: bytes) -> None
     if row is None:
         raise WorkerStateUnavailable(_FAILURE)
     connection.execute("DROP TABLE metadata")
-    _create_metadata(connection, scope, prepared=row[0], phase=row[1], completed=row[2])
+    _create_metadata(
+        connection, scope.key, prepared=row[0], phase=row[1], completed=row[2]
+    )
     if version == (2,):
         create_acknowledgement_schema(connection)
-    create_completion_schema(connection)
+    if version != (4,):
+        create_completion_schema(connection)
+    create_heartbeat_schema(connection)
+    if state.completion is not None:
+        if state.request is None or state.assignment is None:
+            raise WorkerStateUnavailable(_FAILURE)
+        bind_heartbeats(
+            connection, scope, state.request, state.assignment, state.completion
+        )
 
 
 def create_outcome_schema(
@@ -81,6 +101,7 @@ def create_outcome_schema(
     )
     create_acknowledgement_schema(connection)
     create_completion_schema(connection)
+    create_heartbeat_schema(connection)
     connection.execute("""
       CREATE TABLE assignment (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -140,7 +161,7 @@ def recovery_state(
     ).fetchone()
     if (
         header is None
-        or header[0] not in ((2, 3, 4) if allow_legacy else (4,))
+        or header[0] not in ((2, 3, 4, 5) if allow_legacy else (5,))
         or header[1] != scope.key
     ):
         raise WorkerStateUnavailable(_FAILURE)
@@ -180,6 +201,9 @@ def recovery_state(
     outcome = None
     acknowledgement = None
     completion = None
+    pending_heartbeat, last_heartbeat = (
+        read_heartbeats(connection) if header[0] >= 5 else (None, None)
+    )
     if assigned is not None:
         (
             request_id,
@@ -215,11 +239,15 @@ def recovery_state(
         )
         completion = (
             read_completion(connection, scope, request, outcome, acknowledgement)
-            if header[0] == 4
+            if header[0] >= 4
             else None
         )
         expected_integrity = (
-            completion_integrity(scope, request, outcome, completion)
+            heartbeat_integrity(
+                scope, request, outcome, completion, pending_heartbeat, last_heartbeat
+            )
+            if completion is not None and header[0] >= 5
+            else completion_integrity(scope, request, outcome, completion)
             if completion is not None
             else assignment_integrity(scope, request, outcome)
             if acknowledgement is None
@@ -235,7 +263,7 @@ def recovery_state(
             raise WorkerStateUnavailable(_FAILURE)
     elif header[0] >= 3:
         acknowledgement = read_acknowledgement(connection, scope, request, outcome)
-        if header[0] == 4:
+        if header[0] >= 4:
             completion = read_completion(
                 connection, scope, request, outcome, acknowledgement
             )
@@ -246,6 +274,8 @@ def recovery_state(
         last_no_work=previous,
         acknowledgement=acknowledgement,
         completion=completion,
+        pending_heartbeat=pending_heartbeat,
+        last_heartbeat=last_heartbeat,
     )
 
 

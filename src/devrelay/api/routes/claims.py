@@ -21,6 +21,10 @@ from devrelay.api.schemas.claims import (
     WorkerClaimPayload,
     WorkerClaimResponse,
 )
+from devrelay.api.schemas.heartbeats import (
+    WorkerHeartbeatPayload,
+    WorkerHeartbeatResponse,
+)
 from devrelay.application.contracts.assignment_delivery import AssignmentUnavailable
 from devrelay.application.contracts.workers import WorkerAuthorization
 
@@ -117,3 +121,32 @@ async def acknowledge_assignment(
         )
     response.headers["Cache-Control"] = "no-store"
     return WorkerAcknowledgementResponse(result=result)
+
+
+@router.post(
+    "/attempts/{attempt_id}/heartbeats",
+    response_model=WorkerHeartbeatResponse,
+    responses=error_responses(
+        HTTPStatus.UNAUTHORIZED, HTTPStatus.INTERNAL_SERVER_ERROR
+    ),
+    openapi_extra=json_body_schema(WorkerHeartbeatPayload),
+)
+async def heartbeat_assignment(
+    attempt_id: UUID,
+    request: Request,
+    response: Response,
+    authorization: Annotated[WorkerAuthorization, Depends(require_worker_access)],
+    services: Annotated[WorkerClaimServices, Depends(require_worker_claim_services)],
+) -> WorkerHeartbeatResponse:
+    with services.admit_request():
+        payload = await read_json_request(
+            request,
+            services.body_timeout_seconds,
+            WorkerHeartbeatPayload,
+            InvalidWorkerClaimRequest,
+        )
+        if services.heartbeat is None:
+            raise AssignmentUnavailable("Assignment heartbeater is unavailable.")
+        result = await services.heartbeat(payload.to_request(attempt_id), authorization)
+    response.headers["Cache-Control"] = "no-store"
+    return WorkerHeartbeatResponse(result=result)

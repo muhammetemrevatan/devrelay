@@ -1,4 +1,6 @@
 import asyncio
+from collections.abc import Callable
+from time import monotonic
 from uuid import uuid4
 
 from devrelay.application.contracts.acknowledgements import (
@@ -15,29 +17,44 @@ from devrelay.application.contracts.claims import (
     LeaseProof,
     WorkerClaimRequest,
 )
+from devrelay.application.contracts.heartbeats import (
+    HeartbeatRequest,
+    WorkerHeartbeatExchange,
+)
 from devrelay.application.contracts.worker_recovery import (
     AcknowledgementCompletion,
     ClaimExchange,
     WorkerClaimOutcome,
+    WorkerHeartbeatIntent,
     WorkerRecoveryPhase,
     WorkerRecoveryState,
 )
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.ports.control_gateway import (
+    ControlClaimRejected,
     ControlGateway,
+    ControlHeartbeatGateway,
     InvalidControlResponse,
 )
 from devrelay.application.ports.worker_journal import (
     WorkerClaimJournal,
+    WorkerHeartbeatJournal,
     WorkerStateBusy,
+    WorkerStateUnavailable,
 )
 
 
 class PrepareWorkerClaim:
     """Prepare recoverable local input; no HTTP request or assignment is made."""
 
-    def __init__(self, journal: WorkerClaimJournal) -> None:
+    def __init__(
+        self,
+        journal: WorkerClaimJournal,
+        *,
+        heartbeat_journal: WorkerHeartbeatJournal | None = None,
+    ) -> None:
         self._journal = journal
+        self._heartbeat_journal = heartbeat_journal
 
     async def prepare(self) -> WorkerClaimRequest:
         pending = await self._journal.load_pending()
@@ -50,6 +67,20 @@ class PrepareWorkerClaim:
 
     async def recover(self) -> WorkerRecoveryState:
         return await self._journal.load_state()
+
+    async def prepare_heartbeat(
+        self, request: WorkerClaimRequest, intent: WorkerHeartbeatIntent
+    ) -> WorkerHeartbeatIntent:
+        if self._heartbeat_journal is None:
+            raise WorkerStateUnavailable("Heartbeat recovery is not configured.")
+        return await self._heartbeat_journal.get_or_create_heartbeat(request, intent)
+
+    async def record_heartbeat(
+        self, request: WorkerClaimRequest, intent: WorkerHeartbeatIntent
+    ) -> WorkerRecoveryState:
+        if self._heartbeat_journal is None:
+            raise WorkerStateUnavailable("Heartbeat recovery is not configured.")
+        return await self._heartbeat_journal.record_heartbeat(request, intent)
 
     async def record_acknowledgement(
         self, request: WorkerClaimRequest, completion: AcknowledgementCompletion
@@ -100,11 +131,96 @@ class RequestWorkerClaim:
         preparation: PrepareWorkerClaim,
         gateway: ControlGateway,
         authorization: WorkerAuthorization,
+        *,
+        heartbeat_gateway: ControlHeartbeatGateway | None = None,
+        monotonic_clock: Callable[[], float] = monotonic,
     ) -> None:
         self._preparation = preparation
         self._gateway = gateway
         self._authorization = authorization
         self._lock = asyncio.Lock()
+        self._heartbeat_gateway = heartbeat_gateway
+        self._monotonic = monotonic_clock
+        self._heartbeat_observation: WorkerHeartbeatExchange | None = None
+
+    async def heartbeat(self, *, renew: bool = True) -> WorkerHeartbeatExchange:
+        """One durable exchange; restarts replay input to discover fresh authority."""
+        if type(renew) is not bool:
+            raise ValueError("Heartbeat renewal intent must be a boolean.")
+        if self._lock.locked():
+            raise WorkerStateBusy("A worker claim exchange is already active.")
+        if self._heartbeat_gateway is None:
+            raise WorkerStateUnavailable("Heartbeat transport is not configured.")
+        async with self._lock:
+            state = await self._preparation.recover()
+            reference = state.assignment.assignment if state.assignment else None
+            if (
+                state.phase is not WorkerRecoveryPhase.ACKNOWLEDGED
+                or state.request is None
+                or reference is None
+                or state.completion is None
+            ):
+                raise AssignmentUnavailable(
+                    "Heartbeat requires durable acknowledgement."
+                )
+            intent = state.pending_heartbeat
+            if intent is None:
+                cached = self._heartbeat_observation
+                if state.last_heartbeat is not None and (
+                    not renew or cached is None or cached.intent != state.last_heartbeat
+                ):
+                    intent = state.last_heartbeat
+                else:
+                    if not renew:
+                        raise AssignmentUnavailable(
+                            "Heartbeat observation requires a recorded input."
+                        )
+                    observation = cached.result if cached else None
+                    if observation is not None and observation.stop_required:
+                        raise ControlClaimRejected(
+                            "Stopped heartbeat authority cannot renew."
+                        )
+                    intent = await self._preparation.prepare_heartbeat(
+                        state.request,
+                        WorkerHeartbeatIntent(
+                            heartbeat_request_id=uuid4(),
+                            claim_request_id=state.request.claim_request_id,
+                            attempt_id=reference.attempt_id,
+                            generation=reference.generation,
+                            expected_lease_revision=observation.authority.lease_revision
+                            if observation
+                            else 1,
+                        ),
+                    )
+            request = HeartbeatRequest(
+                claim=state.request,
+                heartbeat_request_id=intent.heartbeat_request_id,
+                attempt_id=intent.attempt_id,
+                generation=intent.generation,
+                expected_lease_revision=intent.expected_lease_revision,
+                protocol_version=intent.protocol_version,
+            )
+            started_at = self._monotonic()
+            result = await self._heartbeat_gateway.heartbeat(
+                request, self._authorization, reference=reference
+            )
+            try:
+                result.require_correlation(request, self._authorization)
+                if result.authority.reference != reference:
+                    raise ValueError("Heartbeat changed original assignment anchors.")
+            except ValueError:
+                raise InvalidControlResponse(
+                    "Control heartbeat failed correlation."
+                ) from None
+            await self._preparation.record_heartbeat(state.request, intent)
+            exchange = WorkerHeartbeatExchange(
+                intent=intent,
+                result=result,
+                request_started_at=started_at,
+                received_at=self._monotonic(),
+            )
+            self._heartbeat_observation = exchange
+            return exchange
 
     async def execute(self) -> ClaimExchange:
         if self._lock.locked():

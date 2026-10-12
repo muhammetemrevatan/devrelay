@@ -26,6 +26,10 @@ from devrelay.application.contracts.eligibility import (
     ClaimEligibilityRejected,
     WorkerAuthorityExpired,
 )
+from devrelay.application.contracts.heartbeats import (
+    HeartbeatAdmissionRejected,
+    HeartbeatRejected,
+)
 from devrelay.application.jobs import (
     JobSubmissionConflict,
     JobSubmissionRejected,
@@ -87,6 +91,8 @@ class ApiErrorCode(StrEnum):
     CLAIM_CONFLICT = "claim_conflict"
     ASSIGNMENT_UNAVAILABLE = "assignment_unavailable"
     ACKNOWLEDGEMENT_REJECTED = "acknowledgement_rejected"
+    HEARTBEAT_REJECTED = "heartbeat_rejected"
+    HEARTBEAT_ADMISSION_REJECTED = "heartbeat_admission_rejected"
 
 
 class ApiErrorDetail(BaseModel):
@@ -131,6 +137,16 @@ class InvalidWorkerClaimRequest(Exception):
 
 
 _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
+    HeartbeatRejected: (
+        409,
+        ApiErrorCode.HEARTBEAT_REJECTED,
+        "Assignment heartbeat was rejected.",
+    ),
+    HeartbeatAdmissionRejected: (
+        429,
+        ApiErrorCode.HEARTBEAT_ADMISSION_REJECTED,
+        "New heartbeat admission is restricted.",
+    ),
     AcknowledgementRejected: (
         409,
         ApiErrorCode.ACKNOWLEDGEMENT_REJECTED,

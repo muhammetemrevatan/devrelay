@@ -7,7 +7,11 @@ from devrelay.application.contracts.acknowledgements import (
 )
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.claims import WorkerClaimRequest
-from devrelay.application.contracts.worker_recovery import ClaimExchange
+from devrelay.application.contracts.heartbeats import HeartbeatRequest, HeartbeatResult
+from devrelay.application.contracts.worker_recovery import (
+    AssignmentReference,
+    ClaimExchange,
+)
 from devrelay.application.contracts.workers import WorkerAuthorization
 
 
@@ -25,6 +29,18 @@ class InvalidControlResponse(Exception):
 
 class ControlClaimRejected(Exception):
     """Control rejected the claim; operator reconciliation may be needed."""
+
+
+class ControlHeartbeatGateway(Protocol):
+    """Bounded current lease observation for an original pinned assignment."""
+
+    async def heartbeat(
+        self,
+        request: HeartbeatRequest,
+        authorization: WorkerAuthorization,
+        *,
+        reference: AssignmentReference,
+    ) -> HeartbeatResult: ...
 
 
 class ControlGateway(Protocol):

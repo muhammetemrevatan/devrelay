@@ -3,6 +3,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from math import isfinite
 from secrets import compare_digest
 from uuid import UUID
 
@@ -11,7 +12,10 @@ from devrelay.application.contracts.claims import (
     ClaimRequestIdentity,
     WorkerClaimRequest,
 )
-from devrelay.application.contracts.worker_recovery import AssignmentReference
+from devrelay.application.contracts.worker_recovery import (
+    AssignmentReference,
+    WorkerHeartbeatIntent,
+)
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.domain.jobs.values import _utc, _uuid
 
@@ -252,3 +256,36 @@ class HeartbeatResult:
             )
         ):
             raise ValueError("Heartbeat response does not match current request scope.")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerHeartbeatExchange:
+    """Fresh process-local timing evidence; never persist or treat as launch permission."""
+
+    intent: WorkerHeartbeatIntent
+    result: HeartbeatResult
+    request_started_at: float
+    received_at: float
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.intent, WorkerHeartbeatIntent)
+            or not isinstance(self.result, HeartbeatResult)
+            or self.result.heartbeat_request_id != self.intent.heartbeat_request_id
+            or self.result.authority.reference.attempt_id != self.intent.attempt_id
+            or self.result.authority.reference.generation != self.intent.generation
+        ):
+            raise ValueError("Heartbeat exchange requires correlated typed evidence.")
+        for name in ("request_started_at", "received_at"):
+            value = getattr(self, name)
+            if (
+                type(value) not in (int, float)
+                or not 0 <= value <= 2**53 - 1
+                or not isfinite(value)
+            ):
+                raise ValueError(
+                    "Heartbeat exchange requires bounded monotonic readings."
+                )
+            object.__setattr__(self, name, float(value))
+        if self.received_at < self.request_started_at:
+            raise ValueError("Heartbeat receipt cannot precede request start.")

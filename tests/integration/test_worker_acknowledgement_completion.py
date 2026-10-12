@@ -195,6 +195,7 @@ def test_v3_intent_upgrade_is_atomic_and_preserves_ciphertext_and_pins(
         ).fetchone()
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE acknowledgement_completion")
+        connection.execute("DROP TABLE heartbeat_input")
         connection.execute(
             "CREATE TABLE metadata(slot INTEGER PRIMARY KEY, version INTEGER CHECK(version=3), scope BLOB, prepared INTEGER, phase TEXT, completed INTEGER)"
         )
@@ -222,7 +223,7 @@ def test_v3_intent_upgrade_is_atomic_and_preserves_ciphertext_and_pins(
             upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         assert connection.execute("SELECT version FROM metadata").fetchone() == (
-            (3,) if damage else (4,)
+            (3,) if damage else (5,)
         )
         assert (
             tuple(
@@ -324,6 +325,7 @@ def test_v3_upgrade_preserves_each_existing_recovery_phase(
         ).fetchone()
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE acknowledgement_completion")
+        connection.execute("DROP TABLE heartbeat_input")
         connection.execute(
             "CREATE TABLE metadata(slot INTEGER PRIMARY KEY, version INTEGER CHECK(version=3), scope BLOB, prepared INTEGER, phase TEXT, completed INTEGER)"
         )

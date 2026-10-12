@@ -15,6 +15,7 @@ from devrelay.application.contracts.acknowledgements import (
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.assignments import ClaimResult
 from devrelay.application.contracts.claims import WorkerClaimRequest
+from devrelay.application.contracts.heartbeats import HeartbeatRequest, HeartbeatResult
 from devrelay.application.contracts.submissions import (
     SavedJobSubmission,
     SubmissionAuthorization,
@@ -45,6 +46,9 @@ type AcknowledgementOperation = Callable[
     [WorkerAcknowledgementRequest, WorkerAuthorization],
     Awaitable[AcknowledgementResult],
 ]
+type HeartbeatOperation = Callable[
+    [HeartbeatRequest, WorkerAuthorization], Awaitable[HeartbeatResult]
+]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -52,6 +56,7 @@ class WorkerClaimOperations:
     claim: ClaimOperation
     read_assignment: AssignmentOperation
     acknowledge: AcknowledgementOperation | None = None
+    heartbeat: HeartbeatOperation | None = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -104,6 +109,7 @@ class WorkerClaimServices(RequestAdmission):
     claim_job: ClaimOperation
     read_assignment: AssignmentOperation | None = None
     acknowledge: AcknowledgementOperation | None = None
+    heartbeat: HeartbeatOperation | None = None
     busy_code: ApiErrorCode = ApiErrorCode.CLAIM_BUSY
     busy_message: str = "Worker claims are busy."
 
