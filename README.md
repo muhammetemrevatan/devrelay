@@ -398,6 +398,21 @@ are never persisted as authority. Repeated calls recover the same control receip
 and original expiry; a lost response, local write failure or cancellation preserves
 exact input for explicit recovery. There are no automatic retries or execution.
 
+## Heartbeat authority foundation
+
+Neutral heartbeat contracts now distinguish immutable claim/assignment anchors
+from current lease expiry and revision. Proof-bound operation fingerprints and
+strict response correlation retain the original worker/Attempt/generation scope.
+The pure worker deadline policy caps the remaining budget by current credential
+expiry, anchors it to monotonic request start and subtracts a stop margin, so
+network delay consumes available time. Stale or out-of-order replies cannot extend
+the deadline; a stopped execution lineage cannot revive through a late response.
+
+Deadline state is process-local and must never be restored as authority from the
+journal. Native suspend handling, actual descendant containment, control renewal
+storage, heartbeat HTTP exchange and scheduling remain separate integration gates.
+This foundation performs no polling, renewal, process launch or stopping.
+
 ## Control acknowledgement persistence
 
 `AcknowledgeAssignedJob` recovers only the authenticated original assignment,
