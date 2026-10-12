@@ -29,12 +29,21 @@ from devrelay.application.contracts.eligibility import (
     PreparedJobClaim,
     WorkerAuthorityExpired,
 )
+from devrelay.application.contracts.heartbeats import (
+    HeartbeatAdmissionRejected,
+    HeartbeatIdentity,
+    HeartbeatLimits,
+    HeartbeatRejected,
+    HeartbeatResult,
+    LeaseAuthorityObservation,
+)
 from devrelay.application.contracts.submissions import (
     PreparedJobSubmission,
     RepositoryPolicy,
     StoredJobSubmission,
     repository_policy_map,
 )
+from devrelay.application.contracts.worker_recovery import AssignmentReference
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.contracts.workflows import JobWorkflowState, WorkflowEventType
 from devrelay.application.ports.job_persistence import JobPersistenceError
@@ -48,6 +57,10 @@ from devrelay.infrastructure.persistence.claim_models import (
     DispatchSlotRecord,
     ExecutionAttemptRecord,
     WorkerCoordinationRecord,
+)
+from devrelay.infrastructure.persistence.heartbeat_models import (
+    AttemptLeaseAuthorityRecord,
+    HeartbeatReceiptRecord,
 )
 from devrelay.infrastructure.persistence.job_models import JobRecord
 from devrelay.infrastructure.persistence.job_repository import read_submission
@@ -70,10 +83,13 @@ class SqlAlchemyClaimStore:
         sessions: async_sessionmaker[AsyncSession],
         policies: tuple[RepositoryPolicy, ...],
         limits: ClaimLimits | None = None,
+        *,
+        heartbeat_limits: HeartbeatLimits | None = None,
     ) -> None:
         self._sessions = sessions
         self._policies = repository_policy_map(policies)
         self._limits = limits or ClaimLimits()
+        self._heartbeat_limits = heartbeat_limits or HeartbeatLimits()
 
     def _authorize(
         self, authorization: WorkerAuthorization, now: datetime
@@ -213,13 +229,18 @@ class SqlAlchemyClaimStore:
             or receipt.no_work_reason is not None
         ):
             raise ClaimPersistenceError("Assignment receipt is inconsistent.")
-        record = (
-            await session.scalars(
-                select(ExecutionAttemptRecord).where(
-                    ExecutionAttemptRecord.id == receipt.attempt_id
+        record, authority = (
+            await session.execute(
+                select(ExecutionAttemptRecord, AttemptLeaseAuthorityRecord)
+                .outerjoin(
+                    AttemptLeaseAuthorityRecord,
+                    AttemptLeaseAuthorityRecord.attempt_id == ExecutionAttemptRecord.id,
                 )
+                .where(ExecutionAttemptRecord.id == receipt.attempt_id)
             )
         ).one()
+        if authority is None:
+            raise ClaimPersistenceError("Current assignment authority is unavailable.")
         if (
             record.worker_id,
             record.job_id,
@@ -260,8 +281,8 @@ class SqlAlchemyClaimStore:
             recovered=True,
             stored=stored,
             attempt=attempt,
-            lease_authority_active=now < attempt.lease.expires_at
-            and attempt.lease.revoked_at is None
+            lease_authority_active=now < authority.current_expires_at
+            and authority.revoked_at is None
             and attempt.reserves_execution,
         )
 
@@ -342,11 +363,16 @@ class SqlAlchemyClaimStore:
                         .with_for_update()
                     )
                 ).one()
-                record = (
-                    await session.scalars(
-                        select(ExecutionAttemptRecord)
+                record, authority = (
+                    await session.execute(
+                        select(ExecutionAttemptRecord, AttemptLeaseAuthorityRecord)
+                        .join(
+                            AttemptLeaseAuthorityRecord,
+                            AttemptLeaseAuthorityRecord.attempt_id
+                            == ExecutionAttemptRecord.id,
+                        )
                         .where(ExecutionAttemptRecord.id == attempt.id)
-                        .with_for_update()
+                        .with_for_update(of=ExecutionAttemptRecord)
                         .execution_options(populate_existing=True)
                     )
                 ).one()
@@ -393,7 +419,8 @@ class SqlAlchemyClaimStore:
                         acknowledged_at=receipt.acknowledged_at,
                         expires_at=record.expires_at,
                         recovered=True,
-                        lease_authority_active=now < record.expires_at,
+                        lease_authority_active=now < authority.current_expires_at
+                        and authority.revoked_at is None,
                     )
                 else:
                     if (
@@ -491,13 +518,262 @@ class SqlAlchemyClaimStore:
                 disclosure_time = await self._clock(session)
                 self._authorize(authorization, disclosure_time)
                 result = replace(
-                    result, lease_authority_active=disclosure_time < result.expires_at
+                    result,
+                    lease_authority_active=disclosure_time
+                    < authority.current_expires_at
+                    and authority.revoked_at is None,
                 )
             return result
         except ClaimReplayConflict:
             raise
         except SQLAlchemyError, ValueError, TypeError, JobPersistenceError:
             raise ClaimPersistenceError("Acknowledgement storage failed.") from None
+
+    async def heartbeat(
+        self, identity: HeartbeatIdentity, authorization: WorkerAuthorization
+    ) -> HeartbeatResult:
+        """Serialize current authority and retained identity without changing anchors."""
+        try:
+            async with self._sessions.begin() as session:
+                await self._timeouts(session)
+                slot = await self._slot(session, lock=True)
+                worker = await self._worker(session, authorization.worker_id, lock=True)
+                self._authorize(authorization, await self._clock(session))
+                if identity.claim.worker_id != authorization.worker_id:
+                    raise ClaimScopeRejected(
+                        "Heartbeat requires the authenticated worker."
+                    )
+                receipt = (
+                    await session.scalars(
+                        select(HeartbeatReceiptRecord).where(
+                            HeartbeatReceiptRecord.worker_id == authorization.worker_id,
+                            HeartbeatReceiptRecord.request_id
+                            == identity.heartbeat_request_id,
+                        )
+                    )
+                ).one_or_none()
+                if receipt is not None:
+                    identity.require_replay(receipt.fingerprint)
+                recovered = await self._replay(
+                    session, identity.claim, authorization, await self._clock(session)
+                )
+                if (
+                    recovered is None
+                    or recovered.attempt is None
+                    or recovered.stored is None
+                ):
+                    raise HeartbeatRejected(
+                        "Heartbeat requires an original assignment."
+                    )
+                stored, attempt = recovered.stored, recovered.attempt
+                if (
+                    worker is None
+                    or identity.attempt_id != attempt.id
+                    or identity.generation != attempt.lease.generation
+                    or slot.reserved_attempt_id != attempt.id
+                ):
+                    raise HeartbeatRejected(
+                        "Heartbeat differs from original ownership."
+                    )
+                await session.execute(
+                    select(SourceTaskRecord.id)
+                    .where(SourceTaskRecord.id == stored.job.source_task_id)
+                    .with_for_update()
+                )
+                workflow = (
+                    await session.scalars(
+                        select(JobWorkflowRecord)
+                        .where(JobWorkflowRecord.job_id == stored.job.id)
+                        .with_for_update()
+                    )
+                ).one()
+                record = (
+                    await session.scalars(
+                        select(ExecutionAttemptRecord)
+                        .where(ExecutionAttemptRecord.id == attempt.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).one()
+                authority = (
+                    await session.scalars(
+                        select(AttemptLeaseAuthorityRecord)
+                        .where(AttemptLeaseAuthorityRecord.attempt_id == attempt.id)
+                        .with_for_update()
+                        .execution_options(populate_existing=True)
+                    )
+                ).one()
+                now = await self._clock(session)
+                scope = self._authorize(authorization, now)
+                if stored.job.repository_id not in scope:
+                    raise ClaimScopeRejected("Heartbeat is outside current scope.")
+                if (
+                    record.status != AttemptStatus.RUNNING.value
+                    or workflow.status != JobStatus.RUNNING.value
+                    or workflow.workflow_version != 2
+                    or workflow.active_attempt_id != attempt.id
+                    or record.acknowledged_at is None
+                ):
+                    raise HeartbeatRejected("Heartbeat requires acknowledged work.")
+                reference = AssignmentReference(
+                    worker_id=record.worker_id,
+                    job_id=record.job_id,
+                    repository_id=stored.job.repository_id,
+                    attempt_id=record.id,
+                    generation=record.generation,
+                    issued_at=record.issued_at,
+                    expires_at=record.expires_at,
+                )
+                renewed = False
+                if receipt is not None:
+                    if (
+                        (
+                            receipt.worker_id,
+                            receipt.attempt_id,
+                            receipt.job_id,
+                            receipt.repository_id,
+                            receipt.claim_request_id,
+                            receipt.generation,
+                        )
+                        != (
+                            authorization.worker_id,
+                            record.id,
+                            record.job_id,
+                            stored.job.repository_id,
+                            identity.claim.claim_request_id,
+                            record.generation,
+                        )
+                        or (receipt.protocol_version, receipt.fingerprint_version)
+                        != (1, 1)
+                        or receipt.expected_lease_revision
+                        != identity.expected_lease_revision
+                        or receipt.lease_revision
+                        != receipt.expected_lease_revision + int(receipt.renewed)
+                        or receipt.attempt_ordinal > authority.receipt_count
+                        or receipt.worker_ordinal > worker.heartbeat_receipt_count
+                        or receipt.global_ordinal > slot.heartbeat_receipt_count
+                    ):
+                        raise ClaimPersistenceError(
+                            "Heartbeat recovery history is inconsistent."
+                        )
+                    LeaseAuthorityObservation(
+                        reference=reference,
+                        lease_revision=receipt.lease_revision,
+                        observed_at=receipt.recorded_at,
+                        updated_at=receipt.updated_at,
+                        current_expires_at=receipt.current_expires_at,
+                    )
+                else:
+                    if (
+                        now >= authority.current_expires_at
+                        or authority.revoked_at is not None
+                        or identity.expected_lease_revision != authority.lease_revision
+                    ):
+                        raise HeartbeatRejected(
+                            "Current heartbeat authority is unavailable."
+                        )
+                    limits = self._heartbeat_limits
+                    if (
+                        now < authority.next_heartbeat_at
+                        or authority.receipt_count >= limits.attempt_receipts
+                        or worker.heartbeat_receipt_count >= limits.worker_receipts
+                        or slot.heartbeat_receipt_count >= limits.global_receipts
+                    ):
+                        raise HeartbeatAdmissionRejected(
+                            "New heartbeat exceeds rate or storage limits."
+                        )
+                    expiry = min(
+                        now + timedelta(seconds=limits.lease_seconds),
+                        authorization.credential_expires_at,
+                    )
+                    renewed = expiry > authority.current_expires_at
+                    revision = authority.lease_revision + int(renewed)
+                    if revision >= 1 << 63:
+                        raise HeartbeatRejected("Lease revision has reached its bound.")
+                    updated = now if renewed else authority.updated_at
+                    expiry = expiry if renewed else authority.current_expires_at
+                    attempt_ordinal = authority.receipt_count + 1
+                    worker_ordinal = worker.heartbeat_receipt_count + 1
+                    global_ordinal = slot.heartbeat_receipt_count + 1
+                    await session.execute(
+                        update(AttemptLeaseAuthorityRecord)
+                        .where(
+                            AttemptLeaseAuthorityRecord.attempt_id == attempt.id,
+                            AttemptLeaseAuthorityRecord.lease_revision
+                            == identity.expected_lease_revision,
+                            AttemptLeaseAuthorityRecord.receipt_count
+                            == authority.receipt_count,
+                        )
+                        .values(
+                            lease_revision=revision,
+                            updated_at=updated,
+                            current_expires_at=expiry,
+                            receipt_count=attempt_ordinal,
+                            next_heartbeat_at=now
+                            + timedelta(seconds=limits.minimum_interval_seconds),
+                        )
+                    )
+                    await session.execute(
+                        update(WorkerCoordinationRecord)
+                        .where(
+                            WorkerCoordinationRecord.worker_id
+                            == authorization.worker_id
+                        )
+                        .values(heartbeat_receipt_count=worker_ordinal)
+                    )
+                    await session.execute(
+                        update(DispatchSlotRecord)
+                        .where(DispatchSlotRecord.name == "coding")
+                        .values(heartbeat_receipt_count=global_ordinal)
+                    )
+                    await session.execute(
+                        insert(HeartbeatReceiptRecord).values(
+                            worker_id=authorization.worker_id,
+                            request_id=identity.heartbeat_request_id,
+                            attempt_id=record.id,
+                            job_id=record.job_id,
+                            repository_id=stored.job.repository_id,
+                            claim_request_id=record.claim_request_id,
+                            generation=record.generation,
+                            protocol_version=1,
+                            fingerprint_version=1,
+                            fingerprint=identity.fingerprint,
+                            expected_lease_revision=identity.expected_lease_revision,
+                            lease_revision=revision,
+                            updated_at=updated,
+                            current_expires_at=expiry,
+                            renewed=renewed,
+                            recorded_at=now,
+                            attempt_ordinal=attempt_ordinal,
+                            worker_ordinal=worker_ordinal,
+                            global_ordinal=global_ordinal,
+                        )
+                    )
+                disclosure = await self._clock(session)
+                self._authorize(authorization, disclosure)
+                observation = LeaseAuthorityObservation(
+                    reference=reference,
+                    lease_revision=authority.lease_revision,
+                    observed_at=disclosure,
+                    updated_at=authority.updated_at,
+                    current_expires_at=authority.current_expires_at,
+                    revoked_at=authority.revoked_at,
+                )
+                stop = (
+                    observation.revoked_at is not None
+                    or disclosure >= observation.current_expires_at
+                )
+                result = HeartbeatResult(
+                    heartbeat_request_id=identity.heartbeat_request_id,
+                    authority=observation,
+                    renewed=renewed and not stop,
+                    stop_required=stop,
+                )
+            return result
+        except ClaimReplayConflict:
+            raise
+        except SQLAlchemyError, ValueError, TypeError, JobPersistenceError:
+            raise ClaimPersistenceError("Heartbeat storage failed.") from None
 
     async def claim(
         self,
@@ -649,6 +925,21 @@ class SqlAlchemyClaimStore:
                     issued_at=now,
                     updated_at=now,
                     expires_at=lease.expires_at,
+                )
+            )
+            await session.execute(
+                insert(AttemptLeaseAuthorityRecord).values(
+                    attempt_id=attempt.id,
+                    job_id=attempt.job_id,
+                    worker_id=lease.worker_id,
+                    claim_request_id=identity.claim_request_id,
+                    generation=lease.generation,
+                    lease_revision=1,
+                    updated_at=now,
+                    current_expires_at=lease.expires_at,
+                    revoked_at=None,
+                    receipt_count=0,
+                    next_heartbeat_at=now,
                 )
             )
             await session.execute(

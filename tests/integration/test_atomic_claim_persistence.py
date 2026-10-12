@@ -155,7 +155,7 @@ def test_atomic_assignment_recovery_and_submission_projection(
             assert (
                 result.attempt.lease.expires_at <= authorization.credential_expires_at
             )
-            assert len(statements) == 17
+            assert len(statements) == 18
             assert await totals(engine) == (1, 1, 1, 1, 1)
             recovered = await store.recover(identity, authorization)
             assert recovered is not None and recovered.attempt == result.attempt

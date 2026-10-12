@@ -10,13 +10,16 @@ from devrelay.application.claim_eligibility import PrepareJobClaim
 from devrelay.application.claims import ClaimJob
 from devrelay.application.contracts.assignments import ClaimLimits
 from devrelay.application.contracts.claims import LeaseProof
+from devrelay.application.contracts.heartbeats import HeartbeatLimits
 from devrelay.application.contracts.submissions import RepositoryPolicy
+from devrelay.application.heartbeats import HeartbeatAssignedJob
 from devrelay.bootstrap.github import open_github_repository_source
 from devrelay.bootstrap.jira import open_jira_task_source
 from devrelay.bootstrap.jobs import repository_policy
 from devrelay.bootstrap.persistence import (
     acknowledgement_store,
     claim_store,
+    heartbeat_store,
     job_branch_reader,
     queued_job_reader,
 )
@@ -92,6 +95,19 @@ def job_acknowledger(
         ReadAssignedJob(claim_store(engine, policies), proof_guard),
         acknowledgement_store(engine, policies),
     )
+
+
+def job_heartbeater(
+    settings: ControlSettings,
+    engine: AsyncEngine,
+    *,
+    limits: HeartbeatLimits | None = None,
+) -> HeartbeatAssignedJob:
+    """Explicit control renewal composition; no HTTP, scheduling or execution."""
+    if settings.worker_claims is None:
+        raise ValueError("Heartbeats require explicitly enabled claims.")
+    policies, proof_guard = _claim_configuration(settings)
+    return HeartbeatAssignedJob(heartbeat_store(engine, policies, limits), proof_guard)
 
 
 @asynccontextmanager
