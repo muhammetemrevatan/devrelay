@@ -62,8 +62,9 @@ Migration 0006 supports only initial claims and refuses downgrade after claim
 history exists. Apply migrations explicitly with old writers stopped.
 Control acknowledgement now validates accepted inputs and atomically advances
 Attempt/workflow/history with an immutable replay receipt. An authenticated HTTP
-exchange records completion in the worker journal before returning. Heartbeat and
-execution remain pending; no polling or agent runtime is enabled.
+exchange records completion in the worker journal before returning. Bounded
+heartbeat exchange and input recovery are implemented; scheduling, containment
+and agent execution remain pending.
 
 ## Planned workflow
 
@@ -364,7 +365,7 @@ After restart, preparation returns the same recorded input without HTTP, a new
 identity or renewed authority. Duplicate claim responses preserve pending intent.
 Later payload reads must still match its accepted definition digest.
 
-Valid version-1/version-2/version-3 journals upgrade to version 4 in one transaction, preserving protected
+Valid version-1 through version-4 journals upgrade to version 5 in one transaction, preserving protected
 proof bytes, original identities, assignment anchors and no-work markers. Damaged
 state or an incomplete upgrade retains the old schema and fails closed. SQLite,
 DPAPI and integrity checks remain on the dedicated journal thread.
@@ -372,8 +373,8 @@ DPAPI and integrity checks remain on the dedicated journal thread.
 This step prepares local input only. The control now implements the atomic
 claimed-to-running transition and acknowledgement receipt described below.
 Its HTTP exchange and worker response completion are described below.
-Heartbeat, containment and runtime
-selection are also required before launching an agent; the CLI remains a
+Heartbeat scheduling, containment and runtime integration
+are also required before launching an agent; the CLI remains a
 configuration validator.
 
 ## Worker acknowledgement exchange
@@ -409,8 +410,8 @@ network delay consumes available time. Stale or out-of-order replies cannot exte
 the deadline; a stopped execution lineage cannot revive through a late response.
 
 Deadline state is process-local and must never be restored as authority from the
-journal. Native suspend handling, actual descendant containment, heartbeat HTTP
-exchange and scheduling remain separate integration gates. The deadline policy
+journal. Native suspend handling, actual descendant containment and heartbeat
+scheduling remain separate integration gates. The deadline policy
 performs no polling, process launch or stopping.
 
 ## Atomic control heartbeat persistence
@@ -427,8 +428,37 @@ preserving accepted recovery. Expiry, cancellation or budget exhaustion retains
 the coding reservation. Current readers validate joined authority/history while
 original recovery values remain unchanged. Migration `0008_heartbeat_authorities`
 requires stopped writers during rollout and refuses to discard accepted heartbeat
-history on downgrade. No heartbeat HTTP route, worker exchange, scheduling or
-agent execution is enabled by this persistence slice.
+history on downgrade. The optional HTTP exchange described below delegates to
+this persistence use case. Scheduling and agent execution remain pending.
+
+## Worker heartbeat exchange
+
+With worker claims enabled, `POST /api/v1/worker/attempts/{attempt_id}/heartbeats`
+accepts the original `claim_request_id` and `proof`, a `heartbeat_request_id`,
+`generation`, `expected_lease_revision` and `protocol_version`. Generation and
+protocol start at 1; the expected revision is a positive bounded integer. The
+Attempt comes from the path. Authentication precedes the shared bounded JSON
+reader and admission boundary. Responses wrap a nonsecret `HeartbeatResult` in
+`result`, with protocol version 1, current authority and a stop indication.
+Rejected input returns 409; new rate or receipt admission exhaustion returns 429.
+Accepted exact retries bypass new admission and never renew twice.
+
+The explicit worker `heartbeat()` call stores input before HTTP and records
+validated completion before returning process-local request/receipt timing.
+SQLite version 5 keeps one pending input and one last completed input, bound to
+the original protected proof and acknowledgement completion. These records contain
+request identities and expected revisions only. Current expiry, returned revision,
+observation clocks, active flags and execution deadlines are never stored as
+authority. Upgrades preserve original proof ciphertext, identity and lease anchors.
+
+Pending input always takes priority. After restart, the first call replays the
+last completed input to discover current authority; a subsequent explicit call
+can create a new input using the observed revision. `heartbeat(renew=False)`
+replays recorded input only and refuses an initial request. Network loss, local
+write failure and cancellation retain exact recovery input. A completion committed
+during cancellation also forces discovery before another renewal. The transport
+verifies the full original assignment reference, current scope and credentials,
+strict bounded responses and verified TLS. There is no automatic retry or polling.
 
 ## Control acknowledgement persistence
 

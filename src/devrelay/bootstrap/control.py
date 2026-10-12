@@ -28,7 +28,11 @@ from devrelay.api.routes.jobs import router as jobs_router
 from devrelay.api.routes.tasks import router as tasks_router
 from devrelay.api.routes.workers import router as workers_router
 from devrelay.application.contracts.submissions import SubmissionAuthorization
-from devrelay.bootstrap.claims import job_acknowledger, open_job_claimer
+from devrelay.bootstrap.claims import (
+    job_acknowledger,
+    job_heartbeater,
+    open_job_claimer,
+)
 from devrelay.bootstrap.jobs import open_github_job_submitter
 from devrelay.bootstrap.persistence import open_database_engine
 from devrelay.bootstrap.security import token_verifier, worker_authenticator
@@ -54,6 +58,7 @@ async def open_control_claim_operation(
             claim=claimer.execute,
             read_assignment=claimer.assignment_reader.execute,
             acknowledge=job_acknowledger(settings, engine).execute,
+            heartbeat=job_heartbeater(settings, engine).execute,
         )
 
 
@@ -186,6 +191,9 @@ def create_app(
                         if isinstance(claim_operation, WorkerClaimOperations)
                         else None,
                         acknowledge=claim_operation.acknowledge
+                        if isinstance(claim_operation, WorkerClaimOperations)
+                        else None,
+                        heartbeat=claim_operation.heartbeat
                         if isinstance(claim_operation, WorkerClaimOperations)
                         else None,
                         max_concurrent_requests=claim_settings.max_concurrent_requests,

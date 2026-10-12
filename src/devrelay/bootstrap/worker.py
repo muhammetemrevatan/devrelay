@@ -43,7 +43,9 @@ async def open_worker_claim_client(
             worker_id=authorization.worker_id,
             state_directory=state_directory,
         ) as preparation:
-            yield RequestWorkerClaim(preparation, gateway, authorization)
+            yield RequestWorkerClaim(
+                preparation, gateway, authorization, heartbeat_gateway=gateway
+            )
 
 
 def validate_worker_configuration(env_file: Path | None = None) -> None:
@@ -109,7 +111,7 @@ async def open_worker_journal(
     try:
         resources = await asyncio.shield(future)
         journal = AsyncClaimJournal(resources[1], executor)
-        yield PrepareWorkerClaim(journal)
+        yield PrepareWorkerClaim(journal, heartbeat_journal=journal)
     finally:
         if journal is not None:
             journal.stop_admission()

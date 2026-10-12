@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from typing import Literal
@@ -9,7 +9,10 @@ from devrelay.application.contracts.acknowledgements import (
     WorkerAcknowledgementIntent,
 )
 from devrelay.application.contracts.assignments import ClaimResult, NoWorkReason
-from devrelay.application.contracts.claims import WorkerClaimRequest
+from devrelay.application.contracts.claims import (
+    ClaimReplayConflict,
+    WorkerClaimRequest,
+)
 from devrelay.domain.jobs.values import _utc, _uuid
 
 
@@ -163,6 +166,41 @@ class AcknowledgementCompletion:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class WorkerHeartbeatIntent:
+    """Durable operation input only; the expected revision is never live authority."""
+
+    heartbeat_request_id: UUID
+    claim_request_id: UUID
+    attempt_id: UUID
+    generation: int
+    expected_lease_revision: int
+    protocol_version: int = 1
+
+    def __post_init__(self) -> None:
+        for identity in (
+            self.heartbeat_request_id,
+            self.claim_request_id,
+            self.attempt_id,
+        ):
+            _uuid(identity)
+        if (
+            type(self.generation) is not int
+            or self.generation != 1
+            or type(self.protocol_version) is not int
+            or self.protocol_version != 1
+            or type(self.expected_lease_revision) is not int
+            or not 1 <= self.expected_lease_revision < 1 << 63
+        ):
+            raise ValueError("Heartbeat intent requires supported bounded input.")
+
+    def require_same_input(self, candidate: WorkerHeartbeatIntent) -> None:
+        if not isinstance(candidate, WorkerHeartbeatIntent) or self != replace(
+            candidate, heartbeat_request_id=self.heartbeat_request_id
+        ):
+            raise ClaimReplayConflict("Heartbeat intent conflicts with original input.")
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class WorkerRecoveryState:
     phase: WorkerRecoveryPhase
     request: WorkerClaimRequest | None = field(default=None, repr=False)
@@ -170,6 +208,8 @@ class WorkerRecoveryState:
     last_no_work: WorkerClaimOutcome | None = None
     acknowledgement: WorkerAcknowledgementIntent | None = None
     completion: AcknowledgementCompletion | None = None
+    pending_heartbeat: WorkerHeartbeatIntent | None = None
+    last_heartbeat: WorkerHeartbeatIntent | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, WorkerRecoveryPhase):
@@ -228,3 +268,31 @@ class WorkerRecoveryState:
                 raise ValueError("Completed acknowledgement requires original anchors.")
         elif self.completion is not None:
             raise ValueError("Completion requires its durable phase.")
+        for heartbeat in (self.pending_heartbeat, self.last_heartbeat):
+            if heartbeat is None:
+                continue
+            reference = self.assignment.assignment if self.assignment else None
+            if (
+                self.phase is not WorkerRecoveryPhase.ACKNOWLEDGED
+                or not isinstance(heartbeat, WorkerHeartbeatIntent)
+                or self.request is None
+                or reference is None
+                or heartbeat.claim_request_id != self.request.claim_request_id
+                or heartbeat.attempt_id != reference.attempt_id
+                or heartbeat.generation != reference.generation
+                or heartbeat.protocol_version != self.request.protocol_version
+            ):
+                raise ValueError(
+                    "Heartbeat input requires acknowledged original anchors."
+                )
+        if (
+            self.pending_heartbeat is not None
+            and self.last_heartbeat is not None
+            and (
+                self.pending_heartbeat.heartbeat_request_id
+                == self.last_heartbeat.heartbeat_request_id
+                or self.pending_heartbeat.expected_lease_revision
+                < self.last_heartbeat.expected_lease_revision
+            )
+        ):
+            raise ValueError("Heartbeat input cannot reuse or regress completed input.")

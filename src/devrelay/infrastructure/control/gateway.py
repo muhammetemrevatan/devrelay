@@ -20,6 +20,11 @@ from devrelay.application.contracts.assignment_delivery import (
 )
 from devrelay.application.contracts.assignments import NoWorkReason
 from devrelay.application.contracts.claims import WorkerClaimRequest
+from devrelay.application.contracts.heartbeats import (
+    MAXIMUM_LEASE_SECONDS,
+    HeartbeatRequest,
+    HeartbeatResult,
+)
 from devrelay.application.contracts.worker_recovery import (
     AssignmentReference,
     ClaimExchange,
@@ -34,6 +39,7 @@ from devrelay.application.ports.control_gateway import (
 )
 from devrelay.infrastructure.control.acknowledgements import AcknowledgementPayload
 from devrelay.infrastructure.control.assignments import DeliveryPayload
+from devrelay.infrastructure.control.heartbeats import HeartbeatPayload
 
 
 class IdentityPayload(BaseModel):
@@ -82,6 +88,52 @@ class HttpControlGateway:
         self._timeout = timeout_seconds
         self._max_bytes = max_response_bytes
         self._now = now
+
+    async def heartbeat(
+        self,
+        request: HeartbeatRequest,
+        authorization: WorkerAuthorization,
+        *,
+        reference: AssignmentReference,
+    ) -> HeartbeatResult:
+        if (
+            not isinstance(request, HeartbeatRequest)
+            or not isinstance(authorization, WorkerAuthorization)
+            or not isinstance(reference, AssignmentReference)
+            or reference.worker_id != authorization.worker_id
+            or reference.repository_id not in authorization.allowed_repository_ids
+            or reference.attempt_id != request.attempt_id
+            or reference.generation != request.generation
+            or reference.expires_at - reference.issued_at
+            > timedelta(seconds=MAXIMUM_LEASE_SECONDS)
+        ):
+            raise ControlClaimRejected("Heartbeat input does not match original scope.")
+        if self._now() >= authorization.credential_expires_at:
+            raise ControlAccessDenied("Control worker authority has expired.")
+        body = await self._exchange(
+            "POST",
+            f"api/v1/worker/attempts/{request.attempt_id}/heartbeats",
+            payload={
+                "protocol_version": request.protocol_version,
+                "claim_request_id": str(request.claim.claim_request_id),
+                "proof": request.claim.proof.reveal(),
+                "heartbeat_request_id": str(request.heartbeat_request_id),
+                "generation": request.generation,
+                "expected_lease_revision": request.expected_lease_revision,
+            },
+        )
+        if self._now() >= authorization.credential_expires_at:
+            raise ControlAccessDenied("Control worker authority has expired.")
+        try:
+            result = HeartbeatPayload.model_validate_json(body).result
+            result.require_correlation(request, authorization)
+            if result.authority.reference != reference:
+                raise ValueError("Heartbeat changed original assignment anchors.")
+            return result
+        except ValidationError, ValueError, TypeError, RecursionError:
+            raise InvalidControlResponse(
+                "Control heartbeat failed validation."
+            ) from None
 
     async def identify(self) -> WorkerAuthorization:
         body = await self._exchange("GET", "api/v1/worker/identity")

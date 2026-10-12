@@ -5,6 +5,7 @@ from devrelay.application.contracts.claims import LeaseProof, WorkerClaimRequest
 from devrelay.application.contracts.worker_recovery import (
     AcknowledgementCompletion,
     WorkerClaimOutcome,
+    WorkerHeartbeatIntent,
     WorkerRecoveryState,
 )
 
@@ -21,6 +22,22 @@ class ProofProtector(Protocol):
     def protect(self, proof: LeaseProof, *, context: bytes) -> bytes: ...
 
     def unprotect(self, ciphertext: bytes, *, context: bytes) -> LeaseProof: ...
+
+
+class WorkerHeartbeatJournal(Protocol):
+    async def load_state(self) -> WorkerRecoveryState: ...
+
+    async def get_or_create_heartbeat(
+        self, request: WorkerClaimRequest, candidate: WorkerHeartbeatIntent
+    ) -> WorkerHeartbeatIntent:
+        """Commit exact pending input before network; never persist live authority."""
+        ...
+
+    async def record_heartbeat(
+        self, request: WorkerClaimRequest, intent: WorkerHeartbeatIntent
+    ) -> WorkerRecoveryState:
+        """Retain validated operation input for fresh server observation on restart."""
+        ...
 
 
 class WorkerClaimJournal(Protocol):
