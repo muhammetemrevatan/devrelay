@@ -409,9 +409,26 @@ network delay consumes available time. Stale or out-of-order replies cannot exte
 the deadline; a stopped execution lineage cannot revive through a late response.
 
 Deadline state is process-local and must never be restored as authority from the
-journal. Native suspend handling, actual descendant containment, control renewal
-storage, heartbeat HTTP exchange and scheduling remain separate integration gates.
-This foundation performs no polling, renewal, process launch or stopping.
+journal. Native suspend handling, actual descendant containment, heartbeat HTTP
+exchange and scheduling remain separate integration gates. The deadline policy
+performs no polling, process launch or stopping.
+
+## Atomic control heartbeat persistence
+
+`HeartbeatAssignedJob` renews only an authenticated, proof-bound, acknowledged
+assignment through atomic PostgreSQL coordination. Current expiry and lease
+revision live separately from original claim/acknowledgement anchors. Concurrent
+requests fence the expected revision; retained request identities reject changed
+input and exact replay reports current authority without renewing again.
+
+Renewal uses fresh database time after locks and caps expiry by current credential
+authority. Durable rate and finite receipt budgets bound new operations while
+preserving accepted recovery. Expiry, cancellation or budget exhaustion retains
+the coding reservation. Current readers validate joined authority/history while
+original recovery values remain unchanged. Migration `0008_heartbeat_authorities`
+requires stopped writers during rollout and refuses to discard accepted heartbeat
+history on downgrade. No heartbeat HTTP route, worker exchange, scheduling or
+agent execution is enabled by this persistence slice.
 
 ## Control acknowledgement persistence
 

@@ -5,10 +5,12 @@ from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from devrelay.application.contracts.assignments import ClaimLimits
+from devrelay.application.contracts.heartbeats import HeartbeatLimits
 from devrelay.application.contracts.submissions import RepositoryPolicy
 from devrelay.application.ports.acknowledgement_persistence import AcknowledgementStore
 from devrelay.application.ports.claim_eligibility import QueuedJobReader
 from devrelay.application.ports.claim_persistence import ClaimStore
+from devrelay.application.ports.heartbeat_persistence import HeartbeatStore
 from devrelay.application.ports.job_persistence import (
     JobBranchReader,
     JobSubmissionReader,
@@ -113,6 +115,18 @@ def acknowledgement_store(
 ) -> AcknowledgementStore:
     return SqlAlchemyClaimStore(
         async_sessionmaker(engine, expire_on_commit=False, autoflush=False), policies
+    )
+
+
+def heartbeat_store(
+    engine: AsyncEngine,
+    policies: tuple[RepositoryPolicy, ...],
+    limits: HeartbeatLimits | None = None,
+) -> HeartbeatStore:
+    return SqlAlchemyClaimStore(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False),
+        policies,
+        heartbeat_limits=limits,
     )
 
 

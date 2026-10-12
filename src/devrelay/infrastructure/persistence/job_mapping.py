@@ -1,3 +1,10 @@
+import re
+from uuid import UUID
+
+from devrelay.application.contracts.heartbeats import (
+    MAXIMUM_LEASE_REVISION,
+    LeaseAuthorityObservation,
+)
 from devrelay.application.contracts.submissions import (
     CheckPolicy,
     PreparedJobSubmission,
@@ -5,6 +12,7 @@ from devrelay.application.contracts.submissions import (
     StoredJobSubmission,
 )
 from devrelay.application.contracts.tasks import StoredTaskSnapshot
+from devrelay.application.contracts.worker_recovery import AssignmentReference
 from devrelay.application.contracts.workflows import JobWorkflowState, WorkflowEventType
 from devrelay.application.jobs import (
     SubmissionState,
@@ -20,6 +28,10 @@ from devrelay.infrastructure.persistence.acknowledgement_models import (
     AcknowledgementReceiptRecord,
 )
 from devrelay.infrastructure.persistence.claim_models import ExecutionAttemptRecord
+from devrelay.infrastructure.persistence.heartbeat_models import (
+    AttemptLeaseAuthorityRecord,
+    HeartbeatReceiptRecord,
+)
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
     JobRecord,
@@ -37,6 +49,118 @@ from devrelay.infrastructure.persistence.workflow_models import (
 )
 
 
+def _validate_lease_authority(
+    attempt: ExecutionAttemptRecord,
+    authority: AttemptLeaseAuthorityRecord | None,
+    heartbeat: HeartbeatReceiptRecord | None,
+    *,
+    repository_id: UUID,
+    claimed: bool,
+) -> None:
+    """Validate joined current lease without rewriting historical assignment pins."""
+    if authority is None:
+        raise JobPersistenceError("Current assignment lease authority is missing.")
+    ownership = (
+        attempt.id,
+        attempt.job_id,
+        attempt.worker_id,
+        attempt.claim_request_id,
+        attempt.generation,
+    )
+    if (
+        (
+            authority.attempt_id,
+            authority.job_id,
+            authority.worker_id,
+            authority.claim_request_id,
+            authority.generation,
+        )
+        != ownership
+        or type(authority.generation) is not int
+        or type(authority.lease_revision) is not int
+        or not 1 <= authority.lease_revision <= MAXIMUM_LEASE_REVISION
+        or type(authority.receipt_count) is not int
+        or not 0 <= authority.receipt_count <= MAXIMUM_LEASE_REVISION
+        or authority.lease_revision > authority.receipt_count + 1
+        or authority.revoked_at is not None
+        or (claimed and (authority.lease_revision != 1 or authority.receipt_count != 0))
+    ):
+        raise JobPersistenceError("Current assignment lease ownership is inconsistent.")
+    try:
+        LeaseAuthorityObservation(
+            reference=AssignmentReference(
+                worker_id=attempt.worker_id,
+                job_id=attempt.job_id,
+                repository_id=repository_id,
+                attempt_id=attempt.id,
+                generation=attempt.generation,
+                issued_at=attempt.issued_at,
+                expires_at=attempt.expires_at,
+            ),
+            lease_revision=authority.lease_revision,
+            observed_at=authority.updated_at,
+            updated_at=authority.updated_at,
+            current_expires_at=authority.current_expires_at,
+            revoked_at=authority.revoked_at,
+        )
+        if authority.receipt_count == 0:
+            if (
+                heartbeat is not None
+                or authority.lease_revision != 1
+                or authority.next_heartbeat_at != attempt.issued_at
+            ):
+                raise ValueError("Initial lease has unsupported heartbeat history.")
+            return
+        if heartbeat is None:
+            raise ValueError("Latest heartbeat history is missing.")
+        if (
+            (
+                heartbeat.attempt_id,
+                heartbeat.job_id,
+                heartbeat.worker_id,
+                heartbeat.claim_request_id,
+                heartbeat.generation,
+            )
+            != ownership
+            or heartbeat.repository_id != repository_id
+            or type(heartbeat.protocol_version) is not int
+            or heartbeat.protocol_version != 1
+            or type(heartbeat.fingerprint_version) is not int
+            or heartbeat.fingerprint_version != 1
+            or type(heartbeat.renewed) is not bool
+            or re.fullmatch(r"[0-9a-f]{64}", heartbeat.fingerprint) is None
+            or heartbeat.attempt_ordinal != authority.receipt_count
+            or heartbeat.lease_revision != authority.lease_revision
+            or heartbeat.updated_at != authority.updated_at
+            or heartbeat.current_expires_at != authority.current_expires_at
+            or not heartbeat.updated_at
+            <= heartbeat.recorded_at
+            < heartbeat.current_expires_at
+            or attempt.acknowledged_at is None
+            or heartbeat.recorded_at < attempt.acknowledged_at
+            or authority.next_heartbeat_at <= heartbeat.recorded_at
+            or heartbeat.lease_revision
+            != heartbeat.expected_lease_revision + int(heartbeat.renewed)
+            or (heartbeat.renewed and heartbeat.updated_at != heartbeat.recorded_at)
+            or any(
+                type(value) is not int or not 1 <= value <= MAXIMUM_LEASE_REVISION
+                for value in (
+                    heartbeat.generation,
+                    heartbeat.lease_revision,
+                    heartbeat.expected_lease_revision,
+                    heartbeat.attempt_ordinal,
+                    heartbeat.worker_ordinal,
+                    heartbeat.global_ordinal,
+                )
+            )
+        ):
+            raise ValueError("Latest heartbeat history is inconsistent.")
+    except ValueError, TypeError:
+        raise JobPersistenceError(
+            "Current assignment lease history failed validation."
+        ) from None
+
+
 def materialize_submission(
     record: JobRecord,
     snapshot: TaskSnapshotRecord,
@@ -50,6 +174,8 @@ def materialize_submission(
     attempt: ExecutionAttemptRecord | None,
     claimed_event: JobWorkflowEventRecord | None,
     acknowledgement: AcknowledgementReceiptRecord | None,
+    lease_authority: AttemptLeaseAuthorityRecord | None,
+    heartbeat: HeartbeatReceiptRecord | None,
 ) -> StoredJobSubmission:
     if (
         JobStatus(record.status) is not JobStatus.QUEUED
@@ -190,6 +316,19 @@ def materialize_submission(
         )
     if not (queued or claimed or running):
         raise JobPersistenceError("Stored workflow transition is unsupported.")
+    if queued:
+        if lease_authority is not None or heartbeat is not None:
+            raise JobPersistenceError(
+                "Queued workflow contains lease authority history."
+            )
+    elif attempt is not None:
+        _validate_lease_authority(
+            attempt,
+            lease_authority,
+            heartbeat,
+            repository_id=record.repository_id,
+            claimed=claimed,
+        )
     task = materialize_snapshot(
         snapshot,
         TaskIdentity(

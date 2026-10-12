@@ -19,6 +19,35 @@ MAXIMUM_LEASE_SECONDS = 300
 MAXIMUM_LEASE_REVISION = (1 << 63) - 1
 
 
+class HeartbeatRejected(Exception):
+    """The known assignment cannot accept this heartbeat input."""
+
+
+class HeartbeatAdmissionRejected(Exception):
+    """New heartbeat identities exceed a bounded durable admission policy."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class HeartbeatLimits:
+    lease_seconds: int = 120
+    minimum_interval_seconds: int = 5
+    attempt_receipts: int = 4096
+    worker_receipts: int = 100_000
+    global_receipts: int = 1_000_000
+
+    def __post_init__(self) -> None:
+        for name, minimum, maximum in (
+            ("lease_seconds", 30, MAXIMUM_LEASE_SECONDS),
+            ("minimum_interval_seconds", 1, 10),
+            ("attempt_receipts", 1, 1_000_000),
+            ("worker_receipts", 1, 1_000_000),
+            ("global_receipts", 1, 10_000_000),
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or not minimum <= value <= maximum:
+                raise ValueError("Heartbeat limits require bounded positive integers.")
+
+
 def _lease_revision(value: int) -> None:
     if type(value) is not int or not 1 <= value <= MAXIMUM_LEASE_REVISION:
         raise ValueError("Lease revision requires a bounded positive integer.")

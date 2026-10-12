@@ -25,12 +25,14 @@ class WorkerCoordinationRecord(Base):
         CheckConstraint("receipt_count > 0"),
         CheckConstraint("version = receipt_count"),
         CheckConstraint("next_poll_at >= enrolled_at"),
+        CheckConstraint("heartbeat_receipt_count >= 0"),
     )
     worker_id: Mapped[UUID] = mapped_column(Uuid, primary_key=True)
     enrolled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     next_poll_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     receipt_count: Mapped[int] = mapped_column(BigInteger)
     version: Mapped[int] = mapped_column(BigInteger)
+    heartbeat_receipt_count: Mapped[int] = mapped_column(BigInteger, server_default="0")
 
 
 class DispatchSlotRecord(Base):
@@ -41,6 +43,7 @@ class DispatchSlotRecord(Base):
         CheckConstraint("worker_count BETWEEN 0 AND 256"),
         CheckConstraint("version = receipt_count"),
         CheckConstraint("worker_count <= receipt_count"),
+        CheckConstraint("heartbeat_receipt_count >= 0"),
         ForeignKeyConstraint(["reserved_attempt_id"], ["execution_attempts.id"]),
     )
     name: Mapped[str] = mapped_column(String(16), primary_key=True)
@@ -48,6 +51,7 @@ class DispatchSlotRecord(Base):
     receipt_count: Mapped[int] = mapped_column(BigInteger)
     worker_count: Mapped[int] = mapped_column(BigInteger)
     version: Mapped[int] = mapped_column(BigInteger)
+    heartbeat_receipt_count: Mapped[int] = mapped_column(BigInteger, server_default="0")
 
 
 class ExecutionAttemptRecord(Base):

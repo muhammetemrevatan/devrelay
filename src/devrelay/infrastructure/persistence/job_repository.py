@@ -27,6 +27,10 @@ from devrelay.infrastructure.persistence.acknowledgement_models import (
     AcknowledgementReceiptRecord,
 )
 from devrelay.infrastructure.persistence.claim_models import ExecutionAttemptRecord
+from devrelay.infrastructure.persistence.heartbeat_models import (
+    AttemptLeaseAuthorityRecord,
+    HeartbeatReceiptRecord,
+)
 from devrelay.infrastructure.persistence.job_mapping import materialize_submission
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
@@ -65,6 +69,8 @@ async def read_submission(
                 ExecutionAttemptRecord,
                 claim_event,
                 AcknowledgementReceiptRecord,
+                AttemptLeaseAuthorityRecord,
+                HeartbeatReceiptRecord,
             )
             .join(TaskSnapshotRecord, JobRecord.snapshot_id == TaskSnapshotRecord.id)
             .join(SourceTaskRecord, JobRecord.source_task_id == SourceTaskRecord.id)
@@ -100,6 +106,18 @@ async def read_submission(
                 AcknowledgementReceiptRecord,
                 AcknowledgementReceiptRecord.attempt_id == ExecutionAttemptRecord.id,
             )
+            .outerjoin(
+                AttemptLeaseAuthorityRecord,
+                AttemptLeaseAuthorityRecord.attempt_id == ExecutionAttemptRecord.id,
+            )
+            .outerjoin(
+                HeartbeatReceiptRecord,
+                (HeartbeatReceiptRecord.attempt_id == ExecutionAttemptRecord.id)
+                & (
+                    HeartbeatReceiptRecord.attempt_ordinal
+                    == AttemptLeaseAuthorityRecord.receipt_count
+                ),
+            )
             .where(JobRecord.submission_key == submission_key)
         )
     ).one_or_none()
@@ -117,6 +135,8 @@ async def read_submission(
         attempt,
         claimed_event,
         acknowledgement,
+        lease_authority,
+        heartbeat,
     ) = row
     checks = tuple(
         (
@@ -141,6 +161,8 @@ async def read_submission(
         attempt,
         claimed_event,
         acknowledgement,
+        lease_authority,
+        heartbeat,
     )
 
 
