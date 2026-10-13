@@ -547,6 +547,29 @@ committed virtual memory, and nested CPU caps can be relative to a parent Job.
 Tests exercise harmless Windows processes only. Codex execution, identity/sandbox
 setup and check commands remain disabled.
 
+## Windows workspace reservation
+
+`ReserveAssignedWorkspace` consumes a durable acknowledged execution and the full
+accepted definition. It checks fresh heartbeat authority before and after one
+directory reservation. Changed execution, assignment, definition or supplier
+binding fails. Cancellation and failed checks consume this one-shot request;
+they may leave a directory behind and never authorize a retry or deletion.
+
+The Windows adapter requires an existing, explicitly configured root controlled
+by the coordinator, with canonical protected-directory paths supplied separately.
+It rejects overlapping namespaces, ambiguous DOS paths, existing targets and
+reparse ancestors. It retains noninheritable directory handles without delete
+sharing, checks final paths and native identities, and creates only the execution
+UUID child. Native filesystem work and handle cleanup run on one owned executor;
+cleanup closes handles and preserves any created directory.
+
+This is a process-local directory reservation. It provides no Git checkout/base
+proof, denied-read policy, hostile same-user mutation protection or cross-restart
+uniqueness. Protected paths are trusted configuration, not an ACL verification.
+Changing the configured root or restarting requires a later protected workspace
+receipt/reconciliation protocol before reuse or execution. Codex launch and the
+worker CLI remain disabled.
+
 ## Control acknowledgement persistence
 
 `AcknowledgeAssignedJob` recovers only the authenticated original assignment,
