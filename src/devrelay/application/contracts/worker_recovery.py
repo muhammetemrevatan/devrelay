@@ -13,6 +13,7 @@ from devrelay.application.contracts.claims import (
     ClaimReplayConflict,
     WorkerClaimRequest,
 )
+from devrelay.application.contracts.executions import WorkerExecutionIntent
 from devrelay.domain.jobs.values import _utc, _uuid
 
 
@@ -210,6 +211,7 @@ class WorkerRecoveryState:
     completion: AcknowledgementCompletion | None = None
     pending_heartbeat: WorkerHeartbeatIntent | None = None
     last_heartbeat: WorkerHeartbeatIntent | None = None
+    execution: WorkerExecutionIntent | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, WorkerRecoveryPhase):
@@ -268,6 +270,15 @@ class WorkerRecoveryState:
                 raise ValueError("Completed acknowledgement requires original anchors.")
         elif self.completion is not None:
             raise ValueError("Completion requires its durable phase.")
+        if self.execution is not None and (
+            self.phase is not WorkerRecoveryPhase.ACKNOWLEDGED
+            or not isinstance(self.execution, WorkerExecutionIntent)
+            or self.completion is None
+            or self.execution.acknowledgement != self.acknowledgement
+        ):
+            raise ValueError(
+                "Execution preparation requires the original completed acknowledgement."
+            )
         for heartbeat in (self.pending_heartbeat, self.last_heartbeat):
             if heartbeat is None:
                 continue

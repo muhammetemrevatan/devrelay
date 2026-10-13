@@ -13,6 +13,7 @@ from devrelay.application.contracts.claims import (
     LeaseProofVerifier,
     WorkerClaimRequest,
 )
+from devrelay.application.contracts.executions import WorkerExecutionIntent
 from devrelay.application.contracts.worker_recovery import (
     AcknowledgementCompletion,
     WorkerClaimOutcome,
@@ -27,6 +28,7 @@ from devrelay.application.ports.worker_journal import (
 )
 from devrelay.infrastructure.worker_state.acknowledgements import save_acknowledgement
 from devrelay.infrastructure.worker_state.completions import save_completion
+from devrelay.infrastructure.worker_state.executions import save_execution
 from devrelay.infrastructure.worker_state.heartbeats import (
     bind_heartbeats,
     save_heartbeat,
@@ -108,12 +110,17 @@ class SqliteClaimStore:
                 create_outcome_schema(
                     connection, scope.key, prepared=int(pending is not None)
                 )
-            elif existing in ((2, scope.key), (3, scope.key), (4, scope.key)):
+            elif existing in (
+                (2, scope.key),
+                (3, scope.key),
+                (4, scope.key),
+                (5, scope.key),
+            ):
                 state = recovery_state(
                     connection, self._scope, self._read_request(), allow_legacy=True
                 )
                 upgrade_outcome_schema(connection, scope, state)
-            elif existing != (5, scope.key):
+            elif existing != (6, scope.key):
                 raise WorkerStateUnavailable(_FAILURE)
             self._read_state()
             connection.execute("COMMIT")
@@ -504,6 +511,57 @@ class SqliteClaimStore:
             raise ClaimReplayConflict("Heartbeat conflicts with original proof.")
         return state
 
+    def get_or_create_execution(
+        self, request: WorkerClaimRequest, candidate: WorkerExecutionIntent
+    ) -> WorkerExecutionIntent:
+        connection = self._open()
+        try:
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._read_state()
+            if (
+                not isinstance(request, WorkerClaimRequest)
+                or not isinstance(candidate, WorkerExecutionIntent)
+                or state.phase is not WorkerRecoveryPhase.ACKNOWLEDGED
+                or state.request is None
+                or state.completion is None
+                or request.claim_request_id != state.request.claim_request_id
+                or request.protocol_version != state.request.protocol_version
+                or candidate.acknowledgement != state.completion.intent
+            ):
+                raise ClaimReplayConflict(
+                    "Execution requires completed original anchors."
+                )
+            verifier = LeaseProofVerifier.from_proof(
+                worker_id=self._scope.worker_id,
+                claim_request_id=state.request.claim_request_id,
+                proof=state.request.proof,
+            )
+            if not verifier.matches(
+                request.proof,
+                worker_id=self._scope.worker_id,
+                claim_request_id=request.claim_request_id,
+            ):
+                raise ClaimReplayConflict("Execution conflicts with original proof.")
+            if state.execution is not None:
+                state.execution.require_same_input(candidate)
+                result = state.execution
+            else:
+                save_execution(connection, candidate)
+                self._bind_heartbeat_state(state)
+                saved = self._read_state().execution
+                if saved is None:
+                    raise WorkerStateUnavailable(_FAILURE)
+                result = saved
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
     def _bind_heartbeat_state(self, state: WorkerRecoveryState) -> None:
         if (
             state.request is None
@@ -634,6 +692,16 @@ class AsyncClaimJournal:
                 raise WorkerStateUnavailable(_FAILURE)
             return await asyncio.get_running_loop().run_in_executor(
                 self._executor, self._store.get_or_create_heartbeat, request, candidate
+            )
+
+    async def get_or_create_execution(
+        self, request: WorkerClaimRequest, candidate: WorkerExecutionIntent
+    ) -> WorkerExecutionIntent:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.get_or_create_execution, request, candidate
             )
 
     async def record_heartbeat(
