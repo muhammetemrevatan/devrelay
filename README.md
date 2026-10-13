@@ -522,6 +522,31 @@ A changed definition or policy cannot replace it. Native process containment,
 credential separation, workspace preparation and the Codex launch adapter remain
 required before actual execution. The worker CLI still validates configuration only.
 
+## Windows process-scope management
+
+`ManageExecutionProcesses` manages an existing trusted scope bound to the original
+execution intent and assignment. It monitors fresh heartbeat authority and native
+associated-process accounting within finite runtime, operation, observation and
+stop budgets. It creates no process and never turns recovered intent into launch
+permission. Stop seals attachments before termination. Only fresh accounting of
+zero associated processes after termination yields `empty_verified`; errors,
+timeouts and uncertain operations yield `unknown`, with reservations unchanged.
+
+The Windows adapter creates an unnamed, noninheritable Job Object with explicitly
+configured CPU hard cap, committed-memory limit and process-count limit. It reads
+back the applied limits and fails if a required setting is unsupported. A trusted
+caller may attach a caller-owned suspended process handle; creation, identity,
+resume and failed-launch cleanup belong to the later launch driver. Native work
+runs on one owned executor. Cancellation retains the native future and blocks new
+operation admission until it settles. Handle cleanup supplies no empty evidence.
+
+Parent exit and a successful termination call alone do not establish empty state.
+Job Object results cover associated processes; they do not certify secret isolation,
+escaped-process termination or restart reconciliation. The memory limit concerns
+committed virtual memory, and nested CPU caps can be relative to a parent Job.
+Tests exercise harmless Windows processes only. Codex execution, identity/sandbox
+setup and check commands remain disabled.
+
 ## Control acknowledgement persistence
 
 `AcknowledgeAssignedJob` recovers only the authenticated original assignment,
