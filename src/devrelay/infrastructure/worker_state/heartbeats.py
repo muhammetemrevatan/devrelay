@@ -100,7 +100,28 @@ def bind_heartbeats(
     completion: AcknowledgementCompletion,
 ) -> None:
     pending, last = read_heartbeats(connection)
-    integrity = heartbeat_integrity(scope, request, outcome, completion, pending, last)
+    version = connection.execute(
+        "SELECT version FROM metadata WHERE slot = 1"
+    ).fetchone()
+    if version == (6,):
+        from devrelay.infrastructure.worker_state.executions import (
+            execution_integrity,
+            read_execution,
+        )
+
+        integrity = execution_integrity(
+            scope,
+            request,
+            outcome,
+            completion,
+            pending,
+            last,
+            read_execution(connection, completion),
+        )
+    else:
+        integrity = heartbeat_integrity(
+            scope, request, outcome, completion, pending, last
+        )
     connection.execute(
         "UPDATE assignment SET integrity = ? WHERE slot = 1", (integrity,)
     )

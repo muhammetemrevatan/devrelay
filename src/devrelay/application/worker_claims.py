@@ -17,6 +17,10 @@ from devrelay.application.contracts.claims import (
     LeaseProof,
     WorkerClaimRequest,
 )
+from devrelay.application.contracts.executions import (
+    ExecutionPolicy,
+    WorkerExecutionIntent,
+)
 from devrelay.application.contracts.heartbeats import (
     HeartbeatRequest,
     WorkerHeartbeatExchange,
@@ -36,12 +40,14 @@ from devrelay.application.ports.control_gateway import (
     ControlHeartbeatGateway,
     InvalidControlResponse,
 )
+from devrelay.application.ports.worker_execution_journal import WorkerExecutionJournal
 from devrelay.application.ports.worker_journal import (
     WorkerClaimJournal,
     WorkerHeartbeatJournal,
     WorkerStateBusy,
     WorkerStateUnavailable,
 )
+from devrelay.application.worker_executions import PrepareAssignedExecution
 from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSupervisor
 
 
@@ -53,9 +59,23 @@ class PrepareWorkerClaim:
         journal: WorkerClaimJournal,
         *,
         heartbeat_journal: WorkerHeartbeatJournal | None = None,
+        execution_journal: WorkerExecutionJournal | None = None,
     ) -> None:
         self._journal = journal
         self._heartbeat_journal = heartbeat_journal
+        self._execution_journal = execution_journal
+
+    async def prepare_execution(
+        self,
+        delivery: AssignmentDelivery,
+        supervisor: HeartbeatSupervisor,
+        policy: ExecutionPolicy,
+    ) -> WorkerExecutionIntent:
+        if self._execution_journal is None:
+            raise WorkerStateUnavailable("Execution recovery is not configured.")
+        return await PrepareAssignedExecution(
+            self._execution_journal, supervisor, policy
+        ).execute(delivery)
 
     async def prepare(self) -> WorkerClaimRequest:
         pending = await self._journal.load_pending()
@@ -145,6 +165,17 @@ class RequestWorkerClaim:
         self._supervision_clock = monotonic_clock
         self._heartbeat_observation: WorkerHeartbeatExchange | None = None
         self._supervisor: HeartbeatSupervisor | None = None
+
+    async def prepare_execution(
+        self, delivery: AssignmentDelivery, policy: ExecutionPolicy
+    ) -> WorkerExecutionIntent:
+        """Commit or recover original execution input; never starts a process."""
+        if self._lock.locked():
+            raise WorkerStateBusy("A worker claim exchange is already active.")
+        async with self._lock:
+            return await self._preparation.prepare_execution(
+                delivery, self.heartbeat_supervisor(), policy
+            )
 
     def heartbeat_supervisor(
         self, *, policy: HeartbeatPolicy | None = None

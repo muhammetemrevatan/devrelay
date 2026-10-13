@@ -24,6 +24,11 @@ from devrelay.infrastructure.worker_state.completions import (
     create_completion_schema,
     read_completion,
 )
+from devrelay.infrastructure.worker_state.executions import (
+    create_execution_schema,
+    execution_integrity,
+    read_execution,
+)
 from devrelay.infrastructure.worker_state.heartbeats import (
     bind_heartbeats,
     create_heartbeat_schema,
@@ -45,7 +50,7 @@ def _create_metadata(
     connection.execute("""
       CREATE TABLE metadata (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
-        version INTEGER NOT NULL CHECK (version = 5),
+        version INTEGER NOT NULL CHECK (version = 6),
         scope BLOB NOT NULL CHECK (length(scope) = 32),
         prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
         phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned', 'acknowledgement_pending', 'acknowledged')),
@@ -54,7 +59,7 @@ def _create_metadata(
       )
     """)
     connection.execute(
-        "INSERT INTO metadata VALUES (1, 5, ?, ?, ?, ?)",
+        "INSERT INTO metadata VALUES (1, 6, ?, ?, ?, ?)",
         (scope, prepared, phase, completed),
     )
 
@@ -78,9 +83,11 @@ def upgrade_outcome_schema(
     )
     if version == (2,):
         create_acknowledgement_schema(connection)
-    if version != (4,):
+    if version in ((2,), (3,)):
         create_completion_schema(connection)
-    create_heartbeat_schema(connection)
+    if version in ((2,), (3,), (4,)):
+        create_heartbeat_schema(connection)
+    create_execution_schema(connection)
     if state.completion is not None:
         if state.request is None or state.assignment is None:
             raise WorkerStateUnavailable(_FAILURE)
@@ -102,6 +109,7 @@ def create_outcome_schema(
     create_acknowledgement_schema(connection)
     create_completion_schema(connection)
     create_heartbeat_schema(connection)
+    create_execution_schema(connection)
     connection.execute("""
       CREATE TABLE assignment (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -161,7 +169,7 @@ def recovery_state(
     ).fetchone()
     if (
         header is None
-        or header[0] not in ((2, 3, 4, 5) if allow_legacy else (5,))
+        or header[0] not in ((2, 3, 4, 5, 6) if allow_legacy else (6,))
         or header[1] != scope.key
     ):
         raise WorkerStateUnavailable(_FAILURE)
@@ -201,6 +209,7 @@ def recovery_state(
     outcome = None
     acknowledgement = None
     completion = None
+    execution = None
     pending_heartbeat, last_heartbeat = (
         read_heartbeats(connection) if header[0] >= 5 else (None, None)
     )
@@ -242,8 +251,19 @@ def recovery_state(
             if header[0] >= 4
             else None
         )
+        execution = read_execution(connection, completion) if header[0] >= 6 else None
         expected_integrity = (
-            heartbeat_integrity(
+            execution_integrity(
+                scope,
+                request,
+                outcome,
+                completion,
+                pending_heartbeat,
+                last_heartbeat,
+                execution,
+            )
+            if completion is not None and header[0] >= 6
+            else heartbeat_integrity(
                 scope, request, outcome, completion, pending_heartbeat, last_heartbeat
             )
             if completion is not None and header[0] >= 5
@@ -267,6 +287,8 @@ def recovery_state(
             completion = read_completion(
                 connection, scope, request, outcome, acknowledgement
             )
+        if header[0] >= 6:
+            execution = read_execution(connection, completion)
     return WorkerRecoveryState(
         phase=WorkerRecoveryPhase(phase),
         request=request,
@@ -276,6 +298,7 @@ def recovery_state(
         completion=completion,
         pending_heartbeat=pending_heartbeat,
         last_heartbeat=last_heartbeat,
+        execution=execution,
     )
 
 

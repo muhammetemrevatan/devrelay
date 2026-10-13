@@ -5,6 +5,7 @@ from enum import StrEnum
 from math import isfinite
 
 from devrelay.application.contracts.heartbeats import WorkerHeartbeatExchange
+from devrelay.application.contracts.worker_recovery import AssignmentReference
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.lease_deadlines import LeaseDeadline, LeaseDeadlineRejected
 from devrelay.application.ports.worker_journal import WorkerStateBusy
@@ -142,6 +143,25 @@ class HeartbeatSupervisor:
 
     def request_stop(self) -> None:
         self._latch(HeartbeatStopReason.REQUESTED)
+
+    def require_current_assignment(self, reference: AssignmentReference) -> None:
+        """Check fresh coordination only; this guard grants no launch authority."""
+        if self._stop is not None or self._deadline is None:
+            raise LeaseDeadlineRejected("Current heartbeat authority is unavailable.")
+        now = self._read_clock()
+        if now is None:
+            raise LeaseDeadlineRejected("Current heartbeat clock is unavailable.")
+        if self._deadline.must_stop(now):
+            self._latch(HeartbeatStopReason.DEADLINE_EXPIRED)
+            raise LeaseDeadlineRejected("Current heartbeat authority has expired.")
+        if (
+            not isinstance(reference, AssignmentReference)
+            or reference != self._deadline.reference
+        ):
+            self._latch(HeartbeatStopReason.INVALID_EVIDENCE)
+            raise LeaseDeadlineRejected(
+                "Current heartbeat assignment differs from preparation."
+            )
 
     async def wait_stopped(self) -> HeartbeatStop:
         await self._stop_event.wait()

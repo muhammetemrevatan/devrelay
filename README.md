@@ -366,7 +366,7 @@ After restart, preparation returns the same recorded input without HTTP, a new
 identity or renewed authority. Duplicate claim responses preserve pending intent.
 Later payload reads must still match its accepted definition digest.
 
-Valid version-1 through version-4 journals upgrade to version 5 in one transaction, preserving protected
+Valid version-1 through version-5 journals upgrade to version 6 in one transaction, preserving protected
 proof bytes, original identities, assignment anchors and no-work markers. Damaged
 state or an incomplete upgrade retains the old schema and fails closed. SQLite,
 DPAPI and integrity checks remain on the dedicated journal thread.
@@ -447,7 +447,7 @@ Accepted exact retries bypass new admission and never renew twice.
 
 The explicit worker `heartbeat()` call stores input before HTTP and records
 validated completion before returning process-local request/receipt timing.
-SQLite version 5 keeps one pending input and one last completed input, bound to
+SQLite version 6 keeps one pending input and one last completed input, bound to
 the original protected proof and acknowledgement completion. These records contain
 request identities and expected revisions only. Current expiry, returned revision,
 observation clocks, active flags and execution deadlines are never stored as
@@ -500,6 +500,27 @@ Tests do not suspend the host. Direct application composition must explicitly
 provide a clock with these elapsed-time semantics before creating a supervisor.
 The CLI still validates configuration only. Process containment and Codex execution
 remain separate integrations.
+
+## Durable worker execution preparation
+
+The composed worker client exposes explicit `prepare_execution(delivery, policy)`.
+It verifies the delivered definition against the original durable acknowledgement
+and pins one execution UUID with the Codex runtime, restricted Windows execution
+direction and trusted policy digest. A new intent requires fresh matching authority
+from the retained heartbeat supervisor, checked with its shared clock before and
+after journal commit. Preparation never starts supervision or a subprocess.
+
+SQLite version 6 binds both execution input and its presence to the protected
+original claim, acknowledgement and heartbeat inputs. Valid older journals upgrade
+atomically; changed or missing records fail closed. Duplicate claim/acknowledgement
+responses and heartbeat maintenance preserve the execution UUID and policy.
+
+Recovery returns the original instance and pins even after restart or stop. It is
+historical evidence, never permission to launch or proof that an earlier process
+did not start. Cancellation or expiry during commit can leave a recoverable intent.
+A changed definition or policy cannot replace it. Native process containment,
+credential separation, workspace preparation and the Codex launch adapter remain
+required before actual execution. The worker CLI still validates configuration only.
 
 ## Control acknowledgement persistence
 
