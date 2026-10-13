@@ -42,6 +42,7 @@ from devrelay.application.ports.worker_journal import (
     WorkerStateBusy,
     WorkerStateUnavailable,
 )
+from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSupervisor
 
 
 class PrepareWorkerClaim:
@@ -133,26 +134,69 @@ class RequestWorkerClaim:
         authorization: WorkerAuthorization,
         *,
         heartbeat_gateway: ControlHeartbeatGateway | None = None,
-        monotonic_clock: Callable[[], float] = monotonic,
+        monotonic_clock: Callable[[], float] | None = None,
     ) -> None:
         self._preparation = preparation
         self._gateway = gateway
         self._authorization = authorization
         self._lock = asyncio.Lock()
         self._heartbeat_gateway = heartbeat_gateway
-        self._monotonic = monotonic_clock
+        self._monotonic = monotonic if monotonic_clock is None else monotonic_clock
+        self._supervision_clock = monotonic_clock
         self._heartbeat_observation: WorkerHeartbeatExchange | None = None
+        self._supervisor: HeartbeatSupervisor | None = None
+
+    def heartbeat_supervisor(
+        self, *, policy: HeartbeatPolicy | None = None
+    ) -> HeartbeatSupervisor:
+        """One explicit maintenance lineage; injected clock must include suspend."""
+        if policy is not None and not isinstance(policy, HeartbeatPolicy):
+            raise ValueError("Heartbeat supervision requires a typed policy.")
+        if self._supervision_clock is None or self._heartbeat_gateway is None:
+            raise WorkerStateUnavailable(
+                "Heartbeat supervision requires transport and an explicit clock."
+            )
+        if self._supervisor is not None:
+            if policy is not None and policy != self._supervisor.policy:
+                raise WorkerStateUnavailable(
+                    "Heartbeat supervision policy cannot change within a lineage."
+                )
+            return self._supervisor
+        first = True
+
+        async def exchange() -> WorkerHeartbeatExchange:
+            nonlocal first
+            if first:
+                first = False
+                state = await self._preparation.recover()
+                return await self.heartbeat(
+                    renew=state.pending_heartbeat is None
+                    and state.last_heartbeat is None
+                )
+            return await self.heartbeat()
+
+        self._supervisor = HeartbeatSupervisor(
+            exchange,
+            self._authorization,
+            self._supervision_clock,
+            HeartbeatPolicy() if policy is None else policy,
+        )
+        return self._supervisor
 
     async def heartbeat(self, *, renew: bool = True) -> WorkerHeartbeatExchange:
         """One durable exchange; restarts replay input to discover fresh authority."""
         if type(renew) is not bool:
             raise ValueError("Heartbeat renewal intent must be a boolean.")
+        if self._supervisor is not None and self._supervisor.stop is not None:
+            renew = False
         if self._lock.locked():
             raise WorkerStateBusy("A worker claim exchange is already active.")
         if self._heartbeat_gateway is None:
             raise WorkerStateUnavailable("Heartbeat transport is not configured.")
         async with self._lock:
             state = await self._preparation.recover()
+            if self._supervisor is not None and self._supervisor.stop is not None:
+                renew = False
             reference = state.assignment.assignment if state.assignment else None
             if (
                 state.phase is not WorkerRecoveryPhase.ACKNOWLEDGED
@@ -201,6 +245,14 @@ class RequestWorkerClaim:
                 protocol_version=intent.protocol_version,
             )
             started_at = self._monotonic()
+            if (
+                self._supervisor is not None
+                and self._supervisor.stop is not None
+                and intent != state.last_heartbeat
+            ):
+                raise ControlClaimRejected(
+                    "Uncertain heartbeat input requires restarted recovery."
+                )
             result = await self._heartbeat_gateway.heartbeat(
                 request, self._authorization, reference=reference
             )
