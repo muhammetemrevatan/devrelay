@@ -35,7 +35,8 @@ class WindowsLeaseClock:
 
     GetTickCount64 is unaffected by wall-clock adjustments. Native tests verify
     the binding and readings; they do not certify a forced suspend/resume cycle.
-    Create and use this process-local clock on the worker's orchestration thread.
+    Read this process-local clock on the worker's orchestration thread; its native
+    loader may be initialized off-loop.
     """
 
     def __init__(self) -> None:
