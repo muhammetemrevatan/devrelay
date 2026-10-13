@@ -13,6 +13,7 @@ from devrelay.application.ports.worker_journal import WorkerStateUnavailable
 from devrelay.application.worker_claims import PrepareWorkerClaim, RequestWorkerClaim
 from devrelay.config.worker import WorkerSettings
 from devrelay.infrastructure.control.gateway import HttpControlGateway
+from devrelay.infrastructure.worker_state.clock import WindowsLeaseClock
 from devrelay.infrastructure.worker_state.journal import (
     AsyncClaimJournal,
     SqliteClaimStore,
@@ -38,13 +39,18 @@ async def open_worker_claim_client(
     ) as client:
         gateway = HttpControlGateway(client)
         authorization = await gateway.identify()
+        clock = await asyncio.to_thread(WindowsLeaseClock)
         async with open_worker_journal(
             settings,
             worker_id=authorization.worker_id,
             state_directory=state_directory,
         ) as preparation:
             yield RequestWorkerClaim(
-                preparation, gateway, authorization, heartbeat_gateway=gateway
+                preparation,
+                gateway,
+                authorization,
+                heartbeat_gateway=gateway,
+                monotonic_clock=clock,
             )
 
 

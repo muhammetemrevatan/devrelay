@@ -85,6 +85,7 @@ async def prepared_worker(
     tmp_path: Path,
     *,
     native: bool,
+    clock: Callable[[], float] | None = None,
 ) -> AsyncIterator[WorkerHarness]:
     stored = await save_job(engine)
     values = worker_configuration.model_dump()
@@ -164,6 +165,7 @@ async def prepared_worker(
                         gateway,
                         authorization,
                         heartbeat_gateway=gateway,
+                        monotonic_clock=clock,
                     )
                 finally:
                     journal.stop_admission()

@@ -63,8 +63,8 @@ history exists. Apply migrations explicitly with old writers stopped.
 Control acknowledgement now validates accepted inputs and atomically advances
 Attempt/workflow/history with an immutable replay receipt. An authenticated HTTP
 exchange records completion in the worker journal before returning. Bounded
-heartbeat exchange and input recovery are implemented; scheduling, containment
-and agent execution remain pending.
+heartbeat exchange, input recovery and explicit bounded supervision are implemented;
+containment and agent execution remain pending.
 
 ## Planned workflow
 
@@ -269,7 +269,8 @@ loaded policy until restarted. No registration or token issuance API is exposed.
 The identity endpoint creates no session, lease or assignment and opens no
 database or provider resources when claims/import/submission are disabled.
 Claims independently verify authority and expiry using database time.
-Heartbeat fencing, execution and agent isolation remain pending.
+Heartbeat fencing and explicit maintenance are implemented. Execution and agent
+isolation remain pending.
 
 Neutral claim contracts provide redacted lease-proof values, worker/request-bound
 verifiers and versioned replay fingerprints. These helpers do not expose a claim
@@ -373,8 +374,8 @@ DPAPI and integrity checks remain on the dedicated journal thread.
 This step prepares local input only. The control now implements the atomic
 claimed-to-running transition and acknowledgement receipt described below.
 Its HTTP exchange and worker response completion are described below.
-Heartbeat scheduling, containment and runtime integration
-are also required before launching an agent; the CLI remains a
+Contained process stopping and runtime integration
+are required before launching an agent; the CLI remains a
 configuration validator.
 
 ## Worker acknowledgement exchange
@@ -410,8 +411,9 @@ network delay consumes available time. Stale or out-of-order replies cannot exte
 the deadline; a stopped execution lineage cannot revive through a late response.
 
 Deadline state is process-local and must never be restored as authority from the
-journal. Native suspend handling, actual descendant containment and heartbeat
-scheduling remain separate integration gates. The deadline policy
+journal. The Windows clock and explicit supervision described below account for
+elapsed sleep time. Actual descendant containment and execution restart recovery
+remain separate integration gates. The deadline policy
 performs no polling, process launch or stopping.
 
 ## Atomic control heartbeat persistence
@@ -429,7 +431,7 @@ the coding reservation. Current readers validate joined authority/history while
 original recovery values remain unchanged. Migration `0008_heartbeat_authorities`
 requires stopped writers during rollout and refuses to discard accepted heartbeat
 history on downgrade. The optional HTTP exchange described below delegates to
-this persistence use case. Scheduling and agent execution remain pending.
+this persistence use case. Agent execution remains pending.
 
 ## Worker heartbeat exchange
 
@@ -458,7 +460,46 @@ replays recorded input only and refuses an initial request. Network loss, local
 write failure and cancellation retain exact recovery input. A completion committed
 during cancellation also forces discovery before another renewal. The transport
 verifies the full original assignment reference, current scope and credentials,
-strict bounded responses and verified TLS. There is no automatic retry or polling.
+strict bounded responses and verified TLS. One-shot exchanges perform no automatic
+retry or polling; optional heartbeat maintenance is described below.
+
+## Explicit heartbeat supervision
+
+The composed worker client exposes `heartbeat_supervisor()`. Constructing it
+starts no task or network request. An explicit `await supervisor.run()` maintains
+only the acknowledged assignment and returns a typed terminal stop result.
+`wait_stopped()` reports the latched stop before exchange cancellation cleanup;
+`request_stop()` requests shutdown. A client retains one supervisor and its policy,
+and a stopped instance cannot start again. Manual heartbeat calls after its stop
+can only observe a completed receipt. Pending input with unknown server acceptance
+is retained for fresh client recovery, without another request from the stopped
+client. A request already in flight when stop is signalled can still commit.
+
+Initial pending or last input is replayed for a fresh observation. Only validated
+exchange evidence initializes the process-local deadline. Renewals wait after
+previous completion, without catch-up bursts or retries after failure. Neutral
+`HeartbeatPolicy` separately bounds cadence (11–60 seconds), operation timeout
+(1–30 seconds), stop margin (3–30 seconds), watchdog interval (0.05–1 second),
+cancellation cleanup (0.1–5 seconds) and exchange count (1–4,096). These settings
+do not enable claim polling or reinterpret `poll_interval_seconds`.
+
+The watchdog checks the existing deadline while HTTP or journal completion is
+pending. Expired authority, late replies, control stop, errors, clock regression,
+timeout, cancellation and the finite exchange budget stop maintenance. Late
+completion cannot revive the deadline. Bounded cleanup reports whether the
+async exchange task settled. Control or journal executor work may still commit
+after cancellation; this does not prove an agent or its descendants stopped.
+
+Bootstrap loads the Windows clock off the event loop and shares one instance
+between HTTP timing and supervision. It uses system-only `GetTickCount64`, rejects
+missing APIs and backward values, and has no ordinary-clock fallback. Microsoft
+documents [elapsed time including sleep and hibernation](https://learn.microsoft.com/en-us/windows/win32/sysinfo/interrupt-time)
+and [approximately 10–16 ms resolution](https://learn.microsoft.com/en-us/windows/win32/api/sysinfoapi/nf-sysinfoapi-gettickcount64).
+Native tests verify the binding; controlled clock jumps test delayed wake-ups.
+Tests do not suspend the host. Direct application composition must explicitly
+provide a clock with these elapsed-time semantics before creating a supervisor.
+The CLI still validates configuration only. Process containment and Codex execution
+remain separate integrations.
 
 ## Control acknowledgement persistence
 
