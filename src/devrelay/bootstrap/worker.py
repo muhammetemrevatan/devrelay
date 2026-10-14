@@ -118,7 +118,10 @@ async def open_worker_journal(
         resources = await asyncio.shield(future)
         journal = AsyncClaimJournal(resources[1], executor)
         yield PrepareWorkerClaim(
-            journal, heartbeat_journal=journal, execution_journal=journal
+            journal,
+            heartbeat_journal=journal,
+            execution_journal=journal,
+            workspace_journal=journal,
         )
     finally:
         if journal is not None:

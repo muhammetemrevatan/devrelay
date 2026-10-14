@@ -1,10 +1,15 @@
 import ctypes
-import re
+import hashlib
+import json
 import sys
 from dataclasses import dataclass
 from threading import RLock
 from typing import cast
 
+from devrelay.application.contracts.workspace_recovery import (
+    WorkspaceLocation,
+    canonical_workspace_path,
+)
 from devrelay.application.contracts.workspaces import (
     WorkspaceBinding,
     WorkspaceDirectoryIdentity,
@@ -17,40 +22,13 @@ _DWORD = ctypes.c_uint32
 _BOOL = ctypes.c_int32
 _HANDLE = ctypes.c_void_p
 _INVALID_HANDLE = (1 << (8 * ctypes.sizeof(_HANDLE))) - 1
-_RESERVED = {"CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"} | {
-    prefix + suffix for prefix in ("COM", "LPT") for suffix in "123456789¹²³"
-}
 
 
 def _path(value: object, *, root: bool) -> str:
-    if (
-        type(value) is not str
-        or not 3 <= len(value) <= 200
-        or not re.match(r"^[A-Za-z]:\\", value)
-    ):
-        raise WorkspaceUnavailable(_FAILURE)
-    if value == value[:3]:
-        if root:
-            raise WorkspaceUnavailable(_FAILURE)
-        return value
-    for part in value[3:].split("\\"):
-        if (
-            not part
-            or part in (".", "..")
-            or part[-1] in ". "
-            or part.split(".", 1)[0].rstrip(" .").upper() in _RESERVED
-            or any(
-                ord(char) < 32
-                or 127 <= ord(char) <= 159
-                or 0xD800 <= ord(char) <= 0xDFFF
-                or char in '/:*?"<>|~'
-                for char in part
-            )
-        ):
-            raise WorkspaceUnavailable(_FAILURE)
-    if len(value.encode("utf-16-le")) // 2 > 200:
-        raise WorkspaceUnavailable(_FAILURE)
-    return value
+    try:
+        return canonical_workspace_path(value, allow_volume_root=not root)
+    except ValueError:
+        raise WorkspaceUnavailable(_FAILURE) from None
 
 
 def _overlap(first: str, second: str) -> bool:
@@ -81,6 +59,16 @@ class WindowsWorkspacePolicy:
             _overlap(root, value) for value in protected
         ):
             raise WorkspaceUnavailable(_FAILURE)
+
+    def fingerprint(self) -> str:
+        payload = {
+            "version": 1,
+            "root_directory": self.root_directory,
+            "protected_directories": sorted(self.protected_directories),
+        }
+        return hashlib.sha256(
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
 
 
 class _FileTime(ctypes.Structure):
@@ -141,11 +129,14 @@ class WindowsWorkspaceReservation:
             raise WorkspaceUnavailable(_FAILURE)
         self._binding, self._policy = binding, policy
         self._used = False
+        self._prepared = False
         self._closed = False
         self._lock = RLock()
         self._handles: list[int] = []
         self._find_handles: list[int] = []
         self._kernel: ctypes.CDLL | None = None
+        self._location: WorkspaceLocation | None = None
+        self._held: list[tuple[str, int, WorkspaceDirectoryIdentity]] = []
 
     @property
     def binding(self) -> WorkspaceBinding:
@@ -252,7 +243,42 @@ class WindowsWorkspaceReservation:
                 return
         raise WorkspaceUnavailable(_FAILURE)
 
-    def reserve(self) -> WorkspaceReservation:
+    def _recheck_root(self) -> None:
+        for path, current, previous in self._held:
+            if self._verify(current, path) != previous:
+                raise WorkspaceUnavailable(_FAILURE)
+
+    def prepare(self) -> WorkspaceLocation:
+        """Retain checked ancestors before any durable creation decision."""
+        with self._lock:
+            if self._prepared or self._closed:
+                raise WorkspaceUnavailable(_FAILURE)
+            self._prepared = True
+            try:
+                root = self._policy.root_directory
+                self._kernel = _load_kernel()
+                self._bind()
+                paths = [root[:3]]
+                for part in root[3:].split("\\"):
+                    paths.append(paths[-1].rstrip("\\") + "\\" + part)
+                self._held = [(path, *self._open_directory(path)) for path in paths]
+                self._recheck_root()
+                self._location = WorkspaceLocation(
+                    root_directory=root,
+                    policy_digest=self._policy.fingerprint(),
+                    identity=self._held[-1][2],
+                )
+                return self._location
+            except Exception:
+                try:
+                    self.close()
+                except WorkspaceUnavailable:
+                    pass
+                raise WorkspaceUnavailable(_FAILURE) from None
+
+    def reserve(
+        self, location: WorkspaceLocation | None = None
+    ) -> WorkspaceReservation:
         with self._lock:
             if self._used or self._closed:
                 raise WorkspaceUnavailable(_FAILURE)
@@ -263,20 +289,22 @@ class WindowsWorkspaceReservation:
                 target = root + "\\" + directory_name
                 if len(target) >= 260:
                     raise WorkspaceUnavailable(_FAILURE)
-                self._kernel = _load_kernel()
-                self._bind()
-                paths = [root[:3]]
-                for part in root[3:].split("\\"):
-                    paths.append(paths[-1].rstrip("\\") + "\\" + part)
-                held = [(path, *self._open_directory(path)) for path in paths]
+                # The low-level convenience call remains useful for isolated fixtures.
+                # The application port always supplies the newly journaled location.
+                if location is None:
+                    location = self._location if self._prepared else self.prepare()
+                if (
+                    not isinstance(location, WorkspaceLocation)
+                    or location != self._location
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                self._recheck_root()
                 if not self._native().CreateDirectoryW(target, None):
                     raise WorkspaceUnavailable(_FAILURE)
                 handle, identity = self._open_directory(target)
-                held.append((target, handle, identity))
+                self._held.append((target, handle, identity))
                 self._empty(target)
-                for path, current, previous in held:
-                    if self._verify(current, path) != previous:
-                        raise WorkspaceUnavailable(_FAILURE)
+                self._recheck_root()
                 return WorkspaceReservation(
                     binding=self._binding,
                     directory_name=directory_name,

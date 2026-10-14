@@ -14,6 +14,10 @@ from devrelay.application.contracts.claims import (
     WorkerClaimRequest,
 )
 from devrelay.application.contracts.executions import WorkerExecutionIntent
+from devrelay.application.contracts.workspace_recovery import (
+    WorkerWorkspaceCompletion,
+    WorkerWorkspaceIntent,
+)
 from devrelay.domain.jobs.values import _utc, _uuid
 
 
@@ -212,6 +216,9 @@ class WorkerRecoveryState:
     pending_heartbeat: WorkerHeartbeatIntent | None = None
     last_heartbeat: WorkerHeartbeatIntent | None = None
     execution: WorkerExecutionIntent | None = None
+    workspace_intent: WorkerWorkspaceIntent | None = None
+    workspace_completion: WorkerWorkspaceCompletion | None = None
+    workspace_history_unknown: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, WorkerRecoveryPhase):
@@ -278,6 +285,31 @@ class WorkerRecoveryState:
         ):
             raise ValueError(
                 "Execution preparation requires the original completed acknowledgement."
+            )
+        if type(self.workspace_history_unknown) is not bool or (
+            self.workspace_history_unknown
+            and (
+                self.execution is None
+                or self.workspace_intent is not None
+                or self.workspace_completion is not None
+            )
+        ):
+            raise ValueError(
+                "Unknown workspace history requires retained execution only."
+            )
+        if self.workspace_intent is not None and (
+            not isinstance(self.workspace_intent, WorkerWorkspaceIntent)
+            or self.execution is None
+            or self.workspace_intent.execution != self.execution
+        ):
+            raise ValueError("Workspace preparation requires original execution input.")
+        if self.workspace_completion is not None and (
+            not isinstance(self.workspace_completion, WorkerWorkspaceCompletion)
+            or self.workspace_intent is None
+            or self.workspace_completion.intent != self.workspace_intent
+        ):
+            raise ValueError(
+                "Workspace completion requires original preparation input."
             )
         for heartbeat in (self.pending_heartbeat, self.last_heartbeat):
             if heartbeat is None:

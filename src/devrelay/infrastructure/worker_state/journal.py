@@ -22,6 +22,11 @@ from devrelay.application.contracts.worker_recovery import (
     WorkerRecoveryState,
 )
 from devrelay.application.contracts.workers import WorkerJournalScope
+from devrelay.application.contracts.workspace_recovery import (
+    WorkerWorkspaceCompletion,
+    WorkerWorkspaceIntent,
+    WorkspacePreparationDecision,
+)
 from devrelay.application.ports.worker_journal import (
     ProofProtector,
     WorkerStateUnavailable,
@@ -30,7 +35,6 @@ from devrelay.infrastructure.worker_state.acknowledgements import save_acknowled
 from devrelay.infrastructure.worker_state.completions import save_completion
 from devrelay.infrastructure.worker_state.executions import save_execution
 from devrelay.infrastructure.worker_state.heartbeats import (
-    bind_heartbeats,
     save_heartbeat,
 )
 from devrelay.infrastructure.worker_state.outcomes import (
@@ -39,6 +43,11 @@ from devrelay.infrastructure.worker_state.outcomes import (
     save_assignment,
     save_no_work,
     upgrade_outcome_schema,
+)
+from devrelay.infrastructure.worker_state.workspaces import (
+    bind_workspace_state,
+    save_workspace_completion,
+    save_workspace_intent,
 )
 
 _FAILURE = "Worker recovery journal is unavailable."
@@ -115,12 +124,13 @@ class SqliteClaimStore:
                 (3, scope.key),
                 (4, scope.key),
                 (5, scope.key),
+                (6, scope.key),
             ):
                 state = recovery_state(
                     connection, self._scope, self._read_request(), allow_legacy=True
                 )
                 upgrade_outcome_schema(connection, scope, state)
-            elif existing != (6, scope.key):
+            elif existing != (7, scope.key):
                 raise WorkerStateUnavailable(_FAILURE)
             self._read_state()
             connection.execute("COMMIT")
@@ -466,7 +476,7 @@ class SqliteClaimStore:
                 save_completion(
                     connection, self._scope, state.request, state.assignment, completion
                 )
-                bind_heartbeats(
+                bind_workspace_state(
                     connection, self._scope, state.request, state.assignment, completion
                 )
             result = self._read_state()
@@ -562,6 +572,106 @@ class SqliteClaimStore:
             self._rollback()
             raise WorkerStateUnavailable(_FAILURE) from None
 
+    def _workspace_state(self, request: WorkerClaimRequest) -> WorkerRecoveryState:
+        state = self._read_state()
+        if (
+            not isinstance(request, WorkerClaimRequest)
+            or state.phase is not WorkerRecoveryPhase.ACKNOWLEDGED
+            or state.request is None
+            or state.completion is None
+            or state.execution is None
+            or request.claim_request_id != state.request.claim_request_id
+            or request.protocol_version != state.request.protocol_version
+        ):
+            raise ClaimReplayConflict(
+                "Workspace requires completed original execution."
+            )
+        verifier = LeaseProofVerifier.from_proof(
+            worker_id=self._scope.worker_id,
+            claim_request_id=state.request.claim_request_id,
+            proof=state.request.proof,
+        )
+        if not verifier.matches(
+            request.proof,
+            worker_id=self._scope.worker_id,
+            claim_request_id=request.claim_request_id,
+        ):
+            raise ClaimReplayConflict("Workspace conflicts with original proof.")
+        return state
+
+    def get_or_create_workspace(
+        self, request: WorkerClaimRequest, candidate: WorkerWorkspaceIntent
+    ) -> WorkspacePreparationDecision:
+        connection = self._open()
+        try:
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._workspace_state(request)
+            if state.workspace_history_unknown:
+                raise ClaimReplayConflict("Historical workspace state is uncertain.")
+            if (
+                not isinstance(candidate, WorkerWorkspaceIntent)
+                or candidate.execution != state.execution
+            ):
+                raise ClaimReplayConflict("Workspace changed original execution input.")
+            if state.workspace_intent is not None:
+                state.workspace_intent.require_same_input(candidate)
+                result = WorkspacePreparationDecision(
+                    intent=state.workspace_intent, created=False
+                )
+            else:
+                save_workspace_intent(connection, candidate)
+                self._bind_heartbeat_state(state)
+                saved = self._read_state().workspace_intent
+                if saved is None:
+                    raise WorkerStateUnavailable(_FAILURE)
+                result = WorkspacePreparationDecision(intent=saved, created=True)
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
+    def record_workspace_completion(
+        self, request: WorkerClaimRequest, completion: WorkerWorkspaceCompletion
+    ) -> WorkerWorkspaceCompletion:
+        connection = self._open()
+        try:
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._workspace_state(request)
+            if (
+                not isinstance(completion, WorkerWorkspaceCompletion)
+                or state.workspace_intent != completion.intent
+            ):
+                raise ClaimReplayConflict(
+                    "Workspace completion changed original intent."
+                )
+            if state.workspace_completion is not None:
+                if state.workspace_completion != completion:
+                    raise ClaimReplayConflict(
+                        "Workspace completion changed recorded identity."
+                    )
+                result = state.workspace_completion
+            else:
+                save_workspace_completion(connection, completion)
+                self._bind_heartbeat_state(state)
+                saved = self._read_state().workspace_completion
+                if saved is None:
+                    raise WorkerStateUnavailable(_FAILURE)
+                result = saved
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
     def _bind_heartbeat_state(self, state: WorkerRecoveryState) -> None:
         if (
             state.request is None
@@ -569,7 +679,7 @@ class SqliteClaimStore:
             or state.completion is None
         ):
             raise WorkerStateUnavailable(_FAILURE)
-        bind_heartbeats(
+        bind_workspace_state(
             self._open(), self._scope, state.request, state.assignment, state.completion
         )
 
@@ -702,6 +812,29 @@ class AsyncClaimJournal:
                 raise WorkerStateUnavailable(_FAILURE)
             return await asyncio.get_running_loop().run_in_executor(
                 self._executor, self._store.get_or_create_execution, request, candidate
+            )
+
+    async def get_or_create_workspace(
+        self, request: WorkerClaimRequest, candidate: WorkerWorkspaceIntent
+    ) -> WorkspacePreparationDecision:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.get_or_create_workspace, request, candidate
+            )
+
+    async def record_workspace_completion(
+        self, request: WorkerClaimRequest, completion: WorkerWorkspaceCompletion
+    ) -> WorkerWorkspaceCompletion:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                self._store.record_workspace_completion,
+                request,
+                completion,
             )
 
     async def record_heartbeat(

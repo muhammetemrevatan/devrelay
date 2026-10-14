@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 
+from devrelay.application.contracts.workspace_recovery import WorkspaceLocation
 from devrelay.application.contracts.workspaces import (
     WorkspaceBinding,
     WorkspaceReservation,
@@ -23,7 +24,9 @@ class WindowsWorkspaceScope:
         self._native = native
         self._executor = executor
         self._closed = False
-        self._started = False
+        self._preparation_started = False
+        self._reservation_started = False
+        self._location: WorkspaceLocation | None = None
 
     @property
     def binding(self) -> WorkspaceBinding:
@@ -32,12 +35,33 @@ class WindowsWorkspaceScope:
     def stop_admission(self) -> None:
         self._closed = True
 
-    async def reserve(self) -> WorkspaceReservation:
-        if self._closed or self._started:
+    async def prepare(self) -> WorkspaceLocation:
+        if self._closed or self._preparation_started:
             raise WorkspaceUnavailable("Workspace reservation is unavailable.")
-        self._started = True
+        self._preparation_started = True
         future = asyncio.get_running_loop().run_in_executor(
-            self._executor, self._native.reserve
+            self._executor, self._native.prepare
+        )
+        future.add_done_callback(
+            lambda done: None if done.cancelled() else done.exception()
+        )
+        location = await asyncio.shield(future)
+        if not isinstance(location, WorkspaceLocation) or self._closed:
+            raise WorkspaceUnavailable("Workspace location is unavailable.")
+        self._location = location
+        return location
+
+    async def reserve(self, location: WorkspaceLocation) -> WorkspaceReservation:
+        if (
+            self._closed
+            or self._reservation_started
+            or self._location is None
+            or location != self._location
+        ):
+            raise WorkspaceUnavailable("Workspace reservation is unavailable.")
+        self._reservation_started = True
+        future = asyncio.get_running_loop().run_in_executor(
+            self._executor, self._native.reserve, location
         )
         future.add_done_callback(
             lambda done: None if done.cancelled() else done.exception()

@@ -1,6 +1,7 @@
 import ctypes
 import sys
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -206,6 +207,60 @@ def test_policy_accepts_adjacent_prefix_and_independent_drive() -> None:
     )
 
     assert value.root_directory == "C:\\work"
+
+
+def test_prepare_retains_root_without_creating_execution_directory(
+    kernel: Kernel, policy: windows.WindowsWorkspacePolicy
+) -> None:
+    resource = windows.WindowsWorkspaceReservation(workspace_binding(), policy)
+
+    location = resource.prepare()
+
+    assert kernel.created == []
+    assert location.root_directory == policy.root_directory
+    assert location.identity.file_index == max(kernel.paths)
+    assert kernel.closed == []
+
+
+@pytest.mark.parametrize(
+    "field,value", [("root_directory", "C:\\different"), ("policy_digest", "b" * 64)]
+)
+def test_reserve_rejects_changed_precreation_location(
+    kernel: Kernel, policy: windows.WindowsWorkspacePolicy, field: str, value: str
+) -> None:
+    resource = windows.WindowsWorkspaceReservation(workspace_binding(), policy)
+    location = resource.prepare()
+    changes: dict[str, Any] = {field: value}
+    changed = replace(location, **changes)
+
+    with pytest.raises(WorkspaceUnavailable):
+        resource.reserve(changed)
+
+    assert kernel.created == []
+
+
+def test_reserve_rechecks_root_reparse_state_before_mkdir(
+    kernel: Kernel, policy: windows.WindowsWorkspacePolicy
+) -> None:
+    resource = windows.WindowsWorkspaceReservation(workspace_binding(), policy)
+    location = resource.prepare()
+    kernel.damage = "reparse"
+
+    with pytest.raises(WorkspaceUnavailable):
+        resource.reserve(location)
+
+    assert kernel.created == []
+
+
+def test_policy_digest_binds_protected_namespace_configuration() -> None:
+    original = windows.WindowsWorkspacePolicy(
+        root_directory="C:\\work", protected_directories=("C:\\private",)
+    )
+    changed = replace(original, protected_directories=("C:\\other-private",))
+
+    original_digest, changed_digest = original.fingerprint(), changed.fingerprint()
+
+    assert original_digest != changed_digest
 
 
 def test_reservation_checks_and_retains_all_ancestors_and_exact_uuid_directory(
