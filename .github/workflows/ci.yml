@@ -82,6 +82,7 @@ jobs:
           curl --fail --silent --show-error --max-time 5 http://127.0.0.1:18000/health/live
           docker exec devrelay-control-smoke python -c "import importlib.util, os; from pathlib import Path; assert os.geteuid() == 10001; assert importlib.util.find_spec('pytest') is None; assert not Path('/app/src').exists(); assert not Path('/app/AGENTS.md').exists(); assert Path('/app/migrations/versions/0001_task_snapshots.py').is_file()"
           docker exec devrelay-control-smoke python -c "from devrelay.application.worker_workspaces import RecoverAssignedWorkspace, ReserveAssignedWorkspace; from devrelay.bootstrap.workspaces import open_worker_workspace; from devrelay.infrastructure.worker_state.workspaces import workspace_integrity; from devrelay.infrastructure.workspace.windows import WindowsWorkspaceReservation; assert RecoverAssignedWorkspace and ReserveAssignedWorkspace and open_worker_workspace and workspace_integrity and WindowsWorkspaceReservation"
+          docker exec devrelay-control-smoke python -c "from devrelay.application.materialize_base import MaterializeAssignedBase; from devrelay.application.contracts.base_sources import BaseSourceSnapshot; from devrelay.bootstrap.github import open_github_base_source; from devrelay.infrastructure.github.base_source import GitHubBaseSource; assert MaterializeAssignedBase and BaseSourceSnapshot and open_github_base_source and GitHubBaseSource"
       - name: Show container diagnostics
         if: failure()
         run: docker logs devrelay-control-smoke || true

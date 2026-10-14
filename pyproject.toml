@@ -175,4 +175,6 @@ source_modules = ["devrelay.infrastructure.github"]
 forbidden_modules = [
     "devrelay.api", "devrelay.worker", "devrelay.bootstrap", "devrelay.config",
     "devrelay.infrastructure.persistence", "devrelay.infrastructure.jira", "sqlalchemy", "psycopg",
+    "devrelay.infrastructure.worker_state", "devrelay.infrastructure.worker_processes",
+    "devrelay.infrastructure.workspace",
 ]
