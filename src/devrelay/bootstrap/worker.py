@@ -8,10 +8,17 @@ from uuid import UUID
 
 import httpx
 
-from devrelay.application.contracts.workers import WorkerJournalScope
+from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
+from devrelay.application.contracts.claims import WorkerClaimRequest
+from devrelay.application.contracts.workers import (
+    WorkerAuthorization,
+    WorkerJournalScope,
+)
+from devrelay.application.ports.base_source import BaseSourcePort
 from devrelay.application.ports.worker_journal import WorkerStateUnavailable
 from devrelay.application.worker_claims import PrepareWorkerClaim, RequestWorkerClaim
 from devrelay.config.worker import WorkerSettings
+from devrelay.infrastructure.control.base_sources import HttpControlBaseSource
 from devrelay.infrastructure.control.gateway import HttpControlGateway
 from devrelay.infrastructure.worker_state.clock import WindowsLeaseClock
 from devrelay.infrastructure.worker_state.journal import (
@@ -27,6 +34,7 @@ async def open_worker_claim_client(
     *,
     state_directory: Path,
     transport: httpx.AsyncBaseTransport | None = None,
+    source_transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[RequestWorkerClaim]:
     """Verify control identity before opening its journal; perform no claim on startup."""
     async with httpx.AsyncClient(
@@ -45,13 +53,40 @@ async def open_worker_claim_client(
             worker_id=authorization.worker_id,
             state_directory=state_directory,
         ) as preparation:
-            yield RequestWorkerClaim(
-                preparation,
-                gateway,
-                authorization,
-                heartbeat_gateway=gateway,
-                monotonic_clock=clock,
-            )
+            # A source response never occupies the claim/heartbeat connection.
+            async with httpx.AsyncClient(
+                base_url=str(settings.control_url),
+                headers={
+                    "Authorization": f"Bearer {settings.auth_token.get_secret_value()}"
+                },
+                follow_redirects=False,
+                trust_env=False,
+                limits=httpx.Limits(max_connections=1, max_keepalive_connections=1),
+                timeout=httpx.Timeout(90, connect=5, pool=1),
+                transport=source_transport,
+            ) as source_client:
+
+                async def bind_source(
+                    request: WorkerClaimRequest,
+                    current: WorkerAuthorization,
+                    delivery: AssignmentDelivery,
+                ) -> BaseSourcePort:
+                    return await asyncio.to_thread(
+                        HttpControlBaseSource,
+                        source_client,
+                        request,
+                        current,
+                        delivery,
+                    )
+
+                yield RequestWorkerClaim(
+                    preparation,
+                    gateway,
+                    authorization,
+                    heartbeat_gateway=gateway,
+                    monotonic_clock=clock,
+                    base_source_binding=bind_source,
+                )
 
 
 def validate_worker_configuration(env_file: Path | None = None) -> None:

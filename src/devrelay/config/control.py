@@ -12,6 +12,7 @@ from devrelay.config.logging import LogLevel
 from devrelay.config.repositories import RepositorySettings
 from devrelay.config.task_import import TaskImportSettings
 from devrelay.config.worker_authentication import WorkerRegistrationSettings
+from devrelay.config.worker_base_sources import WorkerBaseSourcesSettings
 from devrelay.config.worker_claims import WorkerClaimsSettings
 
 
@@ -42,6 +43,13 @@ class ControlSettings(BaseSettings):
     repositories: tuple[RepositorySettings, ...] = Field(default=(), max_length=32)
     workers: tuple[WorkerRegistrationSettings, ...] = Field(default=(), max_length=32)
     worker_claims: WorkerClaimsSettings | None = None
+    worker_base_sources: WorkerBaseSourcesSettings | None = None
+
+    @model_validator(mode="after")
+    def require_base_source_claims(self) -> ControlSettings:
+        if self.worker_base_sources is not None and self.worker_claims is None:
+            raise ValueError("Worker base sources require explicitly enabled claims.")
+        return self
 
     @model_validator(mode="after")
     def require_claim_integrations(self) -> ControlSettings:
