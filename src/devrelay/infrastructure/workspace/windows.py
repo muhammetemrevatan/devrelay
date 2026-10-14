@@ -3,9 +3,14 @@ import hashlib
 import json
 import sys
 from dataclasses import dataclass
-from threading import RLock
+from threading import Event, RLock
 from typing import cast
 
+from devrelay.application.contracts.base_sources import (
+    BaseMaterialization,
+    BaseSourceFile,
+    BaseSourceSnapshot,
+)
 from devrelay.application.contracts.workspace_recovery import (
     WorkspaceLocation,
     canonical_workspace_path,
@@ -137,10 +142,28 @@ class WindowsWorkspaceReservation:
         self._kernel: ctypes.CDLL | None = None
         self._location: WorkspaceLocation | None = None
         self._held: list[tuple[str, int, WorkspaceDirectoryIdentity]] = []
+        self._reservation: WorkspaceReservation | None = None
+        self._materialization_used = False
+        self._materialization_sealed = Event()
 
     @property
     def binding(self) -> WorkspaceBinding:
         return self._binding
+
+    @property
+    def reservation(self) -> WorkspaceReservation | None:
+        return self._reservation
+
+    @property
+    def location(self) -> WorkspaceLocation | None:
+        return self._location
+
+    def seal_materialization(self) -> None:
+        self._materialization_sealed.set()
+
+    def _check_materialization(self) -> None:
+        if self._materialization_sealed.is_set() or self._closed:
+            raise WorkspaceUnavailable(_FAILURE)
 
     def _native(self) -> ctypes.CDLL:
         if self._kernel is None:
@@ -180,12 +203,15 @@ class WindowsWorkspaceReservation:
             function = getattr(self._native(), name)
             function.argtypes, function.restype = args, result
 
-    def _verify(self, handle: int, path: str) -> WorkspaceDirectoryIdentity:
+    def _verify(
+        self, handle: int, path: str, *, directory: bool = True
+    ) -> WorkspaceDirectoryIdentity:
         native = self._native()
         information, flags = _FileInformation(), _DWORD()
         if not native.GetFileInformationByHandle(handle, ctypes.byref(information)) or (
-            not information.dwFileAttributes & 0x10
+            bool(information.dwFileAttributes & 0x10) != directory
             or information.dwFileAttributes & 0x400
+            or (not directory and information.nNumberOfLinks != 1)
         ):
             raise WorkspaceUnavailable(_FAILURE)
         if (
@@ -305,11 +331,12 @@ class WindowsWorkspaceReservation:
                 self._held.append((target, handle, identity))
                 self._empty(target)
                 self._recheck_root()
-                return WorkspaceReservation(
+                self._reservation = WorkspaceReservation(
                     binding=self._binding,
                     directory_name=directory_name,
                     identity=identity,
                 )
+                return self._reservation
             except Exception:
                 try:
                     self.close()
@@ -317,7 +344,254 @@ class WindowsWorkspaceReservation:
                     pass
                 raise WorkspaceUnavailable(_FAILURE) from None
 
+    def verify_reservation(self, reservation: WorkspaceReservation) -> None:
+        with self._lock:
+            try:
+                self._check_materialization()
+                if (
+                    not isinstance(reservation, WorkspaceReservation)
+                    or reservation is not self._reservation
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                self._recheck_root()
+                target = self._policy.root_directory + "\\" + reservation.directory_name
+                if not any(
+                    path == target and identity == reservation.identity
+                    for path, handle, identity in self._held
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                self._empty(target)
+                self._check_materialization()
+            except Exception:
+                self.seal_materialization()
+                raise WorkspaceUnavailable(_FAILURE) from None
+
+    def _bind_materialization(self) -> None:
+        pointer = ctypes.POINTER
+        for name, args, result in (
+            (
+                "WriteFile",
+                [_HANDLE, ctypes.c_void_p, _DWORD, pointer(_DWORD), ctypes.c_void_p],
+                _BOOL,
+            ),
+            (
+                "ReadFile",
+                [_HANDLE, ctypes.c_void_p, _DWORD, pointer(_DWORD), ctypes.c_void_p],
+                _BOOL,
+            ),
+            ("FlushFileBuffers", [_HANDLE], _BOOL),
+            (
+                "SetFilePointerEx",
+                [_HANDLE, ctypes.c_int64, ctypes.c_void_p, _DWORD],
+                _BOOL,
+            ),
+        ):
+            function = getattr(self._native(), name)
+            function.argtypes, function.restype = args, result
+
+    def _write_file(
+        self, target: str, item: BaseSourceFile
+    ) -> tuple[int, WorkspaceDirectoryIdentity]:
+        self._check_materialization()
+        native = self._native()
+        handle = native.CreateFileW(target, 0xC0000000, 1, None, 1, 0x00200080, None)
+        if type(handle) is not int or not 0 < handle < _INVALID_HANDLE:
+            raise WorkspaceUnavailable(_FAILURE)
+        self._handles.append(handle)
+        identity = self._verify(handle, target, directory=False)
+        for offset in range(0, len(item.content), 64 * 1024):
+            self._check_materialization()
+            chunk = item.content[offset : offset + 64 * 1024]
+            buffer, written = ctypes.create_string_buffer(chunk), _DWORD()
+            if not native.WriteFile(
+                handle, buffer, len(chunk), ctypes.byref(written), None
+            ) or written.value != len(chunk):
+                raise WorkspaceUnavailable(_FAILURE)
+            self._check_materialization()
+        self._check_materialization()
+        if not native.FlushFileBuffers(handle):
+            raise WorkspaceUnavailable(_FAILURE)
+        self._verify_file_bytes(handle, target, item, identity)
+        return handle, identity
+
+    def _verify_file_bytes(
+        self,
+        handle: int,
+        target: str,
+        item: BaseSourceFile,
+        identity: WorkspaceDirectoryIdentity,
+    ) -> None:
+        self._check_materialization()
+        native, information = self._native(), _FileInformation()
+        if not native.GetFileInformationByHandle(handle, ctypes.byref(information)) or (
+            (information.nFileSizeHigh << 32) | information.nFileSizeLow
+        ) != len(item.content):
+            raise WorkspaceUnavailable(_FAILURE)
+        if not native.SetFilePointerEx(handle, 0, None, 0):
+            raise WorkspaceUnavailable(_FAILURE)
+        digest = hashlib.sha256()
+        for offset in range(0, len(item.content), 64 * 1024):
+            self._check_materialization()
+            expected = item.content[offset : offset + 64 * 1024]
+            buffer, read = ctypes.create_string_buffer(len(expected)), _DWORD()
+            if not native.ReadFile(
+                handle, buffer, len(expected), ctypes.byref(read), None
+            ) or read.value != len(expected):
+                raise WorkspaceUnavailable(_FAILURE)
+            actual = buffer.raw
+            if actual != expected:
+                raise WorkspaceUnavailable(_FAILURE)
+            digest.update(actual)
+        buffer, read = ctypes.create_string_buffer(1), _DWORD()
+        self._check_materialization()
+        if (
+            not native.ReadFile(handle, buffer, 1, ctypes.byref(read), None)
+            or read.value != 0
+        ):
+            raise WorkspaceUnavailable(_FAILURE)
+        if (
+            digest.hexdigest() != hashlib.sha256(item.content).hexdigest()
+            or self._verify(handle, target, directory=False) != identity
+        ):
+            raise WorkspaceUnavailable(_FAILURE)
+        self._check_materialization()
+
+    def _verify_tree(self, target: str, nodes: dict[str, bool]) -> None:
+        native = self._native()
+        directories = [""] + sorted(
+            path for path, directory in nodes.items() if directory
+        )
+        observed: dict[str, bool] = {}
+        for directory in directories:
+            self._check_materialization()
+            prefix = directory + "/" if directory else ""
+            expected = {
+                path: kind
+                for path, kind in nodes.items()
+                if path.startswith(prefix) and "/" not in path[len(prefix) :]
+            }
+            data = _FindData()
+            absolute = target + (
+                "\\" + directory.replace("/", "\\") if directory else ""
+            )
+            handle = native.FindFirstFileW(absolute + "\\*", ctypes.byref(data))
+            if handle == _INVALID_HANDLE:
+                if native.GetLastError() != 2 or expected:
+                    raise WorkspaceUnavailable(_FAILURE)
+                continue
+            if type(handle) is not int or not 0 < handle < _INVALID_HANDLE:
+                raise WorkspaceUnavailable(_FAILURE)
+            self._find_handles.append(handle)
+            names: set[str] = set()
+            for _ in range(len(expected) + 3):
+                self._check_materialization()
+                units = list(data.cFileName)
+                if 0 not in units:
+                    raise WorkspaceUnavailable(_FAILURE)
+                raw = bytes(data.cFileName)[: units.index(0) * 2]
+                name = raw.decode("utf-16-le")
+                if name in names:
+                    raise WorkspaceUnavailable(_FAILURE)
+                names.add(name)
+                if name not in (".", ".."):
+                    path = prefix + name
+                    kind = bool(data.dwFileAttributes & 0x10)
+                    if (
+                        data.dwFileAttributes & 0x400
+                        or path not in expected
+                        or kind != expected[path]
+                    ):
+                        raise WorkspaceUnavailable(_FAILURE)
+                    observed[path] = kind
+                if not native.FindNextFileW(handle, ctypes.byref(data)):
+                    if native.GetLastError() != 18:
+                        raise WorkspaceUnavailable(_FAILURE)
+                    if not native.FindClose(handle):
+                        raise WorkspaceUnavailable(_FAILURE)
+                    self._find_handles.remove(handle)
+                    break
+            else:
+                raise WorkspaceUnavailable(_FAILURE)
+        if observed != nodes:
+            raise WorkspaceUnavailable(_FAILURE)
+
+    def materialize(
+        self, reservation: WorkspaceReservation, snapshot: BaseSourceSnapshot
+    ) -> BaseMaterialization:
+        with self._lock:
+            if self._materialization_used:
+                raise WorkspaceUnavailable(_FAILURE)
+            self._materialization_used = True
+            try:
+                self._check_materialization()
+                if not isinstance(snapshot, BaseSourceSnapshot):
+                    raise WorkspaceUnavailable(_FAILURE)
+                snapshot.validate()
+                self._binding.__post_init__()
+                target = self._policy.root_directory + "\\" + reservation.directory_name
+                nodes: dict[str, bool] = {}
+                for item in snapshot.files:
+                    parts = item.path.split("/")
+                    for index in range(1, len(parts) + 1):
+                        relative = "/".join(parts[:index])
+                        if (
+                            len(
+                                (target + "\\" + relative.replace("/", "\\")).encode(
+                                    "utf-16-le"
+                                )
+                            )
+                            // 2
+                            >= 260
+                        ):
+                            raise WorkspaceUnavailable(_FAILURE)
+                        nodes[relative] = index < len(parts)
+                if any(
+                    check.working_directory != "."
+                    and not nodes.get(check.working_directory, False)
+                    for check in self._binding.definition.checks
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                result = BaseMaterialization(
+                    reservation=reservation,
+                    source=snapshot.request,
+                    root_tree_sha=snapshot.root_tree_sha,
+                    manifest_digest=snapshot.fingerprint(),
+                    file_count=len(snapshot.files),
+                    total_bytes=sum(len(item.content) for item in snapshot.files),
+                )
+                self.verify_reservation(reservation)
+                self._bind_materialization()
+                for relative in sorted(
+                    (path for path, directory in nodes.items() if directory),
+                    key=lambda path: (path.count("/"), path),
+                ):
+                    self._check_materialization()
+                    path = target + "\\" + relative.replace("/", "\\")
+                    if not self._native().CreateDirectoryW(path, None):
+                        raise WorkspaceUnavailable(_FAILURE)
+                    handle, identity = self._open_directory(path)
+                    self._held.append((path, handle, identity))
+                files: list[
+                    tuple[str, int, WorkspaceDirectoryIdentity, BaseSourceFile]
+                ] = []
+                for item in snapshot.files:
+                    self._check_materialization()
+                    path = target + "\\" + item.path.replace("/", "\\")
+                    handle, identity = self._write_file(path, item)
+                    files.append((path, handle, identity, item))
+                self._recheck_root()
+                self._verify_tree(target, nodes)
+                for path, handle, identity, item in files:
+                    self._verify_file_bytes(handle, path, item, identity)
+                self._recheck_root()
+                self._check_materialization()
+                return result
+            except Exception:
+                self.seal_materialization()
+                raise WorkspaceUnavailable(_FAILURE) from None
+
     def close(self) -> None:
+        self.seal_materialization()
         with self._lock:
             self._closed = True
             failed = False

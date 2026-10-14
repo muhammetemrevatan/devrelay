@@ -583,6 +583,42 @@ provide no Git/base provenance, denied-read sandbox, hostile same-user mutation
 protection or proof that work has stopped. Protected paths are trusted namespace
 configuration, not ACL verification. Codex launch and the worker CLI remain disabled.
 
+## Pinned base file materialization
+
+The composed worker exposes explicit `materialize_base(delivery, workspace,
+reservation, source)` after protected workspace preparation. It requires the
+actual same-process reservation, original ACK/execution/full definition and
+completed version-7 workspace history. Historical recovery cannot supply live
+handles or authorize reuse. Heartbeat supervision remains independent while the
+operation checks its retained authority before and after each awaited step.
+The retained client admits one materialization request before any source read;
+duplicate or concurrent calls fail without disrupting the original operation.
+
+`GitHubBaseSource` is a trusted broker-side reader. It constructs bounded,
+fixed-host GETs for the accepted full SHA-1 commit, nonrecursive trees and blobs,
+checks configured numeric repository identity before and after export, and
+verifies raw Git tree and blob hashes. Commit identity relies on the authenticated
+provider response; raw-commit/signature verification is not provided. Redirects,
+truncated trees, symlinks, submodules, LFS pointers and exhausted limits fail closed.
+Provider credentials stay with trusted broker resources. A scoped authenticated
+broker-to-worker delivery route remains to be implemented; the integration test
+composes a provider fixture with real Windows journal/filesystem resources.
+
+The complete manifest is checked before writes for bounded paths/bytes, DOS path
+ambiguities, Unicode casefold collisions, file/directory conflicts and accepted
+check directories. The native adapter uses one admission, CREATE_NEW files,
+retained noninheritable handles, native identities, bounded byte reads/writes and
+exact final directory enumeration. Native creation also refuses filesystem aliases
+not caught by the portable manifest checks. Cancellation, lease loss or failure
+seals further writes; partial files remain and cannot be retried or adopted.
+Cleanup closes handles after native work settles without deleting directories.
+
+This exports literal file bytes, including binary files. It creates no `.git`
+metadata, runs no hooks/filters/checks and supplies neither a full Git checkout nor
+durable materialization recovery. The configured root is a trusted namespace,
+not hostile same-user isolation. Broker delivery, Git metadata/reconciliation,
+credential isolation and Codex launch remain gates before agent execution.
+
 ## Control acknowledgement persistence
 
 `AcknowledgeAssignedJob` recovers only the authenticated original assignment,

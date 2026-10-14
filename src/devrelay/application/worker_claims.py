@@ -12,6 +12,10 @@ from devrelay.application.contracts.assignment_delivery import (
     AssignmentDelivery,
     AssignmentUnavailable,
 )
+from devrelay.application.contracts.base_sources import (
+    BaseMaterialization,
+    BaseMaterializationPolicy,
+)
 from devrelay.application.contracts.claims import (
     ClaimReplayConflict,
     LeaseProof,
@@ -36,6 +40,9 @@ from devrelay.application.contracts.worker_recovery import (
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.contracts.workspace_recovery import WorkspaceRecovery
 from devrelay.application.contracts.workspaces import WorkspaceReservation
+from devrelay.application.materialize_base import MaterializeAssignedBase
+from devrelay.application.ports.base_materialization import BaseMaterializationPort
+from devrelay.application.ports.base_source import BaseSourcePort
 from devrelay.application.ports.control_gateway import (
     ControlClaimRejected,
     ControlGateway,
@@ -50,13 +57,18 @@ from devrelay.application.ports.worker_journal import (
     WorkerStateUnavailable,
 )
 from devrelay.application.ports.worker_workspace_journal import WorkerWorkspaceJournal
-from devrelay.application.ports.workspace_reservation import WorkspaceReservationPort
+from devrelay.application.ports.workspace_reservation import (
+    WorkspaceReservationPort,
+    WorkspaceUnavailable,
+)
 from devrelay.application.worker_executions import PrepareAssignedExecution
 from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSupervisor
 from devrelay.application.worker_workspaces import (
     RecoverAssignedWorkspace,
     ReserveAssignedWorkspace,
 )
+
+_DEFAULT_MATERIALIZATION_POLICY = BaseMaterializationPolicy()
 
 
 class PrepareWorkerClaim:
@@ -74,6 +86,7 @@ class PrepareWorkerClaim:
         self._heartbeat_journal = heartbeat_journal
         self._execution_journal = execution_journal
         self._workspace_journal = workspace_journal
+        self._base_materialization_started = False
 
     async def reserve_workspace(
         self,
@@ -93,6 +106,27 @@ class PrepareWorkerClaim:
         if self._workspace_journal is None:
             raise WorkerStateUnavailable("Workspace recovery is not configured.")
         return await RecoverAssignedWorkspace(self._workspace_journal).execute(delivery)
+
+    async def materialize_base(
+        self,
+        delivery: AssignmentDelivery,
+        supervisor: HeartbeatSupervisor,
+        workspace: BaseMaterializationPort,
+        reservation: WorkspaceReservation,
+        source: BaseSourcePort,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> BaseMaterialization:
+        if self._workspace_journal is None:
+            raise WorkerStateUnavailable("Workspace recovery is not configured.")
+        if self._base_materialization_started:
+            raise WorkspaceUnavailable(
+                "Base materialization has already been requested."
+            )
+        self._base_materialization_started = True
+        return await MaterializeAssignedBase(
+            self._workspace_journal, source, workspace, supervisor, policy
+        ).execute(delivery, reservation)
 
     async def prepare_execution(
         self,
@@ -212,6 +246,27 @@ class RequestWorkerClaim:
             raise WorkerStateBusy("A worker claim exchange is already active.")
         async with self._lock:
             return await self._preparation.recover_workspace(delivery)
+
+    async def materialize_base(
+        self,
+        delivery: AssignmentDelivery,
+        workspace: BaseMaterializationPort,
+        reservation: WorkspaceReservation,
+        source: BaseSourcePort,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> BaseMaterialization:
+        # Preparation and the live scope each bound materialization admission.
+        # Keep heartbeat exchange free
+        # to renew authority while the separately fenced export is in progress.
+        return await self._preparation.materialize_base(
+            delivery,
+            self.heartbeat_supervisor(),
+            workspace,
+            reservation,
+            source,
+            policy=policy,
+        )
 
     async def prepare_execution(
         self, delivery: AssignmentDelivery, policy: ExecutionPolicy

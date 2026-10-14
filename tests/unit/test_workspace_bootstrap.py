@@ -30,6 +30,7 @@ class NativeState:
     block_initialize: bool = False
     block_reserve: bool = False
     block_prepare: bool = False
+    seals: int = 0
 
 
 @pytest.fixture
@@ -80,6 +81,9 @@ def native_state(monkeypatch: pytest.MonkeyPatch) -> Iterator[NativeState]:
         def close(self) -> None:
             state.calls.append("close")
             state.threads.append(threading.get_ident())
+
+        def seal_materialization(self) -> None:
+            state.seals += 1
 
     monkeypatch.setattr(bootstrap, "WindowsWorkspaceReservation", Native)
     try:
