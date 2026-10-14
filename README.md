@@ -601,8 +601,9 @@ verifies raw Git tree and blob hashes. Commit identity relies on the authenticat
 provider response; raw-commit/signature verification is not provided. Redirects,
 truncated trees, symlinks, submodules, LFS pointers and exhausted limits fail closed.
 Provider credentials stay with trusted broker resources. A scoped authenticated
-broker-to-worker delivery route remains to be implemented; the integration test
-composes a provider fixture with real Windows journal/filesystem resources.
+broker-to-worker delivery route is available behind the separate source gate below;
+integration tests compose provider fixtures with real Windows journal/filesystem
+resources. Real provider/account verification remains a separate deployment step.
 
 The complete manifest is checked before writes for bounded paths/bytes, DOS path
 ambiguities, Unicode casefold collisions, file/directory conflicts and accepted
@@ -616,8 +617,41 @@ Cleanup closes handles after native work settles without deleting directories.
 This exports literal file bytes, including binary files. It creates no `.git`
 metadata, runs no hooks/filters/checks and supplies neither a full Git checkout nor
 durable materialization recovery. The configured root is a trusted namespace,
-not hostile same-user isolation. Broker delivery, Git metadata/reconciliation,
+not hostile same-user isolation. Git metadata/reconciliation,
 credential isolation and Codex launch remain gates before agent execution.
+
+## Broker source delivery
+
+`DEVRELAY_CONTROL_WORKER_BASE_SOURCES` explicitly enables
+`POST /api/v1/worker/attempts/{attempt_id}/base-source` and requires worker claims.
+It is disabled by default. Requests use the enrolled worker token and original
+claim UUID/proof; they cannot select a repository, commit, blob URL or branch.
+The reader requires an acknowledged running Attempt and active current authority,
+derives full source pins from its immutable definition, and rechecks proof, scope,
+authority and original pins after provider work and response encoding. Database
+sessions close before network waits. Reads never claim, renew or release work.
+
+The source response carries original assignment and definition pins with a verified
+manifest and canonical base64 file bytes. Limits are 512 files, 2 MiB per file,
+8 MiB decoded total and 12 MiB JSON. Structural JSON allocation, paths, blob hashes
+and manifest digest are bounded and checked. One source admission is independent
+of claim/heartbeat admission; a canceled response retains encoder admission until
+its actual executor work settles. This is point-in-time authorization, not a
+transfer of a server lease deadline to the worker.
+
+The composed worker can call `materialize_base(delivery, workspace, reservation)`
+to use this channel. It binds the protected original input only after live workspace
+validation and admits one export before any fetch. Bootstrap owns a separate HTTP
+client so a long source response leaves the heartbeat connection free. Both clients
+use only the worker credential, verified HTTPS or the configured loopback tunnel,
+without redirects or environment proxies. GitHub credentials stay control-side.
+Current worker credentials and complete response pins are checked again before
+return, while retained heartbeat authority guards receipt and native staging.
+
+Fixture tests cover HTTP round trips into actual Windows protected workspaces,
+real separate loopback connections during heartbeat renewal, and disposable
+PostgreSQL expiry/recovery without changing durable state. No live integrations,
+automatic polling, Codex/check execution, Git history or restart reuse are enabled.
 
 ## Control acknowledgement persistence
 

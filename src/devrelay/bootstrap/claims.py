@@ -6,14 +6,19 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 
 from devrelay.application.acknowledgements import AcknowledgeAssignedJob
 from devrelay.application.assignment_delivery import ReadAssignedJob
+from devrelay.application.base_source_delivery import ReadAssignedBase
 from devrelay.application.claim_eligibility import PrepareJobClaim
 from devrelay.application.claims import ClaimJob
 from devrelay.application.contracts.assignments import ClaimLimits
+from devrelay.application.contracts.base_source_delivery import BASE_DELIVERY_LIMITS
 from devrelay.application.contracts.claims import LeaseProof
 from devrelay.application.contracts.heartbeats import HeartbeatLimits
 from devrelay.application.contracts.submissions import RepositoryPolicy
 from devrelay.application.heartbeats import HeartbeatAssignedJob
-from devrelay.bootstrap.github import open_github_repository_source
+from devrelay.bootstrap.github import (
+    open_github_base_source,
+    open_github_repository_source,
+)
 from devrelay.bootstrap.jira import open_jira_task_source
 from devrelay.bootstrap.jobs import repository_policy
 from devrelay.bootstrap.persistence import (
@@ -108,6 +113,28 @@ def job_heartbeater(
         raise ValueError("Heartbeats require explicitly enabled claims.")
     policies, proof_guard = _claim_configuration(settings)
     return HeartbeatAssignedJob(heartbeat_store(engine, policies, limits), proof_guard)
+
+
+@asynccontextmanager
+async def open_job_base_reader(
+    settings: ControlSettings,
+    engine: AsyncEngine,
+    *,
+    github_transport: httpx.AsyncBaseTransport | None = None,
+) -> AsyncIterator[ReadAssignedBase]:
+    """Read-only broker resource; the provider credential never leaves control."""
+    if settings.worker_base_sources is None or settings.worker_claims is None:
+        raise ValueError("Base delivery requires explicitly enabled source and claims.")
+    if settings.github is None:
+        raise ValueError("Base delivery requires configured GitHub identities.")
+    policies, proof_guard = _claim_configuration(settings)
+    async with open_github_base_source(
+        settings.github,
+        settings.repositories,
+        limits=BASE_DELIVERY_LIMITS,
+        transport=github_transport,
+    ) as source:
+        yield ReadAssignedBase(claim_store(engine, policies), source, proof_guard)
 
 
 @asynccontextmanager

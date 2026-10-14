@@ -36,6 +36,11 @@ from devrelay.application.jobs import (
     TaskNotReady,
     TaskRequirementsChanged,
 )
+from devrelay.application.ports.base_source import (
+    BaseSourceAccessDenied,
+    BaseSourceUnavailable,
+    InvalidBaseSourceData,
+)
 from devrelay.application.ports.job_persistence import JobPersistenceError
 from devrelay.application.ports.repository_source import (
     InvalidRepositorySourceData,
@@ -59,6 +64,10 @@ from devrelay.application.tasks import TaskImportRejected
 
 
 class ApiErrorCode(StrEnum):
+    BASE_SOURCE_BUSY = "base_source_busy"
+    BASE_SOURCE_UNAVAILABLE = "base_source_unavailable"
+    BASE_SOURCE_ACCESS_DENIED = "base_source_access_denied"
+    INVALID_BASE_SOURCE_DATA = "invalid_base_source_data"
     UNAUTHORIZED = "unauthorized"
     WORKER_UNAVAILABLE = "worker_unavailable"
     UNAVAILABLE = "import_unavailable"
@@ -137,6 +146,21 @@ class InvalidWorkerClaimRequest(Exception):
 
 
 _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
+    BaseSourceAccessDenied: (
+        502,
+        ApiErrorCode.BASE_SOURCE_ACCESS_DENIED,
+        "Base source access failed.",
+    ),
+    InvalidBaseSourceData: (
+        502,
+        ApiErrorCode.INVALID_BASE_SOURCE_DATA,
+        "Base source delivery could not be verified.",
+    ),
+    BaseSourceUnavailable: (
+        503,
+        ApiErrorCode.BASE_SOURCE_UNAVAILABLE,
+        "Base source delivery is unavailable.",
+    ),
     HeartbeatRejected: (
         409,
         ApiErrorCode.HEARTBEAT_REJECTED,

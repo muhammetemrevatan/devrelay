@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from devrelay.application.contracts.acknowledgements import (
 )
 from devrelay.application.contracts.assignment_delivery import AssignmentDelivery
 from devrelay.application.contracts.assignments import ClaimResult
+from devrelay.application.contracts.base_source_delivery import BaseSourceDelivery
 from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.application.contracts.heartbeats import HeartbeatRequest, HeartbeatResult
 from devrelay.application.contracts.submissions import (
@@ -49,6 +51,19 @@ type AcknowledgementOperation = Callable[
 type HeartbeatOperation = Callable[
     [HeartbeatRequest, WorkerAuthorization], Awaitable[HeartbeatResult]
 ]
+
+type BaseSourceOperation = Callable[
+    [UUID, WorkerClaimRequest, WorkerAuthorization], Awaitable[BaseSourceDelivery]
+]
+type BaseSourceVerification = Callable[
+    [UUID, WorkerClaimRequest, WorkerAuthorization, BaseSourceDelivery], Awaitable[None]
+]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BaseSourceOperations:
+    read_base: BaseSourceOperation
+    verify_base: BaseSourceVerification
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -112,6 +127,61 @@ class WorkerClaimServices(RequestAdmission):
     heartbeat: HeartbeatOperation | None = None
     busy_code: ApiErrorCode = ApiErrorCode.CLAIM_BUSY
     busy_message: str = "Worker claims are busy."
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkerBaseSourceServices(RequestAdmission):
+    read_base: BaseSourceOperation
+    verify_base: BaseSourceVerification
+    request_timeout_seconds: float
+    busy_code: ApiErrorCode = ApiErrorCode.BASE_SOURCE_BUSY
+    busy_message: str = "Worker base source delivery is busy."
+    _pending_encode: asyncio.Future[bytes] | None = field(
+        default=None, init=False, repr=False
+    )
+
+    @contextmanager
+    def admit_request(self) -> Iterator[None]:
+        if self._pending_encode is not None and not self._pending_encode.done():
+            raise api_error(
+                503, self.busy_code, self.busy_message, headers={"Retry-After": "1"}
+            )
+        with RequestAdmission.admit_request(self):
+            yield
+
+    async def encode(
+        self, value: BaseSourceDelivery, encoder: Callable[[BaseSourceDelivery], bytes]
+    ) -> bytes:
+        if self._pending_encode is not None and not self._pending_encode.done():
+            raise api_error(
+                503, self.busy_code, self.busy_message, headers={"Retry-After": "1"}
+            )
+        future = asyncio.get_running_loop().run_in_executor(None, encoder, value)
+        self._pending_encode = future
+
+        def settled(result: asyncio.Future[bytes]) -> None:
+            if not result.cancelled():
+                result.exception()
+
+        future.add_done_callback(settled)
+        try:
+            return await asyncio.shield(future)
+        finally:
+            if future.done() and self._pending_encode is future:
+                self._pending_encode = None
+
+
+async def require_worker_base_source_services(
+    request: Request,
+) -> WorkerBaseSourceServices:
+    services = getattr(request.app.state, "worker_base_source_services", None)
+    if not isinstance(services, WorkerBaseSourceServices):
+        raise api_error(
+            503,
+            ApiErrorCode.BASE_SOURCE_UNAVAILABLE,
+            "Worker base source delivery is unavailable.",
+        )
+    return services
 
 
 async def require_worker_claim_services(

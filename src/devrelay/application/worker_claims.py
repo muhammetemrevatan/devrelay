@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from time import monotonic
 from uuid import uuid4
 
@@ -15,6 +15,8 @@ from devrelay.application.contracts.assignment_delivery import (
 from devrelay.application.contracts.base_sources import (
     BaseMaterialization,
     BaseMaterializationPolicy,
+    BaseSourceRequest,
+    BaseSourceSnapshot,
 )
 from devrelay.application.contracts.claims import (
     ClaimReplayConflict,
@@ -66,9 +68,15 @@ from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSup
 from devrelay.application.worker_workspaces import (
     RecoverAssignedWorkspace,
     ReserveAssignedWorkspace,
+    _validate_original_input,
 )
 
 _DEFAULT_MATERIALIZATION_POLICY = BaseMaterializationPolicy()
+
+type BaseSourceBinding = Callable[
+    [WorkerClaimRequest, WorkerAuthorization, AssignmentDelivery],
+    Awaitable[BaseSourcePort],
+]
 
 
 class PrepareWorkerClaim:
@@ -207,6 +215,28 @@ class PrepareWorkerClaim:
         )
 
 
+class _DeferredControlSource:
+    """Bind only after the live consumer validated protected execution history."""
+
+    def __init__(
+        self,
+        preparation: PrepareWorkerClaim,
+        bind: BaseSourceBinding,
+        authorization: WorkerAuthorization,
+        delivery: AssignmentDelivery,
+    ) -> None:
+        self._preparation, self._bind = preparation, bind
+        self._authorization, self._delivery = authorization, delivery
+
+    async def read(self, request: BaseSourceRequest) -> BaseSourceSnapshot:
+        state = await self._preparation.recover()
+        await asyncio.to_thread(_validate_original_input, state, self._delivery)
+        if state.request is None:
+            raise WorkerStateUnavailable("Protected source input is unavailable.")
+        source = await self._bind(state.request, self._authorization, self._delivery)
+        return await source.read(request)
+
+
 class RequestWorkerClaim:
     """One explicit exchange, serialized through local completion; no polling/launch."""
 
@@ -218,6 +248,7 @@ class RequestWorkerClaim:
         *,
         heartbeat_gateway: ControlHeartbeatGateway | None = None,
         monotonic_clock: Callable[[], float] | None = None,
+        base_source_binding: BaseSourceBinding | None = None,
     ) -> None:
         self._preparation = preparation
         self._gateway = gateway
@@ -228,6 +259,7 @@ class RequestWorkerClaim:
         self._supervision_clock = monotonic_clock
         self._heartbeat_observation: WorkerHeartbeatExchange | None = None
         self._supervisor: HeartbeatSupervisor | None = None
+        self._base_source_binding = base_source_binding
 
     async def reserve_workspace(
         self, delivery: AssignmentDelivery, workspace: WorkspaceReservationPort
@@ -252,13 +284,22 @@ class RequestWorkerClaim:
         delivery: AssignmentDelivery,
         workspace: BaseMaterializationPort,
         reservation: WorkspaceReservation,
-        source: BaseSourcePort,
+        source: BaseSourcePort | None = None,
         *,
         policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
     ) -> BaseMaterialization:
         # Preparation and the live scope each bound materialization admission.
         # Keep heartbeat exchange free
         # to renew authority while the separately fenced export is in progress.
+        if source is None:
+            if self._base_source_binding is None:
+                raise WorkerStateUnavailable("Control base delivery is not configured.")
+            source = _DeferredControlSource(
+                self._preparation,
+                self._base_source_binding,
+                self._authorization,
+                delivery,
+            )
         return await self._preparation.materialize_base(
             delivery,
             self.heartbeat_supervisor(),
