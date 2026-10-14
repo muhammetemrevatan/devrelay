@@ -273,6 +273,8 @@ def make_v2(path: Path) -> None:
         connection.execute("DROP TABLE acknowledgement_completion")
         connection.execute("DROP TABLE heartbeat_input")
         connection.execute("DROP TABLE execution_input")
+        connection.execute("DROP TABLE workspace_intent")
+        connection.execute("DROP TABLE workspace_completion")
         connection.execute(
             "CREATE TABLE metadata (slot INTEGER PRIMARY KEY CHECK(slot=1), version INTEGER NOT NULL CHECK(version=2), scope BLOB NOT NULL CHECK(length(scope)=32), prepared INTEGER NOT NULL CHECK(prepared IN(0,1)), phase TEXT NOT NULL CHECK(phase IN('idle','pending','assigned')), completed INTEGER NOT NULL CHECK(completed IN(0,1)))"
         )
@@ -332,7 +334,7 @@ def test_v2_upgrade_preserves_valid_recovery_rows(tmp_path: Path, phase: str) ->
                 for table in ("pending_claim", "assignment", "completed_no_work")
             )
             assert after == before
-            assert connection.execute("SELECT version FROM metadata").fetchone() == (6,)
+            assert connection.execute("SELECT version FROM metadata").fetchone() == (7,)
     finally:
         upgraded.close()
 

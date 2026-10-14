@@ -366,7 +366,7 @@ After restart, preparation returns the same recorded input without HTTP, a new
 identity or renewed authority. Duplicate claim responses preserve pending intent.
 Later payload reads must still match its accepted definition digest.
 
-Valid version-1 through version-5 journals upgrade to version 6 in one transaction, preserving protected
+Valid version-1 through version-6 journals upgrade to version 7 in one transaction, preserving protected
 proof bytes, original identities, assignment anchors and no-work markers. Damaged
 state or an incomplete upgrade retains the old schema and fails closed. SQLite,
 DPAPI and integrity checks remain on the dedicated journal thread.
@@ -447,7 +447,7 @@ Accepted exact retries bypass new admission and never renew twice.
 
 The explicit worker `heartbeat()` call stores input before HTTP and records
 validated completion before returning process-local request/receipt timing.
-SQLite version 6 keeps one pending input and one last completed input, bound to
+SQLite version 7 keeps one pending input and one last completed input, bound to
 the original protected proof and acknowledgement completion. These records contain
 request identities and expected revisions only. Current expiry, returned revision,
 observation clocks, active flags and execution deadlines are never stored as
@@ -510,7 +510,7 @@ direction and trusted policy digest. A new intent requires fresh matching author
 from the retained heartbeat supervisor, checked with its shared clock before and
 after journal commit. Preparation never starts supervision or a subprocess.
 
-SQLite version 6 binds both execution input and its presence to the protected
+SQLite version 7 binds both execution input and its presence to the protected
 original claim, acknowledgement and heartbeat inputs. Valid older journals upgrade
 atomically; changed or missing records fail closed. Duplicate claim/acknowledgement
 responses and heartbeat maintenance preserve the execution UUID and policy.
@@ -519,7 +519,7 @@ Recovery returns the original instance and pins even after restart or stop. It i
 historical evidence, never permission to launch or proof that an earlier process
 did not start. Cancellation or expiry during commit can leave a recoverable intent.
 A changed definition or policy cannot replace it. Native process containment,
-credential separation, workspace preparation and the Codex launch adapter remain
+credential separation, Git workspace materialization and the Codex launch adapter remain
 required before actual execution. The worker CLI still validates configuration only.
 
 ## Windows process-scope management
@@ -549,11 +549,14 @@ setup and check commands remain disabled.
 
 ## Windows workspace reservation
 
-`ReserveAssignedWorkspace` consumes a durable acknowledged execution and the full
-accepted definition. It checks fresh heartbeat authority before and after one
-directory reservation. Changed execution, assignment, definition or supplier
-binding fails. Cancellation and failed checks consume this one-shot request;
-they may leave a directory behind and never authorize a retry or deletion.
+The composed client exposes explicit `reserve_workspace(delivery, workspace)` and
+`recover_workspace(delivery)` operations. `ReserveAssignedWorkspace` validates the
+original durable execution and full accepted definition. It observes and retains
+the native root, then commits one protected workspace intent before creation.
+Only the call that newly committed the intent may create the UUID child. Exact
+replay, concurrent losers, existing workspace history and changed bindings cannot
+create another directory. Fresh heartbeat guards fence preparation and the final
+return; a valid child observation is recorded historically before that last guard.
 
 The Windows adapter requires an existing, explicitly configured root controlled
 by the coordinator, with canonical protected-directory paths supplied separately.
@@ -563,12 +566,22 @@ sharing, checks final paths and native identities, and creates only the executio
 UUID child. Native filesystem work and handle cleanup run on one owned executor;
 cleanup closes handles and preserves any created directory.
 
-This is a process-local directory reservation. It provides no Git checkout/base
-proof, denied-read policy, hostile same-user mutation protection or cross-restart
-uniqueness. Protected paths are trusted configuration, not an ACL verification.
-Changing the configured root or restarting requires a later protected workspace
-receipt/reconciliation protocol before reuse or execution. Codex launch and the
-worker CLI remain disabled.
+Journal version 7 preserves the canonical root path, workspace-policy digest and
+native root identity plus an optional immutable child completion. The protected
+proof binds contents, presence and the legacy uncertainty flag together with the
+original execution/ACK/heartbeat history. Cancelled or lost operations can leave
+pending or completed evidence; neither permits another creation, root replacement,
+directory deletion or automatic reuse. Valid older journals upgrade atomically.
+An execution already present in a legacy journal retains unknown workspace history
+and blocks creation because migration cannot prove whether an earlier reservation
+occurred. No automatic reset of that uncertainty is provided.
+
+`RecoverAssignedWorkspace` returns historical input/completion only, without
+filesystem handles, live authority or a usable reservation. Fresh filesystem and
+process reconciliation remain required before reuse or execution. These records
+provide no Git/base provenance, denied-read sandbox, hostile same-user mutation
+protection or proof that work has stopped. Protected paths are trusted namespace
+configuration, not ACL verification. Codex launch and the worker CLI remain disabled.
 
 ## Control acknowledgement persistence
 

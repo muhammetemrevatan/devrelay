@@ -34,6 +34,8 @@ from devrelay.application.contracts.worker_recovery import (
     WorkerRecoveryState,
 )
 from devrelay.application.contracts.workers import WorkerAuthorization
+from devrelay.application.contracts.workspace_recovery import WorkspaceRecovery
+from devrelay.application.contracts.workspaces import WorkspaceReservation
 from devrelay.application.ports.control_gateway import (
     ControlClaimRejected,
     ControlGateway,
@@ -47,8 +49,14 @@ from devrelay.application.ports.worker_journal import (
     WorkerStateBusy,
     WorkerStateUnavailable,
 )
+from devrelay.application.ports.worker_workspace_journal import WorkerWorkspaceJournal
+from devrelay.application.ports.workspace_reservation import WorkspaceReservationPort
 from devrelay.application.worker_executions import PrepareAssignedExecution
 from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSupervisor
+from devrelay.application.worker_workspaces import (
+    RecoverAssignedWorkspace,
+    ReserveAssignedWorkspace,
+)
 
 
 class PrepareWorkerClaim:
@@ -60,10 +68,31 @@ class PrepareWorkerClaim:
         *,
         heartbeat_journal: WorkerHeartbeatJournal | None = None,
         execution_journal: WorkerExecutionJournal | None = None,
+        workspace_journal: WorkerWorkspaceJournal | None = None,
     ) -> None:
         self._journal = journal
         self._heartbeat_journal = heartbeat_journal
         self._execution_journal = execution_journal
+        self._workspace_journal = workspace_journal
+
+    async def reserve_workspace(
+        self,
+        delivery: AssignmentDelivery,
+        supervisor: HeartbeatSupervisor,
+        workspace: WorkspaceReservationPort,
+    ) -> WorkspaceReservation:
+        if self._workspace_journal is None:
+            raise WorkerStateUnavailable("Workspace recovery is not configured.")
+        return await ReserveAssignedWorkspace(
+            self._workspace_journal, supervisor, workspace
+        ).execute(delivery)
+
+    async def recover_workspace(
+        self, delivery: AssignmentDelivery
+    ) -> WorkspaceRecovery | None:
+        if self._workspace_journal is None:
+            raise WorkerStateUnavailable("Workspace recovery is not configured.")
+        return await RecoverAssignedWorkspace(self._workspace_journal).execute(delivery)
 
     async def prepare_execution(
         self,
@@ -165,6 +194,24 @@ class RequestWorkerClaim:
         self._supervision_clock = monotonic_clock
         self._heartbeat_observation: WorkerHeartbeatExchange | None = None
         self._supervisor: HeartbeatSupervisor | None = None
+
+    async def reserve_workspace(
+        self, delivery: AssignmentDelivery, workspace: WorkspaceReservationPort
+    ) -> WorkspaceReservation:
+        if self._lock.locked():
+            raise WorkerStateBusy("A worker claim exchange is already active.")
+        async with self._lock:
+            return await self._preparation.reserve_workspace(
+                delivery, self.heartbeat_supervisor(), workspace
+            )
+
+    async def recover_workspace(
+        self, delivery: AssignmentDelivery
+    ) -> WorkspaceRecovery | None:
+        if self._lock.locked():
+            raise WorkerStateBusy("A worker claim exchange is already active.")
+        async with self._lock:
+            return await self._preparation.recover_workspace(delivery)
 
     async def prepare_execution(
         self, delivery: AssignmentDelivery, policy: ExecutionPolicy

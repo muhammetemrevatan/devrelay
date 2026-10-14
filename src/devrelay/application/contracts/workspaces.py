@@ -2,6 +2,9 @@ from dataclasses import dataclass, field
 
 from devrelay.application.contracts.assignment_delivery import AssignedJobDefinition
 from devrelay.application.contracts.processes import ExecutionProcessBinding
+from devrelay.application.contracts.workspace_recovery import (
+    WorkspaceDirectoryIdentity as WorkspaceDirectoryIdentity,
+)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -27,21 +30,6 @@ class WorkspaceBinding:
             or self.definition.fingerprint() != acknowledgement.definition_digest
         ):
             raise ValueError("Workspace binding changed accepted definition pins.")
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class WorkspaceDirectoryIdentity:
-    volume_serial_number: int
-    file_index: int
-
-    def __post_init__(self) -> None:
-        if (
-            type(self.volume_serial_number) is not int
-            or not 0 <= self.volume_serial_number < 2**32
-            or type(self.file_index) is not int
-            or not 0 < self.file_index < 2**64
-        ):
-            raise ValueError("Workspace directory requires a native identity.")
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

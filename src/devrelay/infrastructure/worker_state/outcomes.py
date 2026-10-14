@@ -30,10 +30,16 @@ from devrelay.infrastructure.worker_state.executions import (
     read_execution,
 )
 from devrelay.infrastructure.worker_state.heartbeats import (
-    bind_heartbeats,
     create_heartbeat_schema,
     heartbeat_integrity,
     read_heartbeats,
+)
+from devrelay.infrastructure.worker_state.workspaces import (
+    bind_workspace_state,
+    create_workspace_schema,
+    read_workspace,
+    workspace_history_unknown,
+    workspace_integrity,
 )
 
 _FAILURE = "Worker recovery journal is unavailable."
@@ -46,21 +52,23 @@ def _create_metadata(
     prepared: int,
     phase: str,
     completed: int,
+    history_unknown: bool = False,
 ) -> None:
     connection.execute("""
       CREATE TABLE metadata (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
-        version INTEGER NOT NULL CHECK (version = 6),
+        version INTEGER NOT NULL CHECK (version = 7),
         scope BLOB NOT NULL CHECK (length(scope) = 32),
         prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
         phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned', 'acknowledgement_pending', 'acknowledged')),
         completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
+        workspace_history_unknown INTEGER NOT NULL CHECK (workspace_history_unknown IN (0, 1)),
         CHECK ((phase = 'idle' AND prepared = 0) OR (phase IN ('pending', 'assigned', 'acknowledgement_pending', 'acknowledged') AND prepared = 1))
       )
     """)
     connection.execute(
-        "INSERT INTO metadata VALUES (1, 6, ?, ?, ?, ?)",
-        (scope, prepared, phase, completed),
+        "INSERT INTO metadata VALUES (1, 7, ?, ?, ?, ?, ?)",
+        (scope, prepared, phase, completed, int(history_unknown)),
     )
 
 
@@ -79,7 +87,12 @@ def upgrade_outcome_schema(
         raise WorkerStateUnavailable(_FAILURE)
     connection.execute("DROP TABLE metadata")
     _create_metadata(
-        connection, scope.key, prepared=row[0], phase=row[1], completed=row[2]
+        connection,
+        scope.key,
+        prepared=row[0],
+        phase=row[1],
+        completed=row[2],
+        history_unknown=state.execution is not None,
     )
     if version == (2,):
         create_acknowledgement_schema(connection)
@@ -87,11 +100,13 @@ def upgrade_outcome_schema(
         create_completion_schema(connection)
     if version in ((2,), (3,), (4,)):
         create_heartbeat_schema(connection)
-    create_execution_schema(connection)
+    if version in ((2,), (3,), (4,), (5,)):
+        create_execution_schema(connection)
+    create_workspace_schema(connection)
     if state.completion is not None:
         if state.request is None or state.assignment is None:
             raise WorkerStateUnavailable(_FAILURE)
-        bind_heartbeats(
+        bind_workspace_state(
             connection, scope, state.request, state.assignment, state.completion
         )
 
@@ -110,6 +125,7 @@ def create_outcome_schema(
     create_completion_schema(connection)
     create_heartbeat_schema(connection)
     create_execution_schema(connection)
+    create_workspace_schema(connection)
     connection.execute("""
       CREATE TABLE assignment (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -169,7 +185,7 @@ def recovery_state(
     ).fetchone()
     if (
         header is None
-        or header[0] not in ((2, 3, 4, 5, 6) if allow_legacy else (6,))
+        or header[0] not in ((2, 3, 4, 5, 6, 7) if allow_legacy else (7,))
         or header[1] != scope.key
     ):
         raise WorkerStateUnavailable(_FAILURE)
@@ -210,6 +226,9 @@ def recovery_state(
     acknowledgement = None
     completion = None
     execution = None
+    workspace_intent = None
+    workspace_completion = None
+    history_unknown = workspace_history_unknown(connection) if header[0] >= 7 else False
     pending_heartbeat, last_heartbeat = (
         read_heartbeats(connection) if header[0] >= 5 else (None, None)
     )
@@ -252,8 +271,25 @@ def recovery_state(
             else None
         )
         execution = read_execution(connection, completion) if header[0] >= 6 else None
+        if header[0] >= 7:
+            workspace_intent, workspace_completion = read_workspace(
+                connection, execution
+            )
         expected_integrity = (
-            execution_integrity(
+            workspace_integrity(
+                scope,
+                request,
+                outcome,
+                completion,
+                pending_heartbeat,
+                last_heartbeat,
+                execution,
+                workspace_intent,
+                workspace_completion,
+                history_unknown,
+            )
+            if completion is not None and header[0] >= 7
+            else execution_integrity(
                 scope,
                 request,
                 outcome,
@@ -289,6 +325,10 @@ def recovery_state(
             )
         if header[0] >= 6:
             execution = read_execution(connection, completion)
+        if header[0] >= 7:
+            workspace_intent, workspace_completion = read_workspace(
+                connection, execution
+            )
     return WorkerRecoveryState(
         phase=WorkerRecoveryPhase(phase),
         request=request,
@@ -299,6 +339,9 @@ def recovery_state(
         pending_heartbeat=pending_heartbeat,
         last_heartbeat=last_heartbeat,
         execution=execution,
+        workspace_intent=workspace_intent,
+        workspace_completion=workspace_completion,
+        workspace_history_unknown=history_unknown,
     )
 
 

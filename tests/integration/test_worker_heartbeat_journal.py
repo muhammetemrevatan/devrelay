@@ -412,6 +412,8 @@ def test_v4_upgrade_preserves_ciphertext_original_anchors_and_completion_atomica
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE heartbeat_input")
         connection.execute("DROP TABLE execution_input")
+        connection.execute("DROP TABLE workspace_intent")
+        connection.execute("DROP TABLE workspace_completion")
         connection.execute(
             "CREATE TABLE metadata(slot INTEGER PRIMARY KEY,version INTEGER CHECK(version=4),scope BLOB,prepared INTEGER,phase TEXT,completed INTEGER)"
         )
@@ -444,7 +446,7 @@ def test_v4_upgrade_preserves_ciphertext_original_anchors_and_completion_atomica
 
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         assert connection.execute("SELECT version FROM metadata").fetchone() == (
-            (4,) if damaged else (6,)
+            (4,) if damaged else (7,)
         )
         assert (
             tuple(
