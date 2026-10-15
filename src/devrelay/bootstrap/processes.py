@@ -14,26 +14,19 @@ from devrelay.infrastructure.worker_processes.windows import WindowsJobObject
 _Result = TypeVar("_Result")
 
 
-class WindowsProcessScope:
-    """Own native operations on one executor; never creates or resumes a process."""
+class ProcessOperationOwner:
+    """Serialize native work while retaining the actual future after cancellation."""
 
-    def __init__(self, native: WindowsJobObject, executor: ThreadPoolExecutor) -> None:
-        self._native = native
+    def __init__(self, executor: ThreadPoolExecutor, seal: Callable[[], None]) -> None:
         self._executor = executor
+        self._seal = seal
         self._closed = False
         self._admission = asyncio.Lock()
         self._pending: asyncio.Future[object] | None = None
 
-    @property
-    def binding(self) -> ExecutionProcessBinding:
-        return self._native.binding
-
-    def seal(self) -> None:
-        self._native.seal()
-
     def stop_admission(self) -> None:
         self._closed = True
-        self.seal()
+        self._seal()
 
     async def _invoke(self, operation: Callable[[], _Result]) -> _Result:
         async with self._admission:
@@ -55,6 +48,21 @@ class WindowsProcessScope:
             finally:
                 if future.done():
                     self._pending = None
+
+
+class WindowsProcessScope(ProcessOperationOwner):
+    """Own native operations on one executor; never creates or resumes a process."""
+
+    def __init__(self, native: WindowsJobObject, executor: ThreadPoolExecutor) -> None:
+        super().__init__(executor, native.seal)
+        self._native = native
+
+    @property
+    def binding(self) -> ExecutionProcessBinding:
+        return self._native.binding
+
+    def seal(self) -> None:
+        self._native.seal()
 
     async def attach_suspended_process(self, process_handle: int) -> None:
         """Borrow a caller-owned handle; suspension and launch policy are external."""

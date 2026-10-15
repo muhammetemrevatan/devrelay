@@ -681,6 +681,30 @@ This is an explicit same-process transition without journal/schema changes. It
 creates no Git metadata, process, sandbox or restart-reuse permission. The worker
 CLI still checks configuration only; actual Codex/check launch remains disabled.
 
+## Managed trusted host processes
+
+`RunTrustedProcess` provides an explicit process bridge for host-owned commands
+and harmless native fixtures. It prepares one hidden suspended Windows process,
+attaches it to the existing resource-limited Job Object, rechecks fresh assignment
+authority and resumes once. Executable, arguments, working directory and the
+complete child environment are explicit. Only the three child standard-I/O
+handles are inherited; coordinator environment and private handles are excluded.
+
+The runner collects bounded binary stdout/stderr chunks and a genuine root exit
+code. Runtime, operation, observation and combined output budgets stop the entire
+associated job. Root exit alone does not prove descendant termination or pipe
+closure. Every terminal path seals launch admission before termination, and only
+fresh post-termination accounting can produce `empty_verified`. Unsettled native
+work, invalid clocks and failed stop observations retain `unknown` evidence.
+Cancellation remains cancellation after bounded cleanup; it does not grant retry
+or release a reservation. Owning-thread cleanup closes process resources before
+the Job Object and is separate from verified containment evidence.
+
+This bridge does not establish a restricted execution identity, denied secret
+reads or network isolation. It is not composed into worker startup, recovery or
+Codex/check execution. Those integrations require their effective isolation and
+authentication policy; the CLI still checks configuration only.
+
 ## Control acknowledgement persistence
 
 `AcknowledgeAssignedJob` recovers only the authenticated original assignment,
