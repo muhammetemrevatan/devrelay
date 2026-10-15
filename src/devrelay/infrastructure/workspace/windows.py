@@ -11,6 +11,7 @@ from devrelay.application.contracts.base_sources import (
     BaseSourceFile,
     BaseSourceSnapshot,
 )
+from devrelay.application.contracts.editable_workspaces import EditableWorkspace
 from devrelay.application.contracts.workspace_recovery import (
     WorkspaceLocation,
     canonical_workspace_path,
@@ -145,6 +146,15 @@ class WindowsWorkspaceReservation:
         self._reservation: WorkspaceReservation | None = None
         self._materialization_used = False
         self._materialization_sealed = Event()
+        self._materialization: BaseMaterialization | None = None
+        self._materialization_snapshot: BaseSourceSnapshot | None = None
+        self._materialization_files: tuple[
+            tuple[str, int, WorkspaceDirectoryIdentity, BaseSourceFile], ...
+        ] = ()
+        self._materialization_nodes: dict[str, bool] = {}
+        self._materialization_digest: str | None = None
+        self._materialization_handles: tuple[int, ...] = ()
+        self._handoff_used = False
 
     @property
     def binding(self) -> WorkspaceBinding:
@@ -157,6 +167,10 @@ class WindowsWorkspaceReservation:
     @property
     def location(self) -> WorkspaceLocation | None:
         return self._location
+
+    @property
+    def materialization(self) -> BaseMaterialization | None:
+        return self._materialization
 
     def seal_materialization(self) -> None:
         self._materialization_sealed.set()
@@ -235,7 +249,9 @@ class WindowsWorkspaceReservation:
         )
 
     def _open_directory(self, path: str) -> tuple[int, WorkspaceDirectoryIdentity]:
-        handle = self._native().CreateFileW(path, 0, 0x3, None, 3, 0x02200000, None)
+        # Explicit directory read access participates in Windows share checks;
+        # metadata-only access does not prevent a directory rename.
+        handle = self._native().CreateFileW(path, 1, 0x3, None, 3, 0x02200000, None)
         if type(handle) is not int or not 0 < handle < _INVALID_HANDLE:
             raise WorkspaceUnavailable(_FAILURE)
         self._handles.append(handle)
@@ -561,6 +577,7 @@ class WindowsWorkspaceReservation:
                 )
                 self.verify_reservation(reservation)
                 self._bind_materialization()
+                retained_count = len(self._handles)
                 for relative in sorted(
                     (path for path, directory in nodes.items() if directory),
                     key=lambda path: (path.count("/"), path),
@@ -585,7 +602,94 @@ class WindowsWorkspaceReservation:
                     self._verify_file_bytes(handle, path, item, identity)
                 self._recheck_root()
                 self._check_materialization()
+                self._materialization_snapshot = snapshot
+                self._materialization_files = tuple(files)
+                self._materialization_nodes = nodes
+                self._materialization_digest = result.manifest_digest
+                self._materialization_handles = tuple(self._handles[retained_count:])
+                self._materialization = result
                 return result
+            except Exception:
+                self.seal_materialization()
+                raise WorkspaceUnavailable(_FAILURE) from None
+
+    def handoff_materialized_base(
+        self, result: BaseMaterialization
+    ) -> EditableWorkspace:
+        """Release descendant guards once, retaining the reserved UUID root.
+
+        The returned object is same-process evidence only. Releasing guards makes
+        previous byte observations historical; it grants no process launch,
+        isolation, Git, restart adoption or capacity-release authority.
+        """
+        with self._lock:
+            if self._handoff_used:
+                raise WorkspaceUnavailable(_FAILURE)
+            self._handoff_used = True
+            try:
+                self._check_materialization()
+                snapshot = self._materialization_snapshot
+                if (
+                    not isinstance(result, BaseMaterialization)
+                    or result is not self._materialization
+                    or result.reservation is not self._reservation
+                    or self._location is None
+                    or snapshot is None
+                    or self._find_handles
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                result.__post_init__()
+                self._binding.__post_init__()
+                snapshot.validate()
+                if (
+                    snapshot.fingerprint() != self._materialization_digest
+                    or result.manifest_digest != self._materialization_digest
+                    or result.source != snapshot.request
+                    or result.root_tree_sha != snapshot.root_tree_sha
+                    or result.file_count != len(snapshot.files)
+                    or result.total_bytes
+                    != sum(len(item.content) for item in snapshot.files)
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                target = (
+                    self._policy.root_directory
+                    + "\\"
+                    + result.reservation.directory_name
+                )
+                self._recheck_root()
+                self._verify_tree(target, self._materialization_nodes)
+                for path, handle, identity, item in self._materialization_files:
+                    self._verify_file_bytes(handle, path, item, identity)
+                self._recheck_root()
+                handles = self._materialization_handles
+                if (
+                    len(handles) != len(self._materialization_nodes)
+                    or len(set(handles)) != len(handles)
+                    or any(handle not in self._handles for handle in handles)
+                    or any(
+                        path == target and handle in handles
+                        for path, handle, _ in self._held
+                    )
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                handoff = EditableWorkspace(
+                    materialization=result, location=self._location
+                )
+                for handle in reversed(handles):
+                    self._check_materialization()
+                    if not self._native().CloseHandle(handle):
+                        raise WorkspaceUnavailable(_FAILURE)
+                    self._handles.remove(handle)
+                    self._held = [entry for entry in self._held if entry[1] != handle]
+                    self._check_materialization()
+                self._recheck_root()
+                self._check_materialization()
+                self._materialization_snapshot = None
+                self._materialization_files = ()
+                self._materialization_nodes = {}
+                self._materialization_digest = None
+                self._materialization_handles = ()
+                return handoff
             except Exception:
                 self.seal_materialization()
                 raise WorkspaceUnavailable(_FAILURE) from None

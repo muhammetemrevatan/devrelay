@@ -653,6 +653,34 @@ real separate loopback connections during heartbeat renewal, and disposable
 PostgreSQL expiry/recovery without changing durable state. No live integrations,
 automatic polling, Codex/check execution, Git history or restart reuse are enabled.
 
+## Editable workspace handoff
+
+After `materialize_base`, the composed worker can explicitly call
+`handoff_materialized_base(delivery, workspace, materialization)` to make the live
+workspace editable. The original export remains protected until that separate
+one-shot transition. Reconstructed or historical materialization values cannot
+authorize it; the exact successful result and retained native scope are required.
+
+The use case validates original ACK/execution/full definition and completed
+workspace history, checking retained heartbeat authority around each awaited step.
+Before releasing any guard, the native adapter rechecks source pins, exact bytes,
+directory contents and native identities. It closes the materialized file and
+descendant-directory handles while retaining the UUID root and its ancestors.
+Retained directories request explicit read access with no delete sharing; native
+tests verify that root and parent rename remain blocked. Missing directory read
+permission fails closed.
+
+Files can then be edited, replaced or deleted and child directories renamed within
+the still-open scope. Their earlier source-byte observations are historical once
+editing begins. Success releases cached source-byte buffers. Cancellation, expiry
+or partial handle-release failure seals the scope, preserves remaining resources
+and returns no usable handoff result. Sealing cannot undo already-released guards.
+Cleanup preserves filesystem contents, and uncertain work never releases capacity.
+
+This is an explicit same-process transition without journal/schema changes. It
+creates no Git metadata, process, sandbox or restart-reuse permission. The worker
+CLI still checks configuration only; actual Codex/check launch remains disabled.
+
 ## Control acknowledgement persistence
 
 `AcknowledgeAssignedJob` recovers only the authenticated original assignment,

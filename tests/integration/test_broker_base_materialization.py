@@ -47,10 +47,12 @@ pytestmark = pytest.mark.skipif(
 )
 
 
+@pytest.mark.parametrize("editable", [False, True])
 def test_broker_fixture_to_http_worker_and_native_protected_workspace(
     tmp_path: Path,
     worker_configuration: ControlSettings,
     monkeypatch: pytest.MonkeyPatch,
+    editable: bool,
 ) -> None:
     values = worker_configuration.model_dump()
     values["worker_claims"] = {}
@@ -244,6 +246,28 @@ def test_broker_fixture_to_http_worker_and_native_protected_workspace(
                             for p in target.rglob("*")
                             if p.is_file()
                         )
+                        if editable:
+                            handed = await worker.handoff_materialized_base(
+                                delivery, workspace, materialized
+                            )
+                            assert handed.materialization is materialized
+                            assert handed.location == workspace.location
+                            # Exercise literal filesystem edits without any command/model.
+                            (target / "README.md").write_bytes(b"Edited fixture\n")
+                            replacement = target / "replacement.txt"
+                            replacement.write_bytes(b"Atomic replacement\n")
+                            replacement.replace(target / "README.md")
+                            (target / "README.md").unlink()
+                            (target / "src").rename(target / "package")
+                            (target / "package/app.py").unlink()
+                            (target / "package").rmdir()
+                            (target / "new.txt").write_bytes(b"New fixture\n")
+                            assert (target / "new.txt").read_bytes() == b"New fixture\n"
+                            assert (
+                                await preparation.recover_workspace(delivery) == history
+                            )
+                            with pytest.raises(PermissionError):
+                                target.rename(root / "must-stay-pinned")
                 assert len(reads) >= 3
         assert (target / "data/payload.bin").read_bytes() == b"\x00\xffbinary\r\n"
 

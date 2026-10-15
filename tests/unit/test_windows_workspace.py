@@ -285,7 +285,7 @@ def test_reservation_checks_and_retains_all_ancestors_and_exact_uuid_directory(
     assert reservation.identity.file_index == max(kernel.paths)
     assert kernel.closed == [] and kernel.search_closed == [999]
     assert all(
-        args[1] == (0, 3, None, 3, 0x02200000, None)
+        args[1] == (1, 3, None, 3, 0x02200000, None)
         for operation, args in kernel.calls
         if operation == "open"
     )
