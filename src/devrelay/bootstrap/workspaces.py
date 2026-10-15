@@ -8,6 +8,7 @@ from devrelay.application.contracts.base_sources import (
     BaseMaterialization,
     BaseSourceSnapshot,
 )
+from devrelay.application.contracts.editable_workspaces import EditableWorkspace
 from devrelay.application.contracts.workspace_recovery import WorkspaceLocation
 from devrelay.application.contracts.workspaces import (
     WorkspaceBinding,
@@ -36,6 +37,8 @@ class WindowsWorkspaceScope:
         self._location: WorkspaceLocation | None = None
         self._reservation: WorkspaceReservation | None = None
         self._materialization_started = False
+        self._materialization: BaseMaterialization | None = None
+        self._handoff_started = False
         self._sealed = False
         self._admission = asyncio.Lock()
         self._pending: asyncio.Future[object] | None = None
@@ -51,6 +54,10 @@ class WindowsWorkspaceScope:
     @property
     def location(self) -> WorkspaceLocation | None:
         return self._location
+
+    @property
+    def materialization(self) -> BaseMaterialization | None:
+        return self._materialization
 
     def seal(self) -> None:
         self._sealed = True
@@ -123,8 +130,24 @@ class WindowsWorkspaceScope:
             raise WorkspaceUnavailable("Live materialization is unavailable.")
         self._materialization_started = True
         try:
-            return await self._invoke(
+            result = await self._invoke(
                 lambda: self._native.materialize(reservation, snapshot)
+            )
+            if not isinstance(result, BaseMaterialization):
+                raise WorkspaceUnavailable("Live materialization is unavailable.")
+            self._materialization = result
+            return result
+        except BaseException:
+            self.seal()
+            raise
+
+    async def handoff(self, materialization: BaseMaterialization) -> EditableWorkspace:
+        if self._handoff_started or materialization is not self._materialization:
+            raise WorkspaceUnavailable("Live editable workspace is unavailable.")
+        self._handoff_started = True
+        try:
+            return await self._invoke(
+                lambda: self._native.handoff_materialized_base(materialization)
             )
         except BaseException:
             self.seal()

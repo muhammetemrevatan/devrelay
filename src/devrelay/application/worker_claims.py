@@ -23,6 +23,7 @@ from devrelay.application.contracts.claims import (
     LeaseProof,
     WorkerClaimRequest,
 )
+from devrelay.application.contracts.editable_workspaces import EditableWorkspace
 from devrelay.application.contracts.executions import (
     ExecutionPolicy,
     WorkerExecutionIntent,
@@ -42,6 +43,7 @@ from devrelay.application.contracts.worker_recovery import (
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.contracts.workspace_recovery import WorkspaceRecovery
 from devrelay.application.contracts.workspaces import WorkspaceReservation
+from devrelay.application.editable_workspaces import HandoffMaterializedBase
 from devrelay.application.materialize_base import MaterializeAssignedBase
 from devrelay.application.ports.base_materialization import BaseMaterializationPort
 from devrelay.application.ports.base_source import BaseSourcePort
@@ -51,6 +53,7 @@ from devrelay.application.ports.control_gateway import (
     ControlHeartbeatGateway,
     InvalidControlResponse,
 )
+from devrelay.application.ports.editable_workspace import EditableWorkspacePort
 from devrelay.application.ports.worker_execution_journal import WorkerExecutionJournal
 from devrelay.application.ports.worker_journal import (
     WorkerClaimJournal,
@@ -95,6 +98,7 @@ class PrepareWorkerClaim:
         self._execution_journal = execution_journal
         self._workspace_journal = workspace_journal
         self._base_materialization_started = False
+        self._editable_handoff_started = False
 
     async def reserve_workspace(
         self,
@@ -147,6 +151,24 @@ class PrepareWorkerClaim:
         return await PrepareAssignedExecution(
             self._execution_journal, supervisor, policy
         ).execute(delivery)
+
+    async def handoff_materialized_base(
+        self,
+        delivery: AssignmentDelivery,
+        supervisor: HeartbeatSupervisor,
+        workspace: EditableWorkspacePort,
+        materialization: BaseMaterialization,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> EditableWorkspace:
+        if self._workspace_journal is None:
+            raise WorkerStateUnavailable("Workspace recovery is not configured.")
+        if self._editable_handoff_started:
+            raise WorkspaceUnavailable("Editable handoff has already been requested.")
+        self._editable_handoff_started = True
+        return await HandoffMaterializedBase(
+            self._workspace_journal, supervisor, workspace, policy
+        ).execute(delivery, materialization)
 
     async def prepare(self) -> WorkerClaimRequest:
         pending = await self._journal.load_pending()
@@ -319,6 +341,23 @@ class RequestWorkerClaim:
             return await self._preparation.prepare_execution(
                 delivery, self.heartbeat_supervisor(), policy
             )
+
+    async def handoff_materialized_base(
+        self,
+        delivery: AssignmentDelivery,
+        workspace: EditableWorkspacePort,
+        materialization: BaseMaterialization,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> EditableWorkspace:
+        # Keep the heartbeat exchange lock free during native verification/release.
+        return await self._preparation.handoff_materialized_base(
+            delivery,
+            self.heartbeat_supervisor(),
+            workspace,
+            materialization,
+            policy=policy,
+        )
 
     def heartbeat_supervisor(
         self, *, policy: HeartbeatPolicy | None = None
