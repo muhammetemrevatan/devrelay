@@ -98,6 +98,7 @@ def test_manifest_revalidates_corrupt_blob_bytes_before_stage() -> None:
     object.__setattr__(candidate, "request", snapshot.request)
     object.__setattr__(candidate, "root_tree_sha", snapshot.root_tree_sha)
     object.__setattr__(candidate, "files", (damaged, *snapshot.files[1:]))
+    object.__setattr__(candidate, "raw_commit", None)
 
     with pytest.raises(ValueError, match="verified ordinary blob"):
         candidate.validate()

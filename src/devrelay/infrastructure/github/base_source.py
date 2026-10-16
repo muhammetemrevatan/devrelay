@@ -22,6 +22,7 @@ from devrelay.application.ports.base_source import (
     BaseSourceUnavailable,
     InvalidBaseSourceData,
 )
+from devrelay.application.ports.git_commit_source import GitCommitSource
 from devrelay.infrastructure.github.repository_source import RepositoryBinding
 
 _DEFAULT_LIMITS = BaseSourceLimits()
@@ -162,6 +163,7 @@ class GitHubBaseSource:
         *,
         bindings: tuple[RepositoryBinding, ...],
         limits: BaseSourceLimits = _DEFAULT_LIMITS,
+        commit_source: GitCommitSource | None = None,
     ) -> None:
         if (
             not isinstance(client, httpx.AsyncClient)
@@ -194,6 +196,7 @@ class GitHubBaseSource:
         self._client = client
         self._bindings = {item.repository_id: item for item in bindings}
         self._limits = limits
+        self._commit_source = commit_source
 
     async def read(self, request: BaseSourceRequest) -> BaseSourceSnapshot:
         try:
@@ -208,7 +211,9 @@ class GitHubBaseSource:
             ):
                 raise BaseSourceAccessDenied("Base source is outside configured scope.")
             async with asyncio.timeout(self._limits.total_timeout_seconds):
-                return await _Export(self._client, binding, self._limits).read(request)
+                return await _Export(
+                    self._client, binding, self._limits, self._commit_source
+                ).read(request)
         except TimeoutError, httpx.RequestError:
             raise BaseSourceUnavailable(
                 "GitHub base source failed or timed out."
@@ -223,8 +228,10 @@ class _Export:
         client: httpx.AsyncClient,
         binding: RepositoryBinding,
         limits: BaseSourceLimits,
+        commit_source: GitCommitSource | None = None,
     ) -> None:
         self.client, self.binding, self.limits = client, binding, limits
+        self.commit_source = commit_source
         self.requests = self.response_bytes = self.entries = self.total_bytes = 0
         self.files: list[BaseSourceFile] = []
         self.paths: dict[str, str] = {}
@@ -241,17 +248,27 @@ class _Export:
             raise ValueError(_INVALID)
         tree_sha = _sha(_object(commit.get("tree")).get("sha"))
         await self._walk(tree_sha, "", frozenset())
-        snapshot = await asyncio.to_thread(self._snapshot, request, tree_sha)
+        raw_commit = (
+            None
+            if self.commit_source is None
+            else await self.commit_source.read(request, root_tree_sha=tree_sha)
+        )
+        if self.commit_source is not None and type(raw_commit) is not bytes:
+            raise ValueError(_INVALID)
+        snapshot = await asyncio.to_thread(
+            self._snapshot, request, tree_sha, raw_commit
+        )
         await self._repository()
         return snapshot
 
     def _snapshot(
-        self, request: BaseSourceRequest, tree_sha: str
+        self, request: BaseSourceRequest, tree_sha: str, raw_commit: bytes | None
     ) -> BaseSourceSnapshot:
         return BaseSourceSnapshot(
             request=request,
             root_tree_sha=tree_sha,
             files=tuple(sorted(self.files, key=lambda item: item.path.encode("utf-8"))),
+            raw_commit=raw_commit,
         )
 
     async def _repository(self) -> None:

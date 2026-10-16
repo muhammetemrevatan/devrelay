@@ -28,6 +28,7 @@ from devrelay.application.contracts.executions import (
     ExecutionPolicy,
     WorkerExecutionIntent,
 )
+from devrelay.application.contracts.git_sources import GitWorkspacePreparation
 from devrelay.application.contracts.heartbeats import (
     HeartbeatRequest,
     WorkerHeartbeatExchange,
@@ -44,6 +45,7 @@ from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.contracts.workspace_recovery import WorkspaceRecovery
 from devrelay.application.contracts.workspaces import WorkspaceReservation
 from devrelay.application.editable_workspaces import HandoffMaterializedBase
+from devrelay.application.git_workspaces import PrepareMaterializedGit
 from devrelay.application.materialize_base import MaterializeAssignedBase
 from devrelay.application.ports.base_materialization import BaseMaterializationPort
 from devrelay.application.ports.base_source import BaseSourcePort
@@ -54,6 +56,7 @@ from devrelay.application.ports.control_gateway import (
     InvalidControlResponse,
 )
 from devrelay.application.ports.editable_workspace import EditableWorkspacePort
+from devrelay.application.ports.git_workspace import GitWorkspacePort
 from devrelay.application.ports.worker_execution_journal import WorkerExecutionJournal
 from devrelay.application.ports.worker_journal import (
     WorkerClaimJournal,
@@ -99,6 +102,7 @@ class PrepareWorkerClaim:
         self._workspace_journal = workspace_journal
         self._base_materialization_started = False
         self._editable_handoff_started = False
+        self._git_preparation_started = False
 
     async def reserve_workspace(
         self,
@@ -139,6 +143,24 @@ class PrepareWorkerClaim:
         return await MaterializeAssignedBase(
             self._workspace_journal, source, workspace, supervisor, policy
         ).execute(delivery, reservation)
+
+    async def prepare_git_base(
+        self,
+        delivery: AssignmentDelivery,
+        supervisor: HeartbeatSupervisor,
+        workspace: GitWorkspacePort,
+        materialization: BaseMaterialization,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> GitWorkspacePreparation:
+        if self._workspace_journal is None:
+            raise WorkerStateUnavailable("Workspace recovery is not configured.")
+        if self._git_preparation_started:
+            raise WorkspaceUnavailable("Git preparation has already been requested.")
+        self._git_preparation_started = True
+        return await PrepareMaterializedGit(
+            self._workspace_journal, supervisor, workspace, policy
+        ).execute(delivery, materialization)
 
     async def prepare_execution(
         self,
@@ -328,6 +350,22 @@ class RequestWorkerClaim:
             workspace,
             reservation,
             source,
+            policy=policy,
+        )
+
+    async def prepare_git_base(
+        self,
+        delivery: AssignmentDelivery,
+        workspace: GitWorkspacePort,
+        materialization: BaseMaterialization,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> GitWorkspacePreparation:
+        return await self._preparation.prepare_git_base(
+            delivery,
+            self.heartbeat_supervisor(),
+            workspace,
+            materialization,
             policy=policy,
         )
 
