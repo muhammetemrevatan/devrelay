@@ -40,7 +40,9 @@ from devrelay.infrastructure.control.gateway import HttpControlGateway
 from devrelay.infrastructure.workspace.windows import WindowsWorkspacePolicy
 from tests.assignment_fixtures import NOW, assigned_result
 from tests.base_source_fixtures import source_fixture
+from tests.git_source_fixtures import git_source_fixture
 from tests.integration.test_protected_workspace_native import fixture_supervisor
+from tests.workspace_fixtures import workspace_binding
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="Native Windows protected source materialization"
@@ -48,11 +50,13 @@ pytestmark = pytest.mark.skipif(
 
 
 @pytest.mark.parametrize("editable", [False, True])
+@pytest.mark.parametrize("git_base", [False, True])
 def test_broker_fixture_to_http_worker_and_native_protected_workspace(
     tmp_path: Path,
     worker_configuration: ControlSettings,
     monkeypatch: pytest.MonkeyPatch,
     editable: bool,
+    git_base: bool,
 ) -> None:
     values = worker_configuration.model_dump()
     values["worker_claims"] = {}
@@ -65,6 +69,18 @@ def test_broker_fixture_to_http_worker_and_native_protected_workspace(
         credential_expires_at=registration.expires_at,
     )
     result = assigned_result(authorization)
+    if git_base:
+        assert result.stored is not None
+        git_revision = git_source_fixture(
+            workspace_binding()
+        ).snapshot.request.base_revision
+        result = replace(
+            result,
+            stored=replace(
+                result.stored,
+                job=replace(result.stored.job, base_revision=git_revision),
+            ),
+        )
     assert result.attempt is not None
     running = replace(
         result,
@@ -126,8 +142,19 @@ def test_broker_fixture_to_http_worker_and_native_protected_workspace(
                     ),
                     definition=delivery.definition,
                 )
-                fixture = source_fixture(binding)
+                fixture = (
+                    git_source_fixture(binding) if git_base else source_fixture(binding)
+                )
                 reads: list[ClaimRequestIdentity] = []
+
+                class CommitReader:
+                    async def read(
+                        self, request: object, *, root_tree_sha: str
+                    ) -> bytes:
+                        assert request == fixture.snapshot.request
+                        assert root_tree_sha == fixture.snapshot.root_tree_sha
+                        assert fixture.snapshot.raw_commit is not None
+                        return fixture.snapshot.raw_commit
 
                 class Store:
                     async def recover(
@@ -168,6 +195,7 @@ def test_broker_fixture_to_http_worker_and_native_protected_workspace(
                         settings.github,
                         settings.repositories,
                         transport=httpx.MockTransport(provider_response),
+                        commit_source=CommitReader() if git_base else None,
                     ) as source:
                         reader = ReadAssignedBase(Store(), source, lambda proof: None)
                         yield BaseSourceOperations(
@@ -246,6 +274,23 @@ def test_broker_fixture_to_http_worker_and_native_protected_workspace(
                             for p in target.rglob("*")
                             if p.is_file()
                         )
+                        if git_base:
+                            git_prepared = await worker.prepare_git_base(
+                                delivery, workspace, materialized
+                            )
+                            assert git_prepared.materialization is materialized
+                            assert (
+                                git_prepared.branch
+                                == binding.definition.authorized_branch
+                            )
+                            assert (target / ".git/HEAD").read_bytes() == (
+                                "ref: refs/heads/"
+                                + binding.definition.authorized_branch
+                                + "\n"
+                            ).encode()
+                            assert (
+                                await preparation.recover_workspace(delivery) == history
+                            )
                         if editable:
                             handed = await worker.handoff_materialized_base(
                                 delivery, workspace, materialized

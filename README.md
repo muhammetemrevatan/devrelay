@@ -681,6 +681,45 @@ This is an explicit same-process transition without journal/schema changes. It
 creates no Git metadata, process, sandbox or restart-reuse permission. The worker
 CLI still checks configuration only; actual Codex/check launch remains disabled.
 
+## Verified shallow Git workspaces
+
+Optional `DEVRELAY_CONTROL_BROKER_GIT` enables original commit acquisition alongside
+the existing broker file export. It requires source delivery and explicit Linux
+Git executable/version/SHA256, HTTPS helper SHA256, helper directory and private
+directory settings. The broker uses the configured read-only provider credential,
+fixed repository URL, verified TLS, depth-one tree-filtered reads and finite process,
+output, memory, file and disk budgets. Ambient configuration, credential helpers, prompts,
+redirects and alternate transports are excluded. Repository numeric identity is
+rechecked after acquisition. Failed or uncertain `git-read-*` directories are
+retained and block another acquisition until trusted operator reconciliation.
+
+Build the optional control image with `docker build --target broker-git -t
+devrelay-control:git .`. This profile uses tested Git 2.47.3 from the pinned Debian
+package and records exact executable/helper identities in
+`/app/broker-git-profile.json`. Supply that JSON as the optional setting and mount
+its dedicated writable private directory, owned by UID10001 with mode0700. The
+default image target and source protocol remain unchanged when Git is disabled.
+Image construction does not enable integrations or run migrations.
+
+Source protocol v2 adds bounded original commit bytes. The worker verifies their
+Git object SHA and matching root tree; it does not reconstruct or authenticate a
+signature. After file materialization, explicit `prepare_git_base` validates the
+original ACK/execution/workspace pins and current heartbeat authority, then creates
+native metadata once: verified loose objects, authorized branch/HEAD, shallow
+boundary and a binary index. Existing `.git` is rejected. Provider credentials and
+Git network operations stay on the broker; metadata preparation runs no Git process
+on the worker.
+
+Before editable handoff, source bytes, metadata digest and native identities are
+rechecked. The initial index describes literal exported bytes: trusted Git attributes
+disable repository text/filter/encoding conversions. Symlinks, submodules, LFS,
+conversion-dependent and history-dependent profiles are unsupported. Parent history
+is absent beyond the accepted shallow boundary. Cancellation/expiry preserves
+uncertain resources and grants no restart, launch or capacity-release authority.
+Generated references must also fit the canonical Windows metadata path budget
+and the actual workspace path length; larger domain-valid references fail before
+metadata creation. Configure a short coding-branch prefix and workspace root.
+
 ## Managed trusted host processes
 
 `RunTrustedProcess` provides an explicit process bridge for host-owned commands

@@ -13,6 +13,7 @@ from devrelay.application.contracts.base_sources import (
     BaseSourceRequest,
     BaseSourceSnapshot,
 )
+from devrelay.application.contracts.git_commits import MAX_GIT_COMMIT_BYTES
 from devrelay.application.contracts.worker_recovery import AssignmentReference
 
 MAX_BASE_DELIVERY_BYTES = 12 * 1024**2
@@ -72,7 +73,7 @@ def encode_base_delivery(value: BaseSourceDelivery) -> bytes:
         for name, item in asdict(value.snapshot.request).items()
     }
     payload = {
-        "protocol_version": 1,
+        "protocol_version": 1 if value.snapshot.raw_commit is None else 2,
         "reference": reference,
         "claim_request_id": str(value.claim_request_id),
         "definition_digest": value.definition_digest,
@@ -90,6 +91,10 @@ def encode_base_delivery(value: BaseSourceDelivery) -> bytes:
             for item in value.snapshot.files
         ],
     }
+    if value.snapshot.raw_commit is not None:
+        payload["raw_commit"] = base64.b64encode(value.snapshot.raw_commit).decode(
+            "ascii"
+        )
     body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
     )
@@ -191,10 +196,16 @@ def decode_base_delivery(body: bytes) -> BaseSourceDelivery:
     if type(body) is not bytes or not 1 <= len(body) <= MAX_BASE_DELIVERY_BYTES:
         raise ValueError("Base delivery exceeds encoded channel limits.")
     _wire_shape(body)
+    decoded = json.loads(
+        body.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant
+    )
+    if type(decoded) is not dict:
+        raise ValueError("Base delivery requires an object.")
+    version = decoded.get("protocol_version")
+    if type(version) is not int or version not in (1, 2):
+        raise ValueError("Base delivery protocol is unsupported.")
     payload = _object(
-        json.loads(
-            body.decode("utf-8"), object_pairs_hook=_pairs, parse_constant=_constant
-        ),
+        decoded,
         {
             "protocol_version",
             "reference",
@@ -204,10 +215,20 @@ def decode_base_delivery(body: bytes) -> BaseSourceDelivery:
             "root_tree_sha",
             "manifest_digest",
             "files",
-        },
+        }
+        | ({"raw_commit"} if version == 2 else set()),
     )
-    if type(payload["protocol_version"]) is not int or payload["protocol_version"] != 1:
-        raise ValueError("Base delivery protocol is unsupported.")
+    raw_commit = None
+    if version == 2:
+        encoded_commit = _text(payload["raw_commit"])
+        if not 1 <= len(encoded_commit) <= 4 * ((MAX_GIT_COMMIT_BYTES + 2) // 3):
+            raise ValueError("Base delivery commit exceeds byte limits.")
+        raw_commit = base64.b64decode(encoded_commit, validate=True)
+        if (
+            not 1 <= len(raw_commit) <= MAX_GIT_COMMIT_BYTES
+            or base64.b64encode(raw_commit).decode("ascii") != encoded_commit
+        ):
+            raise ValueError("Base delivery commit bytes are not canonical.")
     raw_reference = _object(
         payload["reference"],
         {
@@ -270,6 +291,7 @@ def decode_base_delivery(body: bytes) -> BaseSourceDelivery:
         request=request,
         root_tree_sha=_text(payload["root_tree_sha"]),
         files=tuple(files),
+        raw_commit=raw_commit,
     )
     if snapshot.fingerprint() != _text(payload["manifest_digest"]):
         raise ValueError("Base delivery manifest digest is inconsistent.")

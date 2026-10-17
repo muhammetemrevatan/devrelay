@@ -1,13 +1,20 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 
 from devrelay.application.contracts.base_sources import BaseSourceLimits
+from devrelay.application.ports.git_commit_source import GitCommitSource
 from devrelay.application.ports.job_persistence import JobBranchReader
+from devrelay.config.broker_git import BrokerGitSettings
 from devrelay.config.github import GitHubSettings
 from devrelay.config.repositories import RepositorySettings
 from devrelay.infrastructure.github.base_source import GitHubBaseSource
+from devrelay.infrastructure.github.git_commit_source import (
+    BrokerGitPolicy,
+    GitHubGitCommitSource,
+)
 from devrelay.infrastructure.github.repository_source import (
     GitHubRepositorySource,
     RepositoryBinding,
@@ -85,8 +92,33 @@ async def open_github_base_source(
     *,
     limits: BaseSourceLimits = _DEFAULT_BASE_LIMITS,
     transport: httpx.AsyncBaseTransport | None = None,
+    commit_source: GitCommitSource | None = None,
+    git_settings: BrokerGitSettings | None = None,
 ) -> AsyncIterator[GitHubBaseSource]:
     """Trusted broker-side read resources only; never a worker credential channel."""
     bindings = _repository_bindings(settings, repositories)
+    if commit_source is not None and git_settings is not None:
+        raise ValueError("Broker Git source must have one explicit owner.")
+    if git_settings is not None:
+        commit_source = GitHubGitCommitSource(
+            policy=BrokerGitPolicy(
+                executable=Path(git_settings.executable),
+                executable_sha256=git_settings.executable_sha256,
+                version=git_settings.version,
+                exec_directory=Path(git_settings.exec_directory),
+                https_helper_sha256=git_settings.https_helper_sha256,
+                private_directory=Path(git_settings.private_directory),
+                operation_timeout_seconds=git_settings.operation_timeout_seconds,
+                total_timeout_seconds=git_settings.total_timeout_seconds,
+                stop_timeout_seconds=git_settings.stop_timeout_seconds,
+                maximum_disk_bytes=git_settings.maximum_disk_bytes,
+                maximum_retained_bytes=git_settings.maximum_retained_bytes,
+                maximum_processes=git_settings.maximum_processes,
+            ),
+            bindings=bindings,
+            token=settings.api_token.get_secret_value(),
+        )
     async with _github_client(settings, transport) as client:
-        yield GitHubBaseSource(client, bindings=bindings, limits=limits)
+        yield GitHubBaseSource(
+            client, bindings=bindings, limits=limits, commit_source=commit_source
+        )

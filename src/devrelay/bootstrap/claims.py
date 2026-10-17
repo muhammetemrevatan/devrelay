@@ -133,6 +133,7 @@ async def open_job_base_reader(
         settings.repositories,
         limits=BASE_DELIVERY_LIMITS,
         transport=github_transport,
+        git_settings=settings.broker_git,
     ) as source:
         yield ReadAssignedBase(claim_store(engine, policies), source, proof_guard)
 

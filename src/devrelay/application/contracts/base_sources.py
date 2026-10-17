@@ -7,6 +7,7 @@ from enum import StrEnum
 from math import isfinite
 from uuid import UUID
 
+from devrelay.application.contracts.git_commits import validate_git_commit
 from devrelay.application.contracts.workspace_recovery import canonical_workspace_path
 from devrelay.application.contracts.workspaces import WorkspaceReservation
 
@@ -100,6 +101,7 @@ class BaseSourceSnapshot:
     request: BaseSourceRequest
     root_tree_sha: str
     files: tuple[BaseSourceFile, ...] = field(repr=False)
+    raw_commit: bytes | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         self.validate()
@@ -109,6 +111,10 @@ class BaseSourceSnapshot:
             raise ValueError("Base snapshot requires pinned repository input.")
         self.request.__post_init__()
         _sha(self.root_tree_sha)
+        if self.raw_commit is not None:
+            validate_git_commit(
+                self.raw_commit, self.request.base_revision, self.root_tree_sha
+            )
         if type(self.files) is not tuple or len(self.files) > MAX_BASE_FILES:
             raise ValueError("Base snapshot exceeds bounded file count.")
         names: dict[str, str] = {}
@@ -163,6 +169,8 @@ class BaseSourceSnapshot:
                 for item in self.files
             ],
         }
+        if self.raw_commit is not None:
+            payload["raw_commit_sha256"] = hashlib.sha256(self.raw_commit).hexdigest()
         return hashlib.sha256(
             json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
         ).hexdigest()

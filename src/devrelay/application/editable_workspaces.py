@@ -26,13 +26,8 @@ _Value = TypeVar("_Value")
 _DEFAULT_POLICY = BaseMaterializationPolicy()
 
 
-class HandoffMaterializedBase:
-    """Make one verified live base editable without granting launch or replay.
-
-    Native release may finish after cancellation or authority loss. A rejected
-    result leaves uncertain mutable resources; sealing cannot restore immutability,
-    certify process stop, or release the coding reservation.
-    """
+class MaterializedWorkspaceOperation:
+    """Shared original-pin and live-authority guards for materialized operations."""
 
     def __init__(
         self,
@@ -137,6 +132,14 @@ class HandoffMaterializedBase:
                 cast(asyncio.Future[object], task),
                 min(remaining, self._policy.poll_interval_seconds),
             )
+
+
+class HandoffMaterializedBase(MaterializedWorkspaceOperation):
+    """Make one verified live base editable without granting launch or replay.
+
+    Rejected late releases leave uncertain mutable resources; sealing cannot
+    restore immutability, certify process stop or release the coding reservation.
+    """
 
     async def execute(
         self, delivery: AssignmentDelivery, materialization: BaseMaterialization

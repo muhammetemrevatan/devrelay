@@ -4,6 +4,7 @@ from enum import StrEnum
 from pydantic import Field, IPvAnyAddress, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from devrelay.config.broker_git import BrokerGitSettings
 from devrelay.config.database import DatabaseSettings
 from devrelay.config.github import GitHubSettings
 from devrelay.config.jira import JiraSettings
@@ -44,9 +45,12 @@ class ControlSettings(BaseSettings):
     workers: tuple[WorkerRegistrationSettings, ...] = Field(default=(), max_length=32)
     worker_claims: WorkerClaimsSettings | None = None
     worker_base_sources: WorkerBaseSourcesSettings | None = None
+    broker_git: BrokerGitSettings | None = None
 
     @model_validator(mode="after")
     def require_base_source_claims(self) -> ControlSettings:
+        if self.broker_git is not None and self.worker_base_sources is None:
+            raise ValueError("Broker Git requires explicitly enabled base delivery.")
         if self.worker_base_sources is not None and self.worker_claims is None:
             raise ValueError("Worker base sources require explicitly enabled claims.")
         return self

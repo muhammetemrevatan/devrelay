@@ -9,6 +9,10 @@ from devrelay.application.contracts.base_sources import (
     BaseSourceSnapshot,
 )
 from devrelay.application.contracts.editable_workspaces import EditableWorkspace
+from devrelay.application.contracts.git_sources import (
+    GitBaseSourceSnapshot,
+    GitWorkspacePreparation,
+)
 from devrelay.application.contracts.workspace_recovery import WorkspaceLocation
 from devrelay.application.contracts.workspaces import (
     WorkspaceBinding,
@@ -39,6 +43,9 @@ class WindowsWorkspaceScope:
         self._materialization_started = False
         self._materialization: BaseMaterialization | None = None
         self._handoff_started = False
+        self._git_preparation_started = False
+        self._source_snapshot: BaseSourceSnapshot | None = None
+        self._git_preparation: GitWorkspacePreparation | None = None
         self._sealed = False
         self._admission = asyncio.Lock()
         self._pending: asyncio.Future[object] | None = None
@@ -58,6 +65,14 @@ class WindowsWorkspaceScope:
     @property
     def materialization(self) -> BaseMaterialization | None:
         return self._materialization
+
+    @property
+    def source_snapshot(self) -> BaseSourceSnapshot | None:
+        return self._source_snapshot
+
+    @property
+    def git_preparation(self) -> GitWorkspacePreparation | None:
+        return self._git_preparation
 
     def seal(self) -> None:
         self._sealed = True
@@ -136,6 +151,37 @@ class WindowsWorkspaceScope:
             if not isinstance(result, BaseMaterialization):
                 raise WorkspaceUnavailable("Live materialization is unavailable.")
             self._materialization = result
+            self._source_snapshot = snapshot
+            return result
+        except BaseException:
+            self.seal()
+            raise
+
+    async def prepare_git_metadata(
+        self,
+        source: GitBaseSourceSnapshot,
+        materialization: BaseMaterialization,
+        branch: str,
+    ) -> GitWorkspacePreparation:
+        if (
+            self._git_preparation_started
+            or self._handoff_started
+            or materialization is not self._materialization
+        ):
+            raise WorkspaceUnavailable("Live Git metadata preparation is unavailable.")
+        self._git_preparation_started = True
+        try:
+            result = await self._invoke(
+                lambda: self._native.prepare_git_metadata(
+                    source, materialization, branch
+                )
+            )
+            if (
+                not isinstance(result, GitWorkspacePreparation)
+                or result.materialization is not materialization
+            ):
+                raise WorkspaceUnavailable("Git preparation changed original pins.")
+            self._git_preparation = result
             return result
         except BaseException:
             self.seal()
@@ -146,9 +192,11 @@ class WindowsWorkspaceScope:
             raise WorkspaceUnavailable("Live editable workspace is unavailable.")
         self._handoff_started = True
         try:
-            return await self._invoke(
+            result = await self._invoke(
                 lambda: self._native.handoff_materialized_base(materialization)
             )
+            self._source_snapshot = None
+            return result
         except BaseException:
             self.seal()
             raise

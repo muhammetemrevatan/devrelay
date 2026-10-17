@@ -86,6 +86,14 @@ jobs:
           docker exec devrelay-control-smoke python -c "from devrelay.application.base_source_delivery import ReadAssignedBase; from devrelay.application.contracts.base_source_delivery import decode_base_delivery; from devrelay.infrastructure.control.base_sources import HttpControlBaseSource; assert ReadAssignedBase and decode_base_delivery and HttpControlBaseSource"
           docker exec devrelay-control-smoke python -c "from devrelay.application.editable_workspaces import HandoffMaterializedBase; from devrelay.application.contracts.editable_workspaces import EditableWorkspace; from devrelay.application.ports.editable_workspace import EditableWorkspacePort; assert HandoffMaterializedBase and EditableWorkspace and EditableWorkspacePort"
           docker exec devrelay-control-smoke python -c "from devrelay.application.trusted_processes import RunTrustedProcess; from devrelay.bootstrap.trusted_processes import open_trusted_process_scope; from devrelay.infrastructure.worker_processes.trusted_windows import WindowsTrustedProcess; assert RunTrustedProcess and open_trusted_process_scope and WindowsTrustedProcess"
+          docker exec devrelay-control-smoke python -c "from devrelay.application.git_workspaces import PrepareMaterializedGit; from devrelay.infrastructure.github.git_commit_source import GitHubGitCommitSource; from devrelay.infrastructure.workspace.git_metadata import build_git_metadata; assert PrepareMaterializedGit and GitHubGitCommitSource and build_git_metadata"
+      - name: Build optional Git broker image
+        run: docker build --target broker-git --tag devrelay-control:git-ci .
+      - name: Verify installed Git profile
+        run: |
+          docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
+            --security-opt no-new-privileges --entrypoint python devrelay-control:git-ci \
+            -c 'import json,os,subprocess; from pathlib import Path; from devrelay.config.broker_git import BrokerGitSettings; from devrelay.infrastructure.github.git_commit_source import BrokerGitPolicy,_verify_profile; value=json.loads(Path("/app/broker-git-profile.json").read_text()); BrokerGitSettings.model_validate(value); value.update(executable=Path(value["executable"]),exec_directory=Path(value["exec_directory"]),private_directory=Path(value["private_directory"])); profile=BrokerGitPolicy(**value); _verify_profile(profile); assert os.geteuid()==10001; assert subprocess.check_output([str(profile.executable),"--version"],text=True).strip()==profile.version'
       - name: Show container diagnostics
         if: failure()
         run: docker logs devrelay-control-smoke || true

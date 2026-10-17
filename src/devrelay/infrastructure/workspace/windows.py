@@ -12,6 +12,10 @@ from devrelay.application.contracts.base_sources import (
     BaseSourceSnapshot,
 )
 from devrelay.application.contracts.editable_workspaces import EditableWorkspace
+from devrelay.application.contracts.git_sources import (
+    GitBaseSourceSnapshot,
+    GitWorkspacePreparation,
+)
 from devrelay.application.contracts.workspace_recovery import (
     WorkspaceLocation,
     canonical_workspace_path,
@@ -22,6 +26,11 @@ from devrelay.application.contracts.workspaces import (
     WorkspaceReservation,
 )
 from devrelay.application.ports.workspace_reservation import WorkspaceUnavailable
+from devrelay.infrastructure.workspace.git_metadata import (
+    GitMetadata,
+    GitMetadataFile,
+    build_git_metadata,
+)
 
 _FAILURE = "Windows workspace reservation is unavailable."
 _DWORD = ctypes.c_uint32
@@ -149,12 +158,19 @@ class WindowsWorkspaceReservation:
         self._materialization: BaseMaterialization | None = None
         self._materialization_snapshot: BaseSourceSnapshot | None = None
         self._materialization_files: tuple[
-            tuple[str, int, WorkspaceDirectoryIdentity, BaseSourceFile], ...
+            tuple[
+                str, int, WorkspaceDirectoryIdentity, BaseSourceFile | GitMetadataFile
+            ],
+            ...,
         ] = ()
         self._materialization_nodes: dict[str, bool] = {}
         self._materialization_digest: str | None = None
         self._materialization_handles: tuple[int, ...] = ()
         self._handoff_used = False
+        self._git_metadata_used = False
+        self._git_metadata: GitMetadata | None = None
+        self._git_preparation: GitWorkspacePreparation | None = None
+        self._git_metadata_digest: str | None = None
 
     @property
     def binding(self) -> WorkspaceBinding:
@@ -171,6 +187,10 @@ class WindowsWorkspaceReservation:
     @property
     def materialization(self) -> BaseMaterialization | None:
         return self._materialization
+
+    @property
+    def git_preparation(self) -> GitWorkspacePreparation | None:
+        return self._git_preparation
 
     def seal_materialization(self) -> None:
         self._materialization_sealed.set()
@@ -406,7 +426,7 @@ class WindowsWorkspaceReservation:
             function.argtypes, function.restype = args, result
 
     def _write_file(
-        self, target: str, item: BaseSourceFile
+        self, target: str, item: BaseSourceFile | GitMetadataFile
     ) -> tuple[int, WorkspaceDirectoryIdentity]:
         self._check_materialization()
         native = self._native()
@@ -434,7 +454,7 @@ class WindowsWorkspaceReservation:
         self,
         handle: int,
         target: str,
-        item: BaseSourceFile,
+        item: BaseSourceFile | GitMetadataFile,
         identity: WorkspaceDirectoryIdentity,
     ) -> None:
         self._check_materialization()
@@ -613,6 +633,126 @@ class WindowsWorkspaceReservation:
                 self.seal_materialization()
                 raise WorkspaceUnavailable(_FAILURE) from None
 
+    def _verify_materialized_base(self, result: BaseMaterialization) -> None:
+        self._check_materialization()
+        snapshot = self._materialization_snapshot
+        if (
+            not isinstance(result, BaseMaterialization)
+            or result is not self._materialization
+            or result.reservation is not self._reservation
+            or self._location is None
+            or snapshot is None
+            or self._find_handles
+        ):
+            raise WorkspaceUnavailable(_FAILURE)
+        result.__post_init__()
+        self._binding.__post_init__()
+        snapshot.validate()
+        if (
+            snapshot.fingerprint() != self._materialization_digest
+            or result.manifest_digest != self._materialization_digest
+            or result.source != snapshot.request
+            or result.root_tree_sha != snapshot.root_tree_sha
+            or result.file_count != len(snapshot.files)
+            or result.total_bytes != sum(len(item.content) for item in snapshot.files)
+        ):
+            raise WorkspaceUnavailable(_FAILURE)
+        if self._git_metadata is not None:
+            self._git_metadata.validate()
+            if (
+                self._git_metadata.fingerprint() != self._git_metadata_digest
+                or self._git_preparation is None
+                or self._git_preparation.materialization is not result
+                or self._git_preparation.branch
+                != self._binding.definition.authorized_branch
+                or self._git_preparation.metadata_digest != self._git_metadata_digest
+            ):
+                raise WorkspaceUnavailable(_FAILURE)
+        target = self._policy.root_directory + "\\" + result.reservation.directory_name
+        self._recheck_root()
+        self._verify_tree(target, self._materialization_nodes)
+        for path, handle, identity, item in self._materialization_files:
+            self._verify_file_bytes(handle, path, item, identity)
+        self._recheck_root()
+        self._check_materialization()
+
+    def prepare_git_metadata(
+        self,
+        source: GitBaseSourceSnapshot,
+        result: BaseMaterialization,
+        branch: str,
+    ) -> GitWorkspacePreparation:
+        """Create genuine shallow metadata inside this exact retained live scope."""
+        with self._lock:
+            if self._git_metadata_used or self._handoff_used:
+                raise WorkspaceUnavailable(_FAILURE)
+            self._git_metadata_used = True
+            try:
+                self._verify_materialized_base(result)
+                if (
+                    not isinstance(source, GitBaseSourceSnapshot)
+                    or branch != self._binding.definition.authorized_branch
+                ):
+                    raise WorkspaceUnavailable(_FAILURE)
+                source.validate()
+                if source.snapshot.fingerprint() != self._materialization_digest:
+                    raise WorkspaceUnavailable(_FAILURE)
+                metadata = build_git_metadata(source, branch)
+                digest = metadata.fingerprint()
+                target = (
+                    self._policy.root_directory
+                    + "\\"
+                    + result.reservation.directory_name
+                )
+                nodes = dict(self._materialization_nodes)
+                nodes.update((path, True) for path in metadata.directories)
+                nodes.update((item.path, False) for item in metadata.files)
+                for path in (
+                    *metadata.directories,
+                    *(item.path for item in metadata.files),
+                ):
+                    if (
+                        len(
+                            (target + "\\" + path.replace("/", "\\")).encode(
+                                "utf-16-le"
+                            )
+                        )
+                        // 2
+                        >= 260
+                    ):
+                        raise WorkspaceUnavailable(_FAILURE)
+                preparation = GitWorkspacePreparation(
+                    materialization=result, branch=branch, metadata_digest=digest
+                )
+                self._verify_materialized_base(result)
+                retained_count = len(self._handles)
+                for relative in sorted(
+                    metadata.directories, key=lambda path: (path.count("/"), path)
+                ):
+                    self._check_materialization()
+                    path = target + "\\" + relative.replace("/", "\\")
+                    if not self._native().CreateDirectoryW(path, None):
+                        raise WorkspaceUnavailable(_FAILURE)
+                    handle, identity = self._open_directory(path)
+                    self._held.append((path, handle, identity))
+                files = list(self._materialization_files)
+                for item in metadata.files:
+                    self._check_materialization()
+                    path = target + "\\" + item.path.replace("/", "\\")
+                    handle, identity = self._write_file(path, item)
+                    files.append((path, handle, identity, item))
+                self._materialization_files = tuple(files)
+                self._materialization_nodes = nodes
+                self._materialization_handles += tuple(self._handles[retained_count:])
+                self._git_metadata = metadata
+                self._git_metadata_digest = digest
+                self._git_preparation = preparation
+                self._verify_materialized_base(result)
+                return preparation
+            except Exception:
+                self.seal_materialization()
+                raise WorkspaceUnavailable(_FAILURE) from None
+
     def handoff_materialized_base(
         self, result: BaseMaterialization
     ) -> EditableWorkspace:
@@ -627,40 +767,14 @@ class WindowsWorkspaceReservation:
                 raise WorkspaceUnavailable(_FAILURE)
             self._handoff_used = True
             try:
-                self._check_materialization()
-                snapshot = self._materialization_snapshot
-                if (
-                    not isinstance(result, BaseMaterialization)
-                    or result is not self._materialization
-                    or result.reservation is not self._reservation
-                    or self._location is None
-                    or snapshot is None
-                    or self._find_handles
-                ):
-                    raise WorkspaceUnavailable(_FAILURE)
-                result.__post_init__()
-                self._binding.__post_init__()
-                snapshot.validate()
-                if (
-                    snapshot.fingerprint() != self._materialization_digest
-                    or result.manifest_digest != self._materialization_digest
-                    or result.source != snapshot.request
-                    or result.root_tree_sha != snapshot.root_tree_sha
-                    or result.file_count != len(snapshot.files)
-                    or result.total_bytes
-                    != sum(len(item.content) for item in snapshot.files)
-                ):
+                self._verify_materialized_base(result)
+                if self._location is None:
                     raise WorkspaceUnavailable(_FAILURE)
                 target = (
                     self._policy.root_directory
                     + "\\"
                     + result.reservation.directory_name
                 )
-                self._recheck_root()
-                self._verify_tree(target, self._materialization_nodes)
-                for path, handle, identity, item in self._materialization_files:
-                    self._verify_file_bytes(handle, path, item, identity)
-                self._recheck_root()
                 handles = self._materialization_handles
                 if (
                     len(handles) != len(self._materialization_nodes)
@@ -689,6 +803,8 @@ class WindowsWorkspaceReservation:
                 self._materialization_nodes = {}
                 self._materialization_digest = None
                 self._materialization_handles = ()
+                self._git_metadata = None
+                self._git_metadata_digest = None
                 return handoff
             except Exception:
                 self.seal_materialization()
