@@ -38,6 +38,7 @@ _FAILURE = "Broker Git commit acquisition is unavailable."
 _PROMISOR_NOTICE = (
     b"warning: This repository uses promisor remotes. Some objects may not be loaded.\n"
 )
+_EMPTY_TREE_SHA = hashlib.sha1(b"tree 0\0", usedforsecurity=False).hexdigest()
 _SETUP = (
     "import os,resource,sys;"
     "resource.setrlimit(resource.RLIMIT_CPU,(10,10));"
@@ -640,13 +641,33 @@ class GitHubGitCommitSource:
                 "--batch-check=%(objectname) %(objecttype) %(objectsize)",
             )
         )
+        commit_row = f"{request.base_revision} commit {length}\n".encode("ascii")
+        # Git 2.55 can include the zero-byte root tree despite tree:0. Accept only
+        # this exact expected object, then independently read/hash its bytes.
+        # --batch-all-objects defaults to ascending object-name order.
+        empty_root_present = tree == _EMPTY_TREE_SHA and objects.stdout == b"".join(
+            sorted((commit_row, f"{_EMPTY_TREE_SHA} tree 0\n".encode("ascii")))
+        )
         if objects.stderr not in (
             b"",
             _PROMISOR_NOTICE,
-        ) or objects.stdout != f"{request.base_revision} commit {length}\n".encode(
-            "ascii"
-        ):
+        ) or (objects.stdout != commit_row and not empty_root_present):
             raise ValueError(_FAILURE)
+        if empty_root_present:
+            empty_root = command(prefix + ("cat-file", "tree", tree), maximum_stdout=1)
+            if (
+                empty_root.stderr
+                or empty_root.stdout != b""
+                or hashlib.sha1(
+                    b"tree "
+                    + str(len(empty_root.stdout)).encode("ascii")
+                    + b"\0"
+                    + empty_root.stdout,
+                    usedforsecurity=False,
+                ).hexdigest()
+                != tree
+            ):
+                raise ValueError(_FAILURE)
         repository = root / "repo"
         shallow = repository / "shallow"
         parents = any(

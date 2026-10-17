@@ -34,11 +34,11 @@ TRACE = b"packet:          git< version 2\npacket:          git< fetch=shallow w
 
 
 def raw_commit(
-    *, signed: bool = False, extra: bool = False, parent: bool = True
+    *, signed: bool = False, extra: bool = False, parent: bool = True, tree: str = TREE
 ) -> bytes:
     return (
         b"tree "
-        + TREE.encode()
+        + tree.encode()
         + b"\n"
         + (b"parent " + b"b" * 40 + b"\n" if parent else b"")
         + b"author Fixture <fixture@example.invalid> 1700000000 +0330\n"
@@ -98,6 +98,9 @@ class Commands:
         self.entered, self.release = Event(), Event()
         self.block = False
         self.on_disk: list[bytes] = []
+        self.inventory: bytes | None = None
+        self.inventory_stderr = b""
+        self.empty_tree_output = git_source._Output(0, b"", b"")
 
     def run(
         self,
@@ -173,16 +176,26 @@ class Commands:
         if "commit" in arguments:
             value = self.raw + b"changed" if self.damage == "raw" else self.raw
             return git_source._Output(0, value, b"")
+        if "tree" in arguments:
+            assert arguments[-1] == git_source._EMPTY_TREE_SHA
+            assert maximum_stdout == 1
+            return self.empty_tree_output
         if "--batch-all-objects" in arguments:
             value = f"{sha} commit {len(self.raw)}\n".encode()
             if self.damage == "extra_objects":
                 value += b"f" * 40 + b" blob 999\n"
+            elif self.damage == "extra_empty_tree":
+                value += b"4b825dc642cb6eb9a060e54bf8d69288fbee4904 tree 0\n"
             if self.damage == "settlement":
                 self.settled = False
             self.on_disk = [
                 item.read_bytes() for item in self.root.rglob("*") if item.is_file()
             ]
-            return git_source._Output(0, value, b"")
+            return git_source._Output(
+                0,
+                self.inventory if self.inventory is not None else value,
+                self.inventory_stderr,
+            )
         raise AssertionError("Unexpected fixture command.")
 
 
@@ -270,6 +283,111 @@ def test_fixed_source_reads_original_unsigned_signed_and_extra_header_bytes(
     )
 
 
+@pytest.mark.parametrize("present", [False, True])
+@pytest.mark.parametrize("commit_first", [False, True])
+@pytest.mark.parametrize("notice", [b"", git_source._PROMISOR_NOTICE])
+def test_empty_root_accepts_only_commit_or_exact_sorted_commit_and_empty_tree(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    present: bool,
+    commit_first: bool,
+    notice: bytes,
+) -> None:
+    empty_sha = git_source._EMPTY_TREE_SHA
+    raw = raw_commit(tree=empty_sha)
+    # Exercise either side of the fixed tree hash in Git's documented hash order.
+    for nonce in range(1000):
+        candidate = raw + str(nonce).encode()
+        if (commit_sha(candidate) < empty_sha) == commit_first:
+            raw = candidate
+            break
+    else:
+        raise AssertionError("No fixture commit on requested side of empty tree hash.")
+    setup = context(tmp_path, monkeypatch, raw=raw)
+    commit_row = f"{setup.request.base_revision} commit {len(raw)}\n".encode()
+    tree_row = f"{empty_sha} tree 0\n".encode()
+    setup.commands.inventory = (
+        b"".join(sorted((commit_row, tree_row))) if present else commit_row
+    )
+    setup.commands.inventory_stderr = notice
+
+    result = asyncio.run(setup.source.read(setup.request, root_tree_sha=empty_sha))
+
+    tree_calls = [args for args, _ in setup.commands.calls if "tree" in args]
+    assert result == raw
+    assert list(setup.policy.private_directory.iterdir()) == []
+    assert len(tree_calls) == int(present)
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        "missing_commit",
+        "duplicate_tree",
+        "duplicate_commit",
+        "unsorted",
+        "other_tree",
+        "wrong_type",
+        "wrong_size",
+        "extra_blob",
+        "extra_commit",
+        "notice_changed",
+        "tree_bytes",
+        "tree_stderr",
+        "tree_status",
+    ],
+)
+def test_empty_root_rejects_unexpected_inventory_or_unverified_raw_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, damage: str
+) -> None:
+    empty_sha = git_source._EMPTY_TREE_SHA
+    setup = context(tmp_path, monkeypatch, raw=raw_commit(tree=empty_sha))
+    commit_row = f"{setup.request.base_revision} commit {len(setup.raw)}\n".encode()
+    tree_row = f"{empty_sha} tree 0\n".encode()
+    inventory = b"".join(sorted((commit_row, tree_row)))
+    if damage == "missing_commit":
+        inventory = tree_row
+    elif damage == "duplicate_tree":
+        inventory = b"".join(sorted((commit_row, tree_row, tree_row)))
+    elif damage == "duplicate_commit":
+        inventory = b"".join(sorted((commit_row, commit_row, tree_row)))
+    elif damage == "unsorted":
+        inventory = b"".join(reversed(sorted((commit_row, tree_row))))
+    elif damage == "other_tree":
+        inventory = inventory.replace(empty_sha.encode(), b"f" * 40)
+    elif damage == "wrong_type":
+        inventory = inventory.replace(b" tree 0\n", b" blob 0\n")
+    elif damage == "wrong_size":
+        inventory = inventory.replace(b" tree 0\n", b" tree 1\n")
+    elif damage == "extra_blob":
+        inventory += b"f" * 40 + b" blob 1\n"
+    elif damage == "extra_commit":
+        inventory += b"f" * 40 + b" commit 100\n"
+    elif damage == "notice_changed":
+        setup.commands.inventory_stderr = (
+            git_source._PROMISOR_NOTICE + b"warning: extra\n"
+        )
+    elif damage == "tree_bytes":
+        setup.commands.empty_tree_output = git_source._Output(0, b"x", b"")
+    elif damage == "tree_stderr":
+        setup.commands.empty_tree_output = git_source._Output(
+            0, b"", b"warning: extra\n"
+        )
+    elif damage == "tree_status":
+        setup.commands.empty_tree_output = git_source._Output(1, b"", b"")
+    setup.commands.inventory = inventory
+
+    with pytest.raises(BaseSourceUnavailable):
+        asyncio.run(setup.source.read(setup.request, root_tree_sha=empty_sha))
+
+    assert any(
+        item.name.startswith("git-read-")
+        for item in setup.policy.private_directory.iterdir()
+    )
+    if not damage.startswith("tree_"):
+        assert not any("tree" in args for args, _ in setup.commands.calls)
+
+
 def test_token_is_transient_scoped_env_only_with_no_ambient_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -332,6 +450,7 @@ def test_token_is_transient_scoped_env_only_with_no_ambient_configuration(
         "size",
         "raw",
         "extra_objects",
+        "extra_empty_tree",
         "shallow_missing",
         "shallow_wrong",
         "alternates",

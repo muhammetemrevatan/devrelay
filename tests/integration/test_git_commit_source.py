@@ -79,10 +79,12 @@ def object_sha(raw: bytes) -> str:
 
 
 @pytest.mark.parametrize("variant", ["unsigned", "signed", "encoding", "mergetag"])
+@pytest.mark.parametrize("empty_tree", [False, True])
 def test_actual_git_preserves_original_commit_bytes_from_local_filtered_shallow_fixture(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     variant: str,
+    empty_tree: bool,
 ) -> None:
     pins = profile(tmp_path)
     remote = tmp_path / "remote.git"
@@ -93,11 +95,21 @@ def test_actual_git_preserves_original_commit_bytes_from_local_filtered_shallow_
         ("init", "--bare", "--quiet", "--template=" + str(template), str(remote)),
     )
     prefix = ("--git-dir=" + str(remote),)
+    blob = (
+        local_git(
+            pins.executable,
+            prefix + ("hash-object", "-t", "blob", "-w", "--stdin"),
+            stdin=b"Literal fixture source.\n",
+        )
+        .decode()
+        .strip()
+    )
+    # Exercise both literal source and Git 2.55's special empty-root transfer.
     tree = (
         local_git(
             pins.executable,
             prefix + ("hash-object", "-t", "tree", "-w", "--stdin"),
-            stdin=b"",
+            stdin=b"" if empty_tree else b"100644 fixture.txt\0" + bytes.fromhex(blob),
         )
         .decode()
         .strip()
@@ -192,6 +204,23 @@ def test_actual_git_preserves_original_commit_bytes_from_local_filtered_shallow_
                 environment["GIT_CONFIG_COUNT"] = str(count + 1)
                 environment["GIT_ALLOW_PROTOCOL"] = "file"
             result = super().run(arguments, environment, maximum_stdout=maximum_stdout)
+            if "--batch-all-objects" in arguments:
+                expected = f"{sha} commit {len(raw)}\n".encode("ascii")
+                allowed: tuple[bytes, ...] = (expected,)
+                if empty_tree:
+                    allowed += (
+                        b"".join(
+                            sorted((expected, f"{tree} tree 0\n".encode("ascii")))
+                        ),
+                    )
+                assert result.stdout in allowed, (
+                    pins.version,
+                    result.stdout,
+                )
+                assert result.stderr in (b"", git_source._PROMISOR_NOTICE), (
+                    pins.version,
+                    result.stderr,
+                )
             return result
 
     monkeypatch.setattr(git_source, "_LinuxCommands", LocalFixtureCommands)
