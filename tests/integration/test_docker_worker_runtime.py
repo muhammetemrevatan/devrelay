@@ -23,8 +23,8 @@ from devrelay.application.contracts.processes import ProcessStopStatus
 from devrelay.application.contracts.submissions import CheckPolicy
 from devrelay.bootstrap.workspaces import open_worker_workspace
 from devrelay.infrastructure.containers import (
-    ContainerUnavailable,
     ContainerSpec,
+    ContainerUnavailable,
     DockerEngine,
     OwnedContainer,
 )
