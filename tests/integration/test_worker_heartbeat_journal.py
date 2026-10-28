@@ -448,7 +448,7 @@ def test_v4_upgrade_preserves_ciphertext_original_anchors_and_completion_atomica
 
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         assert connection.execute("SELECT version FROM metadata").fetchone() == (
-            (4,) if damaged else (8,)
+            (4,) if damaged else (9,)
         )
         assert (
             tuple(

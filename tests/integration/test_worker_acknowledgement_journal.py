@@ -344,7 +344,7 @@ def test_v2_upgrade_preserves_valid_recovery_rows(tmp_path: Path, phase: str) ->
                 for table in ("pending_claim", "completed_no_work")
             )
             assert after == before
-            assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
+            assert connection.execute("SELECT version FROM metadata").fetchone() == (9,)
     finally:
         upgraded.close()
 

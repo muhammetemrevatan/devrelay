@@ -6,11 +6,14 @@ readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "alembic>=1.20,<2",
+    "docker==7.2.0",
     "fastapi>=0.115,<1",
     "httpx>=0.28,<1",
     "psycopg[binary]>=3.3,<4",
     "pydantic>=2,<3",
     "pydantic-settings>=2,<3",
+    "pywin32>=311,<400 ; sys_platform == 'win32'",
+    "requests>=2.32,<3",
     "sqlalchemy[asyncio]>=2.1,<2.2",
     "uvicorn>=0.34,<1",
 ]
@@ -26,6 +29,9 @@ dev = [
     "mypy>=1,<3",
     "pytest>=8,<10",
     "ruff>=0.11,<1",
+    "types-docker>=7.1,<8",
+    "types-requests>=2.32,<3",
+    "uv-build==0.12.24",
 ]
 
 [build-system]
@@ -52,7 +58,10 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "--import-mode=importlib -ra"
-markers = ["postgres: requires an explicitly configured disposable PostgreSQL database"]
+markers = [
+    "postgres: requires an explicitly configured disposable PostgreSQL database",
+    "docker_runtime: requires an explicitly pinned disposable Linux worker image",
+]
 
 [tool.importlinter]
 root_package = "devrelay"

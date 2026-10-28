@@ -560,7 +560,7 @@ def test_valid_v7_upgrade_preserves_originals_and_marks_only_execution_history_u
             state.original.workspace_history_unknown == before.workspace_history_unknown
         )
         with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
-            assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
+            assert connection.execute("SELECT version FROM metadata").fetchone() == (9,)
     finally:
         reopened.close()
 

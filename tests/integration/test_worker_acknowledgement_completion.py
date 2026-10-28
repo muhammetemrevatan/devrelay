@@ -237,7 +237,7 @@ def test_v3_intent_upgrade_is_atomic_and_preserves_ciphertext_and_pins(
             upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         assert connection.execute("SELECT version FROM metadata").fetchone() == (
-            (3,) if damage else (8,)
+            (3,) if damage else (9,)
         )
         assert (
             tuple(

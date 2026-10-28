@@ -154,12 +154,15 @@ class SqliteClaimStore:
                 (5, scope.key),
                 (6, scope.key),
                 (7, scope.key),
+                (8, scope.key),
             ):
                 state = recovery_state(
                     connection, self._scope, self._read_request(), allow_legacy=True
                 )
+                if existing == (8, scope.key):
+                    read_result_state(connection, state)
                 upgrade_outcome_schema(connection, scope, state)
-            elif existing != (8, scope.key):
+            elif existing != (9, scope.key):
                 raise WorkerStateUnavailable(_FAILURE)
             self._read_state()
             connection.execute("COMMIT")

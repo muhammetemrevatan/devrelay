@@ -3,7 +3,7 @@ import pytest
 from devrelay.worker.main import main
 
 
-def test_worker_execution_is_explicitly_unavailable(
+def test_worker_requires_an_explicit_action(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     monkeypatch.setattr("sys.argv", ["devrelay-worker"])
@@ -12,7 +12,9 @@ def test_worker_execution_is_explicitly_unavailable(
         main()
 
     assert error.value.code == 2
-    assert "Job execution is not implemented" in capsys.readouterr().err
+    assert (
+        "Choose --check-config, --check-runtime or --run-one" in capsys.readouterr().err
+    )
 
 
 def test_configuration_check_does_not_print_credentials(
