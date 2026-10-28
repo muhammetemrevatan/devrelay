@@ -1065,6 +1065,9 @@ journal and native candidate handles. Only the task UUID directory is shared;
 checks receive a read-only mount. Each container uses a read-only root, non-root
 user, no added capabilities, no-new-privileges, 2 CPUs, 2 GiB and 128 PIDs.
 The pinned Codex Linux sandbox stays enabled inside the container.
+The host must permit its unprivileged user namespaces; an incompatible kernel or
+AppArmor policy fails readiness. The container CI job pins Ubuntu 22.04 for this
+capability without changing host security policy or adding container privileges.
 
 Journal version 9 preserves version-8 proof, execution, workspace and result bytes
 while adding the `docker_linux` isolation value; it never repins an old execution.
@@ -1110,6 +1113,9 @@ accepted by control. Configure cache output under `/tmp` or disable it, such as
 `pytest -p no:cacheprovider` and `ruff --no-cache`. Windows commands and `uv run`
 are rejected rather than translated. Dependencies come from the image; candidate
 packages are built offline into temporary storage and imported from that build.
+The trusted check shim reports actual command settlement separately from sandbox
+startup. Missing executables, namespace failures and signals never become invented
+check exit codes; a genuine exit 125 remains an ordinary failed command.
 
 Containers are observed and removed by their original IDs before a candidate is
 captured or a check result is accepted. Cancellation seals admission and drains

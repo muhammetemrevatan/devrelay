@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import re
+import struct
 from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import asdict, dataclass
@@ -32,6 +33,7 @@ from devrelay.application.worker_executions import ExecutionAuthorityGuard
 from devrelay.infrastructure.codex_events import CodexJsonlDecoder
 from devrelay.infrastructure.containers import (
     MAX_INPUT_BYTES,
+    MAX_OUTPUT_BYTES,
     ContainerSpec,
     ContainerUnavailable,
     DockerEngine,
@@ -53,6 +55,22 @@ _PROBE_CHECKS = frozenset(
         "project_config_ignored",
     }
 )
+
+
+def decode_fixed_check(raw: bytes, outer_stderr: bytes) -> tuple[int, bytes, bytes]:
+    """Decode the trusted entry's frame, never infer command exit from bwrap exit."""
+    magic = b"DEVRELAY_CHECK_RESULT_V1\0"
+    header = len(magic) + 12
+    if (
+        outer_stderr
+        or not raw.startswith(magic)
+        or not header <= len(raw) <= MAX_OUTPUT_BYTES
+    ):
+        raise ContainerUnavailable("The fixed command settlement frame is unavailable.")
+    code, stdout_size, stderr_size = struct.unpack("!III", raw[len(magic) : header])
+    if code > 255 or header + stdout_size + stderr_size != len(raw):
+        raise ContainerUnavailable("The fixed command settlement frame is invalid.")
+    return code, raw[header : header + stdout_size], raw[header + stdout_size :]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -134,6 +152,10 @@ async def probe_runtime(
         ).encode()
         try:
             result = await owned.run(payload, timeout_seconds=120)
+            if result.exit_code != 0:
+                raise ContainerUnavailable(
+                    "The Linux runtime isolation checks did not pass."
+                )
             value = decode_json(result.stdout)
             expected_checks = _PROBE_CHECKS | (
                 {
@@ -145,7 +167,7 @@ async def probe_runtime(
                     "harness_image",
                 }
                 if phase == "code"
-                else set()
+                else {"check_command_admission"}
             )
             if (
                 result.exit_code != 0
@@ -338,12 +360,15 @@ class DockerCodingRuntime:
                 raise ContainerUnavailable(
                     "The execution profile failed before a verified command result."
                 )
+            code, stdout, stderr = settled.exit_code, settled.stdout, settled.stderr
+            if mode == "check":
+                code, stdout, stderr = decode_fixed_check(stdout, stderr)
             return TrustedProcessResult(
                 execution_id=self._expected.intent.execution_id,
                 reason=TrustedProcessStopReason.EXITED,
-                exit_code=settled.exit_code,
-                stdout=settled.stdout,
-                stderr=settled.stderr,
+                exit_code=code,
+                stdout=stdout,
+                stderr=stderr,
                 stop_status=ProcessStopStatus.EMPTY_VERIFIED,
             )
         except BaseException:

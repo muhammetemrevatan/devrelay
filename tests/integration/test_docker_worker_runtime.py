@@ -31,6 +31,7 @@ from devrelay.infrastructure.containers import (
 from devrelay.infrastructure.docker_coding import (
     DockerCodingProfile,
     DockerCodingRuntime,
+    decode_fixed_check,
     probe_runtime,
 )
 from devrelay.infrastructure.workspace.windows import WindowsWorkspacePolicy
@@ -213,7 +214,9 @@ def test_fixed_check_imports_actual_candidate_package(tmp_path: Path) -> None:
                 timeout_seconds=90,
             )
             assert result.exit_code == 0, result.stderr
-            assert b"CANDIDATE_PACKAGE_CONFIRMED" in result.stdout
+            code, stdout, stderr = decode_fixed_check(result.stdout, result.stderr)
+            assert code == 0, stderr
+            assert b"CANDIDATE_PACKAGE_CONFIRMED" in stdout
         finally:
             await owned.aclose()
             await docker.aclose()
@@ -305,6 +308,77 @@ def test_cancellation_kills_original_container_with_descendants(tmp_path: Path) 
         finally:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+            await owned.aclose()
+            await docker.aclose()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "argv, actual_exit",
+    [
+        (["python", "-c", "raise SystemExit(125)"], 125),
+        (
+            [
+                "python",
+                "-c",
+                "import ctypes,os; libc=ctypes.CDLL(None,use_errno=True); assert libc.ptrace(16,os.getppid(),0,0)==-1; assert ctypes.get_errno()==1",
+            ],
+            0,
+        ),
+        (
+            ["python", "-c", "print('DEVRELAY_CHECK_RESULT_V1'); raise SystemExit(17)"],
+            17,
+        ),
+        (["devrelay-nonexistent-fixture-command"], None),
+        (
+            ["python", "-c", "import os,signal; os.kill(os.getpid(),signal.SIGTERM)"],
+            None,
+        ),
+    ],
+)
+def test_actual_check_exit_is_distinct_from_setup_or_signal_failure(
+    tmp_path: Path, argv: list[str], actual_exit: int | None
+) -> None:
+    async def scenario() -> None:
+        docker = engine()
+        execution = uuid4()
+        workspace = tmp_path / str(execution)
+        workspace.mkdir()
+        spec = ContainerSpec(
+            image=IMAGE,
+            execution_id=execution,
+            invocation_id=uuid4(),
+            mode="check",
+            workspace=str(workspace),
+        )
+        owned = OwnedContainer(docker, spec, lambda: None, monotonic)
+        try:
+            result = await owned.run(
+                json.dumps(
+                    dict(
+                        version=1,
+                        mode="check",
+                        execution_id=str(execution),
+                        invocation_id=str(spec.invocation_id),
+                        cycle=0,
+                        timeout_seconds=30,
+                        cwd=".",
+                        argv=argv,
+                    )
+                ).encode(),
+                timeout_seconds=60,
+            )
+            if actual_exit is None:
+                assert result.exit_code == 125
+                with pytest.raises(ContainerUnavailable):
+                    decode_fixed_check(result.stdout, result.stderr)
+            else:
+                assert result.exit_code == 0, result.stderr
+                assert (
+                    decode_fixed_check(result.stdout, result.stderr)[0] == actual_exit
+                )
+        finally:
             await owned.aclose()
             await docker.aclose()
 

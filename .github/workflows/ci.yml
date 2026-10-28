@@ -52,7 +52,9 @@ jobs:
 
   container:
     needs: checks
-    runs-on: ubuntu-latest
+    # The inner sandbox requires unprivileged user namespaces. Keep host policy
+    # intact; Ubuntu 24.04's default AppArmor restriction rejects this backend.
+    runs-on: ubuntu-22.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7

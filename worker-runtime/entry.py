@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import socket
+import struct
 import subprocess
 import sys
 import threading
@@ -146,6 +148,7 @@ def bounded(
     timeout: float,
     data: bytes | None = None,
     extra_env: dict[str, str] | None = None,
+    maximum_output_bytes: int = MAX_OUTPUT,
 ) -> tuple[int, bytes, bytes]:
     env = environment()
     env.update(extra_env or {})
@@ -166,7 +169,7 @@ def bounded(
         assert stream is not None
         while chunk := stream.read(16384):
             with lock:
-                if sum(map(len, output)) + len(chunk) > MAX_OUTPUT:
+                if sum(map(len, output)) + len(chunk) > maximum_output_bytes:
                     failed.append("output")
                     process.kill()
                     return
@@ -216,6 +219,61 @@ print(json.dumps(result))
 """
 
 
+def run_fixed_check(
+    argv: list[str], cwd: str, timeout: float
+) -> tuple[int, bytes, bytes]:
+    launch_nonce = secrets.token_hex(32)
+    check = json.dumps(
+        {"argv": argv, "cwd": cwd, "launch_nonce": launch_nonce}, separators=(",", ":")
+    )
+    if len(check.encode()) > 32768:
+        raise ValueError("Fixed check exceeds the runtime profile limit.")
+    extra = [
+        "-c",
+        "shell_environment_policy.set={"
+        + ",".join(
+            json.dumps(key) + "=" + json.dumps(value)
+            for key, value in {
+                **{
+                    key: value
+                    for key, value in environment().items()
+                    if key != "CODEX_HOME"
+                },
+                "DEVRELAY_FIXED_CHECK": check,
+            }.items()
+        )
+        + "}",
+    ]
+    command = [
+        "codex",
+        *overrides("check"),
+        *extra,
+        "sandbox",
+        "--permission-profile",
+        "devrelay",
+        "--cd",
+        "/workspace",
+        "--",
+        "/opt/deps/.venv/bin/python",
+        "/opt/devrelay/check.py",
+    ]
+    code, stdout, stderr = bounded(
+        command,
+        timeout=timeout,
+        extra_env={"DEVRELAY_FIXED_CHECK": check},
+        maximum_output_bytes=MAX_OUTPUT - 256,
+    )
+    prefix = b"DEVRELAY_CHECK_SETTLED_V1:" + launch_nonce.encode("ascii") + b":"
+    receipts = re.findall(re.escape(prefix) + rb"(-?[0-9]{1,3})\n", stdout)
+    if (
+        len(receipts) != 1
+        or not 0 <= int(receipts[0]) <= 255
+        or int(receipts[0]) != code
+    ):
+        raise ValueError("The fixed check did not reach verified command settlement.")
+    return code, stdout.replace(prefix + receipts[0] + b"\n", b"", 1), stderr
+
+
 def probe(spec: dict[str, Any]) -> int:
     from probe import hostile_project
 
@@ -247,9 +305,14 @@ def probe(spec: dict[str, Any]) -> int:
         str(os.getpid()),
     ]
     try:
-        code, stdout, stderr = bounded(
-            command, timeout=min(spec["timeout_seconds"], 60)
-        )
+        if phase == "check":
+            code, stdout, stderr = run_fixed_check(
+                command[-5:], ".", min(spec["timeout_seconds"], 60)
+            )
+        else:
+            code, stdout, stderr = bounded(
+                command, timeout=min(spec["timeout_seconds"], 60)
+            )
     finally:
         server.close()
     if code:
@@ -274,6 +337,8 @@ def probe(spec: dict[str, Any]) -> int:
         for kind in ("private", "auth")
     )
     checks["project_config_ignored"] = not marker.exists()
+    if phase == "check":
+        checks["check_command_admission"] = True
     events = ""
     if phase == "code":
         from probe import harness_probe
@@ -357,43 +422,14 @@ def main() -> int:
             )
         ):
             raise ValueError("Invalid fixed check.")
-        check = json.dumps({"argv": argv, "cwd": cwd}, separators=(",", ":"))
-        if len(check.encode()) > 32768:
-            raise ValueError("Fixed check exceeds the runtime profile limit.")
-        extra = [
-            "-c",
-            "shell_environment_policy.set={"
-            + ",".join(
-                json.dumps(key) + "=" + json.dumps(value)
-                for key, value in {
-                    **{
-                        key: value
-                        for key, value in environment().items()
-                        if key != "CODEX_HOME"
-                    },
-                    "DEVRELAY_FIXED_CHECK": check,
-                }.items()
-            )
-            + "}",
-        ]
-        command = [
-            "codex",
-            *overrides("check"),
-            *extra,
-            "sandbox",
-            "--permission-profile",
-            "devrelay",
-            "--cd",
-            "/workspace",
-            "--",
-            "/opt/deps/.venv/bin/python",
-            "/opt/devrelay/check.py",
-        ]
-        code, stdout, stderr = bounded(
-            command,
-            timeout=spec["timeout_seconds"],
-            extra_env={"DEVRELAY_FIXED_CHECK": check},
+        code, stdout, stderr = run_fixed_check(argv, cwd, spec["timeout_seconds"])
+        sys.stdout.buffer.write(
+            b"DEVRELAY_CHECK_RESULT_V1\0"
+            + struct.pack("!III", code, len(stdout), len(stderr))
+            + stdout
+            + stderr
         )
+        return 0
     sys.stdout.buffer.write(stdout)
     sys.stderr.buffer.write(stderr)
     return code if 0 <= code <= 255 else 125
