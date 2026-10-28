@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from importlib.metadata import version
 from pathlib import Path
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI
@@ -392,8 +393,73 @@ def main() -> None:
     parser.add_argument(
         "--env-file", type=Path, help="Explicit local environment file."
     )
+    result_command = parser.add_mutually_exclusive_group()
+    result_command.add_argument(
+        "--publish-result",
+        type=UUID,
+        help="Explicitly publish one accepted result UUID instead of starting HTTP.",
+    )
+    result_command.add_argument(
+        "--reconcile-result",
+        type=UUID,
+        help="Observe one accepted result UUID without new publication writes.",
+    )
+    parser.add_argument(
+        "--worker-id", type=UUID, help="Current enrolled owner of the result command."
+    )
     arguments = parser.parse_args()
+    result_id: UUID | None = arguments.publish_result or arguments.reconcile_result
+    if (result_id is None) != (arguments.worker_id is None):
+        parser.error("A result command and --worker-id must be supplied together.")
     env_file: Path | None = arguments.env_file
+    if result_id is not None:
+        from devrelay.bootstrap.accepted_coding_results import (
+            publish_accepted_result,
+            reconcile_accepted_result,
+        )
+
+        try:
+            settings = ControlSettings(_env_file=env_file)  # pyright: ignore[reportCallIssue]
+            with asyncio.Runner(loop_factory=control_event_loop) as runner:
+                if arguments.publish_result is not None:
+                    terminal = runner.run(
+                        publish_accepted_result(
+                            settings, result_id, arguments.worker_id
+                        )
+                    )
+                    message = (
+                        f"Published accepted result {terminal.receipt.result_id}: "
+                        f"pull request #{terminal.reference.number}, "
+                        f"head {terminal.reference.head_revision}; awaiting human review."
+                    )
+                else:
+                    status = runner.run(
+                        reconcile_accepted_result(
+                            settings, result_id, arguments.worker_id
+                        )
+                    )
+                    if status is None:
+                        message = "No accepted result was available for reconciliation."
+                    elif status.terminal is not None:
+                        message = (
+                            f"Reconciled accepted result {status.receipt.result_id}: "
+                            f"{status.state.value}, pull request "
+                            f"#{status.terminal.reference.number}, head "
+                            f"{status.terminal.reference.head_revision}; awaiting human review."
+                        )
+                    else:
+                        message = (
+                            f"Reconciled accepted result {status.receipt.result_id}: "
+                            f"{status.state.value}; no new publication write authorized."
+                        )
+        except Exception:
+            # Command failures can contain SQL/provider/configuration secrets.
+            parser.exit(
+                1,
+                "Coding result operation did not complete; inspect retained history before retrying.\n",
+            )
+        print(message)
+        return
     # Pylance synthesizes model-field parameters; BaseSettings accepts _env_file.
     settings = ControlSettings(_env_file=env_file)  # pyright: ignore[reportCallIssue]
     uvicorn.run(

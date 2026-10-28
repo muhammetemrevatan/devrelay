@@ -987,6 +987,42 @@ Opening it performs no provider request. Trusted broker code explicitly calls
 no worker publication endpoint, automatic startup task or polling loop is added.
 Task PRs are left for human review and merge.
 
+The trusted control command can load and publish one already accepted result:
+
+```shell
+devrelay-control --env-file control.env --publish-result RESULT_UUID --worker-id WORKER_UUID
+```
+
+Replace both UUID placeholders with the durable result and its enrolled worker.
+Run this command only in the trusted broker environment holding the separate
+publication credential. Both flags are required together, and this mode exits
+after that result instead of starting HTTP. It requires an enabled, unexpired
+worker enrollment and the intersection of its repository scope with the enabled
+publication policy. The command reconstructs the original proof-free report and
+immutable assignment from storage; it never requests or recreates a worker lease
+proof. Storage revalidates current authentication and history after bounded
+off-loop report validation and again before publication writes. It does not
+claim another job, renew authority, launch an agent or migrate the database.
+Failures print a fixed credential-free message; inspect and reconcile retained
+publication history before retrying. Repeating the command cannot grant another
+write for an existing uncertain or interrupted publication owner.
+
+Use the separate observation-only command for an accepted result whose provider
+response was lost or whose publication was interrupted:
+
+```shell
+devrelay-control --env-file control.env --reconcile-result RESULT_UUID --worker-id WORKER_UUID
+```
+
+The two result commands are mutually exclusive and require the same current
+enrollment and broker configuration. Reconciliation reads the exact retained
+provider effect and may append its correlated observation to control history.
+It never creates another provider write or publication owner, clears uncertainty,
+finalizes an uncertain result or releases its coding reservation. The output
+reports the current publication state or unavailable result; a recorded terminal
+result includes only its correlated PR number and checked head. Uncertain work
+still requires trusted resolution before another coding job can advance.
+
 The publisher validates the complete plan before recording an owner or calling
 GitHub. It reconstructs exact blobs, child-first trees and the canonical unsigned
 commit, preserving the checked SHA and original parent. Write IDs and request
