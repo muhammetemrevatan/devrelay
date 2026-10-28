@@ -3,12 +3,15 @@ from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from typing import TypeVar, cast
+from uuid import UUID
 
 from devrelay.application.contracts.base_sources import (
     BaseMaterialization,
     BaseSourceSnapshot,
 )
+from devrelay.application.contracts.candidates import CandidateCommitSpec
 from devrelay.application.contracts.editable_workspaces import EditableWorkspace
+from devrelay.application.contracts.frozen_candidates import FrozenCandidate
 from devrelay.application.contracts.git_sources import (
     GitBaseSourceSnapshot,
     GitWorkspacePreparation,
@@ -22,6 +25,9 @@ from devrelay.application.ports.workspace_reservation import WorkspaceUnavailabl
 from devrelay.infrastructure.workspace.windows import (
     WindowsWorkspacePolicy,
     WindowsWorkspaceReservation,
+)
+from devrelay.infrastructure.workspace.windows_candidates import (
+    WindowsCandidateWorkspace,
 )
 
 _Result = TypeVar("_Result")
@@ -46,6 +52,13 @@ class WindowsWorkspaceScope:
         self._git_preparation_started = False
         self._source_snapshot: BaseSourceSnapshot | None = None
         self._git_preparation: GitWorkspacePreparation | None = None
+        self._editable: EditableWorkspace | None = None
+        self._candidate_capture_started = False
+        self._candidate_capture: WindowsCandidateWorkspace | None = None
+        self._candidate_capture_preparation: GitWorkspacePreparation | None = None
+        self._capture_started = False
+        self._release_started = False
+        self._frozen: FrozenCandidate | None = None
         self._sealed = False
         self._admission = asyncio.Lock()
         self._pending: asyncio.Future[object] | None = None
@@ -73,6 +86,14 @@ class WindowsWorkspaceScope:
     @property
     def git_preparation(self) -> GitWorkspacePreparation | None:
         return self._git_preparation
+
+    @property
+    def editable(self) -> EditableWorkspace | None:
+        return self._editable
+
+    @property
+    def candidate_capture_preparation(self) -> GitWorkspacePreparation | None:
+        return self._candidate_capture_preparation
 
     def seal(self) -> None:
         self._sealed = True
@@ -195,7 +216,123 @@ class WindowsWorkspaceScope:
             result = await self._invoke(
                 lambda: self._native.handoff_materialized_base(materialization)
             )
+            if (
+                not isinstance(result, EditableWorkspace)
+                or result.materialization is not materialization
+                or result.location != self._location
+            ):
+                raise WorkspaceUnavailable("Editable handoff changed original pins.")
+            self._editable = result
             self._source_snapshot = None
+            return result
+        except BaseException:
+            self.seal()
+            raise
+
+    async def prepare_candidate_capture(
+        self, source: GitBaseSourceSnapshot
+    ) -> GitWorkspacePreparation:
+        preparation = self._git_preparation
+        if (
+            self._candidate_capture_started
+            or self._handoff_started
+            or preparation is None
+            or not isinstance(source, GitBaseSourceSnapshot)
+            or source.snapshot is not self._source_snapshot
+        ):
+            raise WorkspaceUnavailable("Original protected Git source is required.")
+        self._candidate_capture_started = True
+        try:
+            result = await self._invoke(
+                lambda: self._native.prepare_candidate_capture(source)
+            )
+            if not isinstance(result, WindowsCandidateWorkspace):
+                raise WorkspaceUnavailable(
+                    "Native candidate preparation is unavailable."
+                )
+            self._candidate_capture = result
+            self._candidate_capture_preparation = preparation
+            return preparation
+        except BaseException:
+            self.seal()
+            raise
+
+    async def capture_candidate(
+        self,
+        preparation: GitWorkspacePreparation,
+        editable: EditableWorkspace,
+        *,
+        capture_id: UUID,
+        cycle: int,
+        commit: CandidateCommitSpec,
+    ) -> FrozenCandidate:
+        helper = self._candidate_capture
+        if (
+            self._capture_started
+            or self._frozen is not None
+            or helper is None
+            or preparation is not self._candidate_capture_preparation
+            or not isinstance(editable, EditableWorkspace)
+            or editable is not self._editable
+        ):
+            raise WorkspaceUnavailable("Live candidate capture is unavailable.")
+        self._capture_started = True
+        try:
+            result = await self._invoke(
+                lambda: helper.capture(
+                    preparation,
+                    editable,
+                    capture_id=capture_id,
+                    cycle=cycle,
+                    commit=commit,
+                )
+            )
+            if (
+                not isinstance(result, FrozenCandidate)
+                or result.preparation is not preparation
+                or result.editable is not editable
+                or result.capture_id != capture_id
+                or result.snapshot.cycle != cycle
+            ):
+                raise WorkspaceUnavailable("Candidate capture changed original pins.")
+            result.__post_init__()
+            if result.snapshot.raw_commit != commit.raw_commit(
+                parent=preparation.materialization.source.base_revision,
+                tree=result.snapshot.root_tree_sha,
+            ):
+                raise WorkspaceUnavailable(
+                    "Candidate capture changed configured commit."
+                )
+            self._frozen = result
+            return result
+        except BaseException:
+            self.seal()
+            raise
+
+    async def verify_candidate(self, candidate: FrozenCandidate) -> None:
+        helper = self._candidate_capture
+        if helper is None or candidate is not self._frozen:
+            raise WorkspaceUnavailable("Original live candidate is required.")
+        try:
+            await self._invoke(lambda: helper.verify(candidate))
+        except BaseException:
+            self.seal()
+            raise
+
+    async def release_candidate(self, candidate: FrozenCandidate) -> EditableWorkspace:
+        helper = self._candidate_capture
+        if self._release_started or helper is None or candidate is not self._frozen:
+            raise WorkspaceUnavailable("Original live candidate is required.")
+        self._release_started = True
+        try:
+            result = await self._invoke(lambda: helper.release_for_repair(candidate))
+            if result is not self._editable:
+                raise WorkspaceUnavailable(
+                    "Candidate release changed original workspace."
+                )
+            self._frozen = None
+            self._capture_started = False
+            self._release_started = False
             return result
         except BaseException:
             self.seal()

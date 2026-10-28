@@ -2,7 +2,7 @@ import asyncio
 import os
 from collections.abc import AsyncIterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
 from uuid import UUID
 
@@ -19,6 +19,9 @@ from devrelay.application.ports.worker_journal import WorkerStateUnavailable
 from devrelay.application.worker_claims import PrepareWorkerClaim, RequestWorkerClaim
 from devrelay.config.worker import WorkerSettings
 from devrelay.infrastructure.control.base_sources import HttpControlBaseSource
+from devrelay.infrastructure.control.coding_results import (
+    open_http_control_coding_results,
+)
 from devrelay.infrastructure.control.gateway import HttpControlGateway
 from devrelay.infrastructure.worker_state.clock import WindowsLeaseClock
 from devrelay.infrastructure.worker_state.journal import (
@@ -35,6 +38,7 @@ async def open_worker_claim_client(
     state_directory: Path,
     transport: httpx.AsyncBaseTransport | None = None,
     source_transport: httpx.AsyncBaseTransport | None = None,
+    result_transport: httpx.AsyncBaseTransport | None = None,
 ) -> AsyncIterator[RequestWorkerClaim]:
     """Verify control identity before opening its journal; perform no claim on startup."""
     async with httpx.AsyncClient(
@@ -79,14 +83,29 @@ async def open_worker_claim_client(
                         delivery,
                     )
 
-                yield RequestWorkerClaim(
-                    preparation,
-                    gateway,
-                    authorization,
-                    heartbeat_gateway=gateway,
-                    monotonic_clock=clock,
-                    base_source_binding=bind_source,
-                )
+                async with AsyncExitStack() as result_resources:
+                    result_gateway = None
+                    if settings.coding_results_enabled:
+                        result_gateway = await result_resources.enter_async_context(
+                            open_http_control_coding_results(
+                                str(settings.control_url),
+                                settings.auth_token.get_secret_value(),
+                                transport=result_transport,
+                            )
+                        )
+                    worker = RequestWorkerClaim(
+                        preparation,
+                        gateway,
+                        authorization,
+                        heartbeat_gateway=gateway,
+                        monotonic_clock=clock,
+                        base_source_binding=bind_source,
+                        coding_result_gateway=result_gateway,
+                    )
+                    try:
+                        yield worker
+                    finally:
+                        await worker.close_coding_results()
 
 
 def validate_worker_configuration(env_file: Path | None = None) -> None:
@@ -157,6 +176,7 @@ async def open_worker_journal(
             heartbeat_journal=journal,
             execution_journal=journal,
             workspace_journal=journal,
+            result_journal=journal,
         )
     finally:
         if journal is not None:

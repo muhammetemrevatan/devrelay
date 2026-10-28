@@ -899,6 +899,126 @@ alone do not start work; submission records a durable Job and opt-in claims
 reserve its initial assignment.
 Repository configuration alone exposes no new route or provider adapter.
 
+## Successful coding result coordination
+
+Result delivery has a separate default-disabled `worker_coding_results` gate and
+requires explicitly enabled worker claims. It exposes authenticated
+`POST /api/v1/worker/attempts/{attempt_id}/results` and
+`POST /api/v1/worker/attempts/{attempt_id}/results/recovery`. The latter consumes
+the same original request; it does not create missing results or a new assignment.
+The bounded v1 request includes the original proof/ACK/execution pins, contiguous
+settled coding/check cycles and only the final candidate's complete source bytes.
+The strict codec rejects duplicate/unknown fields, noncanonical identities and
+oversized structures before source decoding. Result bodies are capped at 16 MiB;
+the ordinary claim/ACK/heartbeat body limit remains unchanged.
+
+Acceptance returns 202 with a nonsecret receipt after the transaction commits.
+The immutable proof-free report, every workflow event and the publication intent
+commit together. Fixed checks must match the accepted policy and exact candidate
+SHA. Failed local cycles consume the configured repair budget; the final cycle
+must pass all checks. Exact retry returns the original receipt; changed input or
+another result for the Attempt conflicts. Acceptance retains the coding slot and
+ends at `PUBLISHING_PR`. Cancellation retains actual decoder/preparation/storage
+work until settlement; no late value becomes a new operation's input.
+
+Broker-only coordination methods record one invocation and each provider write
+plan before any external mutation. Only a newly committed plan permits its one
+write; replay never permits repeating it. Outcomes of already planned writes can
+be recorded after expiry without granting further work rights. Uncertainty is
+sticky and retains the reservation, including after a late observation. Normal
+finalization requires fresh authority and independently verified exact PR/repo/
+branch/head association. It atomically records `AWAITING_REVIEW`, closes the
+coding Attempt, revokes authority and releases only the original reservation once.
+Historical claim/ACK/heartbeat/result reads remain available under current scope,
+including after another Attempt reserves the slot. Coding completion does not
+mean merged, deployed or healthy delivery.
+
+Migration 0009 must be deployed with matching stopped writers; startup never
+migrates. It preserves immutable definitions and original claim/ACK/lease anchors,
+retains heartbeat update fields separately from revocation, and refuses to discard
+advanced result history on downgrade. Explicit broker publication is separately
+configured below; the admitted Codex/check runtime remains separate consumer
+work. The result gate does not enable automatic GitHub writes or execution.
+
+The worker separately opts in with `DEVRELAY_WORKER_CODING_RESULTS_ENABLED=true`.
+Its explicit `submit_coding_result` method requires the retained heartbeat
+supervisor and original completed execution/workspace. It validates the complete
+report off the event loop and commits one canonical proof-free report and request
+UUID to the protected private SQLite journal before its first HTTP submission.
+A later submit with existing input first recovers that original result; it never
+silently replaces the report or changes the accepted target branch. The final
+authority check runs after encoding, immediately before the outbound submission.
+Result traffic has its own connection, so a slow result response does not occupy
+the heartbeat connection. Opening the worker does not submit or recover a result.
+
+SQLite v8 binds report contents and presence, the target branch, acceptance and
+terminal receipts to the original protected proof and execution/workspace state.
+Valid v1–v7 upgrades are atomic. An older journal with an execution already
+present retains an explicit unknown result-history flag and cannot create a new
+report without reconciliation. Receipt metadata is strictly correlated to the
+original request, candidate SHA, repository, execution and both PR branches.
+
+`recover_coding_result` reads and persists historical acceptance/terminal metadata
+under current worker authentication without constructing a heartbeat supervisor
+or reviving execution authority. Canceled submissions retain unresolved work;
+once HTTP has started, correlated response bookkeeping settles before normal
+resource closure. A terminal receipt preserves the original claim and workspace
+history. It does not reset the worker, prove native process settlement, delete a
+workspace or admit another job; verified settlement and bounded historical claim
+rotation remain separate consumer work.
+
+## Scoped GitHub publication
+
+The optional control `coding_publication` setting requires enabled result
+coordination, a separate server-only `api_token` and explicit
+`allowed_repository_ids`. Its scope must be inside enabled, numerically bound
+repository policies. The write credential cannot equal a read, operator, database
+or worker credential, and the claim proof reuse guard includes it. It is never
+sent to the local worker, task workspace or agent process. The GitHub credential
+must be provisioned separately for the selected repositories with the required
+contents and pull-request write permissions; configuration does not grant those
+permissions. See GitHub's [Git commit API](https://docs.github.com/en/rest/git/commits?apiVersion=2026-03-10)
+and [pull request API](https://docs.github.com/en/rest/pulls/pulls?apiVersion=2026-03-10).
+
+The control lifespan owns one explicit `coding_result_publisher`, sharing its
+database pool with result coordination and using a separate bounded GitHub client.
+Opening it performs no provider request. Trusted broker code explicitly calls
+`execute(prepared, authorization)` or read-only `reconcile(prepared, authorization)`;
+no worker publication endpoint, automatic startup task or polling loop is added.
+Task PRs are left for human review and merge.
+
+The publisher validates the complete plan before recording an owner or calling
+GitHub. It reconstructs exact blobs, child-first trees and the canonical unsigned
+commit, preserving the checked SHA and original parent. Write IDs and request
+digests are stable. Configured write, event, request, byte and time budgets reject
+an oversized plan before its first provider request. The fixed GitHub API client
+does not follow redirects, use environment proxies or retry mutations.
+
+Each write requires its newly committed DB plan and a fresh dispatch window.
+Historical permits carry no dispatch timestamps. The broker conservatively
+subtracts the full SQL wait and safety margin from the DB window and checks a
+suspend-inclusive clock immediately before HTTP. Close and cancellation also
+fence that final boundary. Started provider work and its bookkeeping settle
+before normal resource closure. The provider independently reads back object
+bytes/hashes, exact ref and same-repository PR source/target/head association;
+returned SHAs never replace the checked candidate SHA.
+
+Branches and PRs are created once, with no update, force, delete or merge operation.
+A lost mutation response retains its original planned input and coding reservation.
+Read-only reconciliation may observe that exact effect and append its historical
+observation; uncertainty stays sticky and grants neither a new POST nor normal
+finalization. An empty PR list after a lost response is not retry permission.
+Successful normal publication atomically records `AWAITING_REVIEW` and releases
+the original slot once. An uncertain or interrupted publisher still needs explicit
+trusted recovery before normal processing can advance.
+
+Controlled GitHub transport fixtures and disposable PostgreSQL verify this flow,
+including repair history and response loss for each write kind. They do not
+certify live GitHub byte compatibility or provision a real write credential. The
+native Codex/check consumer, known-stopped failure handling and verified local
+settlement/claim rotation remain separate work; publication configuration alone
+does not start coding or deployment.
+
 ## Container
 
 The Dockerfile builds the control service with locked runtime dependencies,

@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from devrelay.api.dependencies import (
     BaseSourceOperations,
     ClaimOperation,
+    CodingResultOperations,
     ImportOperation,
     JobSubmissionServices,
     SubmissionOperation,
@@ -21,6 +22,7 @@ from devrelay.api.dependencies import (
     WorkerBaseSourceServices,
     WorkerClaimOperations,
     WorkerClaimServices,
+    WorkerCodingResultServices,
 )
 from devrelay.api.errors import register_error_handlers
 from devrelay.api.middleware import UnexpectedErrorMiddleware
@@ -31,6 +33,7 @@ from devrelay.api.routes.jobs import router as jobs_router
 from devrelay.api.routes.tasks import router as tasks_router
 from devrelay.api.routes.workers import router as workers_router
 from devrelay.application.contracts.submissions import SubmissionAuthorization
+from devrelay.application.publish_coding_result import PublishCodingResult
 from devrelay.bootstrap.claims import (
     job_acknowledger,
     job_heartbeater,
@@ -53,6 +56,37 @@ type ClaimResourceFactory = Callable[
 type BaseSourceResourceFactory = Callable[
     [], AbstractAsyncContextManager[BaseSourceOperations]
 ]
+type CodingResultResourceFactory = Callable[
+    [], AbstractAsyncContextManager[CodingResultOperations]
+]
+type PublicationResourceFactory = Callable[
+    [], AbstractAsyncContextManager[PublishCodingResult]
+]
+
+
+@asynccontextmanager
+async def open_control_coding_publisher(
+    settings: ControlSettings, engine: AsyncEngine
+) -> AsyncIterator[PublishCodingResult]:
+    from devrelay.bootstrap.coding_publication import open_coding_publisher
+
+    async with open_coding_publisher(settings, engine) as publisher:
+        yield publisher
+
+
+@asynccontextmanager
+async def open_control_coding_result_operation(
+    settings: ControlSettings,
+    engine: AsyncEngine,
+) -> AsyncIterator[CodingResultOperations]:
+    from devrelay.bootstrap.coding_results import open_worker_coding_results
+
+    async with open_worker_coding_results(settings, engine) as results:
+        yield CodingResultOperations(
+            accept=results.execute,
+            recover=results.recover,
+            require_ready=results.require_ready,
+        )
 
 
 @asynccontextmanager
@@ -110,8 +144,14 @@ def create_app(
     submission_resources: SubmissionResourceFactory | None = None,
     claim_resources: ClaimResourceFactory | None = None,
     base_source_resources: BaseSourceResourceFactory | None = None,
+    coding_result_resources: CodingResultResourceFactory | None = None,
+    publication_resources: PublicationResourceFactory | None = None,
 ) -> FastAPI:
     configuration = settings if settings is not None else ControlSettings()
+    if publication_resources is not None and configuration.coding_publication is None:
+        raise ValueError(
+            "Publication resources require explicitly enabled publication."
+        )
     show_docs = configuration.environment != RuntimeEnvironment.PRODUCTION
     if import_resources is not None and configuration.task_import is None:
         raise ValueError("Import resources require explicit import authentication.")
@@ -125,6 +165,13 @@ def create_app(
         raise ValueError(
             "Base source resources require explicitly enabled source delivery."
         )
+    if (
+        coding_result_resources is not None
+        and configuration.worker_coding_results is None
+    ):
+        raise ValueError(
+            "Coding result resources require explicitly enabled result acceptance."
+        )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI) -> AsyncIterator[None]:
@@ -133,6 +180,8 @@ def create_app(
         application.state.worker_authentication_services = None
         application.state.worker_claim_services = None
         application.state.worker_base_source_services = None
+        application.state.worker_coding_result_services = None
+        application.state.coding_result_publisher = None
         async with AsyncExitStack() as stack:
             try:
                 if configuration.workers:
@@ -155,6 +204,14 @@ def create_app(
                     or (
                         configuration.worker_base_sources is not None
                         and base_source_resources is None
+                    )
+                    or (
+                        configuration.worker_coding_results is not None
+                        and coding_result_resources is None
+                    )
+                    or (
+                        configuration.coding_publication is not None
+                        and publication_resources is None
                     )
                 ):
                     if configuration.database is None:
@@ -245,6 +302,43 @@ def create_app(
                         body_timeout_seconds=base_source_settings.body_timeout_seconds,
                         request_timeout_seconds=base_source_settings.request_timeout_seconds,
                     )
+                coding_result_settings = configuration.worker_coding_results
+                if coding_result_settings is not None:
+                    if coding_result_resources is not None:
+                        coding_result_context = coding_result_resources()
+                    else:
+                        assert engine is not None
+                        coding_result_context = open_control_coding_result_operation(
+                            configuration, engine
+                        )
+                    coding_operations = await stack.enter_async_context(
+                        coding_result_context
+                    )
+                    if not isinstance(coding_operations, CodingResultOperations):
+                        raise ValueError(
+                            "Coding result resources require complete explicit operations."
+                        )
+                    coding_services = WorkerCodingResultServices(
+                        accept_result=coding_operations.accept,
+                        recover_result=coding_operations.recover,
+                        require_ready=coding_operations.require_ready,
+                        max_concurrent_requests=coding_result_settings.max_concurrent_requests,
+                        body_timeout_seconds=coding_result_settings.body_timeout_seconds,
+                        request_timeout_seconds=coding_result_settings.request_timeout_seconds,
+                    )
+                    application.state.worker_coding_result_services = coding_services
+                    stack.push_async_callback(coding_services.aclose)
+                if configuration.coding_publication is not None:
+                    if publication_resources is not None:
+                        publication_context = publication_resources()
+                    else:
+                        assert engine is not None
+                        publication_context = open_control_coding_publisher(
+                            configuration, engine
+                        )
+                    application.state.coding_result_publisher = (
+                        await stack.enter_async_context(publication_context)
+                    )
                 yield
             finally:
                 application.state.task_import_services = None
@@ -252,6 +346,8 @@ def create_app(
                 application.state.worker_authentication_services = None
                 application.state.worker_claim_services = None
                 application.state.worker_base_source_services = None
+                application.state.worker_coding_result_services = None
+                application.state.coding_result_publisher = None
 
     app = FastAPI(
         title="DevRelay",
@@ -275,6 +371,10 @@ def create_app(
         app.include_router(claims_router)
     if configuration.worker_base_sources is not None:
         app.include_router(base_sources_router)
+    if configuration.worker_coding_results is not None:
+        from devrelay.api.routes.coding_results import router as coding_results_router
+
+        app.include_router(coding_results_router)
     return app
 
 

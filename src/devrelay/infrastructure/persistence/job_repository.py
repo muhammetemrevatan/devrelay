@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import Bundle, aliased
 
 from devrelay.application.contracts.submissions import (
     JobBranchAssociation,
@@ -31,7 +31,11 @@ from devrelay.infrastructure.persistence.heartbeat_models import (
     AttemptLeaseAuthorityRecord,
     HeartbeatReceiptRecord,
 )
-from devrelay.infrastructure.persistence.job_mapping import materialize_submission
+from devrelay.infrastructure.persistence.job_mapping import (
+    AcceptedResultHistory,
+    DeliveryOperationHistory,
+    materialize_submission,
+)
 from devrelay.infrastructure.persistence.job_models import (
     JobCheckRecord,
     JobRecord,
@@ -41,6 +45,11 @@ from devrelay.infrastructure.persistence.job_models import (
 from devrelay.infrastructure.persistence.models import (
     SourceTaskRecord,
     TaskSnapshotRecord,
+)
+from devrelay.infrastructure.persistence.result_models import (
+    AttemptResultRecord,
+    DeliveryOperationEventRecord,
+    DeliveryOperationRecord,
 )
 from devrelay.infrastructure.persistence.task_mapping import materialize_snapshot
 from devrelay.infrastructure.persistence.workflow_models import (
@@ -55,6 +64,7 @@ async def read_submission(
 ) -> StoredJobSubmission | None:
     initial_event = aliased(JobWorkflowEventRecord)
     claim_event = aliased(JobWorkflowEventRecord)
+    acknowledged_event = aliased(JobWorkflowEventRecord)
     row = (
         await session.execute(
             select(
@@ -71,6 +81,22 @@ async def read_submission(
                 AcknowledgementReceiptRecord,
                 AttemptLeaseAuthorityRecord,
                 HeartbeatReceiptRecord,
+                acknowledged_event,
+                Bundle(
+                    "accepted_result",
+                    *(
+                        getattr(AttemptResultRecord, name)
+                        for name in AcceptedResultHistory._fields
+                    ),
+                ),
+                Bundle(
+                    "delivery_operation",
+                    *(
+                        getattr(DeliveryOperationRecord, name)
+                        for name in DeliveryOperationHistory._fields
+                    ),
+                ),
+                DeliveryOperationEventRecord,
             )
             .join(TaskSnapshotRecord, JobRecord.snapshot_id == TaskSnapshotRecord.id)
             .join(SourceTaskRecord, JobRecord.source_task_id == SourceTaskRecord.id)
@@ -95,7 +121,7 @@ async def read_submission(
             )
             .outerjoin(
                 ExecutionAttemptRecord,
-                JobWorkflowRecord.active_attempt_id == ExecutionAttemptRecord.id,
+                JobWorkflowRecord.last_attempt_id == ExecutionAttemptRecord.id,
             )
             .outerjoin(
                 claim_event,
@@ -103,8 +129,32 @@ async def read_submission(
                 & (claim_event.workflow_version == 1),
             )
             .outerjoin(
+                acknowledged_event,
+                (acknowledged_event.job_id == JobRecord.id)
+                & (acknowledged_event.workflow_version == 2),
+            )
+            .outerjoin(
                 AcknowledgementReceiptRecord,
                 AcknowledgementReceiptRecord.attempt_id == ExecutionAttemptRecord.id,
+            )
+            .outerjoin(
+                AttemptResultRecord,
+                AttemptResultRecord.attempt_id == ExecutionAttemptRecord.id,
+            )
+            .outerjoin(
+                DeliveryOperationRecord,
+                DeliveryOperationRecord.result_id == AttemptResultRecord.id,
+            )
+            .outerjoin(
+                DeliveryOperationEventRecord,
+                (
+                    DeliveryOperationEventRecord.result_id
+                    == DeliveryOperationRecord.result_id
+                )
+                & (
+                    DeliveryOperationEventRecord.sequence
+                    == DeliveryOperationRecord.version
+                ),
             )
             .outerjoin(
                 AttemptLeaseAuthorityRecord,
@@ -137,6 +187,10 @@ async def read_submission(
         acknowledgement,
         lease_authority,
         heartbeat,
+        acknowledged,
+        result_history,
+        operation_history,
+        operation_event,
     ) = row
     checks = tuple(
         (
@@ -163,6 +217,14 @@ async def read_submission(
         acknowledgement,
         lease_authority,
         heartbeat,
+        acknowledged,
+        AcceptedResultHistory(*result_history)
+        if result_history.id is not None
+        else None,
+        DeliveryOperationHistory(*operation_history)
+        if operation_history.result_id is not None
+        else None,
+        operation_event,
     )
 
 

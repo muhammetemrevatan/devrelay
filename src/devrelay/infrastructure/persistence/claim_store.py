@@ -174,6 +174,8 @@ class SqlAlchemyClaimStore:
         identity: ClaimRequestIdentity,
         authorization: WorkerAuthorization,
         now: datetime,
+        *,
+        slot: DispatchSlotRecord,
     ) -> ClaimResult | None:
         scope = self._authorize(authorization, now)
         if identity.worker_id != authorization.worker_id:
@@ -269,7 +271,11 @@ class SqlAlchemyClaimStore:
                 worker_id=record.worker_id,
                 generation=record.generation,
                 issued_at=record.issued_at,
-                updated_at=record.updated_at,
+                # Phase timestamps advance beyond the original lease deadline.
+                # Preserve the immutable claim/ACK anchors on historical replay.
+                updated_at=record.revoked_at
+                or record.acknowledged_at
+                or record.issued_at,
                 expires_at=record.expires_at,
                 revoked_at=record.revoked_at,
             ),
@@ -283,7 +289,8 @@ class SqlAlchemyClaimStore:
             attempt=attempt,
             lease_authority_active=now < authority.current_expires_at
             and authority.revoked_at is None
-            and attempt.reserves_execution,
+            and attempt.reserves_execution
+            and slot.reserved_attempt_id == attempt.id,
         )
 
     async def recover(
@@ -292,10 +299,12 @@ class SqlAlchemyClaimStore:
         try:
             async with self._sessions.begin() as session:
                 await self._timeouts(session)
-                await self._slot(session, lock=True)
+                slot = await self._slot(session, lock=True)
                 await self._worker(session, authorization.worker_id, lock=True)
                 now = await self._clock(session)
-                result = await self._replay(session, identity, authorization, now)
+                result = await self._replay(
+                    session, identity, authorization, now, slot=slot
+                )
             return result
         except ClaimReplayConflict:
             raise
@@ -328,7 +337,11 @@ class SqlAlchemyClaimStore:
                 slot = await self._slot(session, lock=True)
                 await self._worker(session, authorization.worker_id, lock=True)
                 recovered = await self._replay(
-                    session, identity.claim, authorization, await self._clock(session)
+                    session,
+                    identity.claim,
+                    authorization,
+                    await self._clock(session),
+                    slot=slot,
                 )
                 if (
                     recovered is None
@@ -343,7 +356,6 @@ class SqlAlchemyClaimStore:
                 )
                 if (
                     attempt.id != intent.attempt_id
-                    or slot.reserved_attempt_id != attempt.id
                     or stored.job.snapshot_id != intent.snapshot_id
                     or stored.job.base_revision != intent.base_revision
                     or definition_digest != intent.definition_digest
@@ -402,11 +414,14 @@ class SqlAlchemyClaimStore:
                         or receipt.base_revision != intent.base_revision
                         or receipt.definition_digest != intent.definition_digest
                         or receipt.repository_id != stored.job.repository_id
-                        or record.status != AttemptStatus.RUNNING.value
                         or record.acknowledged_at != receipt.acknowledged_at
-                        or workflow.workflow_version != 2
-                        or workflow.status != JobStatus.RUNNING.value
-                        or workflow.updated_at != receipt.acknowledged_at
+                        or receipt.workflow_version != 2
+                        or receipt.expected_workflow_version != 1
+                        or receipt.generation != intent.generation
+                        or receipt.protocol_version != intent.protocol_version
+                        or receipt.definition_digest_version
+                        != intent.definition_digest_version
+                        or receipt.fingerprint_version != 1
                     ):
                         raise ClaimPersistenceError(
                             "Acknowledgement history is inconsistent."
@@ -424,7 +439,8 @@ class SqlAlchemyClaimStore:
                     )
                 else:
                     if (
-                        record.status != AttemptStatus.CLAIMED.value
+                        slot.reserved_attempt_id != attempt.id
+                        or record.status != AttemptStatus.CLAIMED.value
                         or record.acknowledged_at is not None
                         or record.worker_id != authorization.worker_id
                         or record.claim_request_id != intent.claim_request_id
@@ -521,7 +537,9 @@ class SqlAlchemyClaimStore:
                     result,
                     lease_authority_active=disclosure_time
                     < authority.current_expires_at
-                    and authority.revoked_at is None,
+                    and authority.revoked_at is None
+                    and slot.reserved_attempt_id == attempt.id
+                    and record.ended_at is None,
                 )
             return result
         except ClaimReplayConflict:
@@ -555,7 +573,11 @@ class SqlAlchemyClaimStore:
                 if receipt is not None:
                     identity.require_replay(receipt.fingerprint)
                 recovered = await self._replay(
-                    session, identity.claim, authorization, await self._clock(session)
+                    session,
+                    identity.claim,
+                    authorization,
+                    await self._clock(session),
+                    slot=slot,
                 )
                 if (
                     recovered is None
@@ -570,7 +592,6 @@ class SqlAlchemyClaimStore:
                     worker is None
                     or identity.attempt_id != attempt.id
                     or identity.generation != attempt.lease.generation
-                    or slot.reserved_attempt_id != attempt.id
                 ):
                     raise HeartbeatRejected(
                         "Heartbeat differs from original ownership."
@@ -607,14 +628,6 @@ class SqlAlchemyClaimStore:
                 scope = self._authorize(authorization, now)
                 if stored.job.repository_id not in scope:
                     raise ClaimScopeRejected("Heartbeat is outside current scope.")
-                if (
-                    record.status != AttemptStatus.RUNNING.value
-                    or workflow.status != JobStatus.RUNNING.value
-                    or workflow.workflow_version != 2
-                    or workflow.active_attempt_id != attempt.id
-                    or record.acknowledged_at is None
-                ):
-                    raise HeartbeatRejected("Heartbeat requires acknowledged work.")
                 reference = AssignmentReference(
                     worker_id=record.worker_id,
                     job_id=record.job_id,
@@ -652,6 +665,19 @@ class SqlAlchemyClaimStore:
                         or receipt.attempt_ordinal > authority.receipt_count
                         or receipt.worker_ordinal > worker.heartbeat_receipt_count
                         or receipt.global_ordinal > slot.heartbeat_receipt_count
+                        or type(receipt.renewed) is not bool
+                        or record.acknowledged_at is None
+                        or receipt.recorded_at < record.acknowledged_at
+                        or any(
+                            type(value) is not int or not 1 <= value < 1 << 63
+                            for value in (
+                                receipt.attempt_ordinal,
+                                receipt.worker_ordinal,
+                                receipt.global_ordinal,
+                                receipt.lease_revision,
+                                receipt.expected_lease_revision,
+                            )
+                        )
                     ):
                         raise ClaimPersistenceError(
                             "Heartbeat recovery history is inconsistent."
@@ -664,6 +690,25 @@ class SqlAlchemyClaimStore:
                         current_expires_at=receipt.current_expires_at,
                     )
                 else:
+                    running = (
+                        record.status == AttemptStatus.RUNNING.value
+                        and workflow.status == JobStatus.RUNNING.value
+                        and workflow.workflow_version == 2
+                    )
+                    publishing = (
+                        record.status == AttemptStatus.PUBLISHING_PR.value
+                        and workflow.status == JobStatus.PUBLISHING_PR.value
+                        and workflow.workflow_version == 4 + 2 * workflow.repair_cycles
+                    )
+                    if (
+                        slot.reserved_attempt_id != attempt.id
+                        or not (running or publishing)
+                        or workflow.active_attempt_id != attempt.id
+                        or record.acknowledged_at is None
+                    ):
+                        raise HeartbeatRejected(
+                            "Heartbeat requires active acknowledged work."
+                        )
                     if (
                         now >= authority.current_expires_at
                         or authority.revoked_at is not None
@@ -762,6 +807,8 @@ class SqlAlchemyClaimStore:
                 stop = (
                     observation.revoked_at is not None
                     or disclosure >= observation.current_expires_at
+                    or slot.reserved_attempt_id != attempt.id
+                    or record.ended_at is not None
                 )
                 result = HeartbeatResult(
                     heartbeat_request_id=identity.heartbeat_request_id,
@@ -787,7 +834,9 @@ class SqlAlchemyClaimStore:
                 slot = await self._slot(session, lock=True)
                 worker = await self._worker(session, authorization.worker_id, lock=True)
                 now = await self._clock(session)
-                recovered = await self._replay(session, identity, authorization, now)
+                recovered = await self._replay(
+                    session, identity, authorization, now, slot=slot
+                )
                 if recovered is not None:
                     return recovered
                 self._admit(slot, worker, now)

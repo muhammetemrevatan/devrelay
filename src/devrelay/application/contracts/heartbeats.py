@@ -97,13 +97,15 @@ class LeaseAuthorityObservation:
                 and (
                     self.current_expires_at != self.reference.expires_at
                     or self.updated_at != self.reference.issued_at
-                    or self.revoked_at is not None
                 )
             )
             or self.current_expires_at - self.updated_at
             > timedelta(seconds=MAXIMUM_LEASE_SECONDS)
             or (self.revoked_at is None and self.current_expires_at <= self.updated_at)
-            or (self.revoked_at is not None and self.revoked_at != self.updated_at)
+            or (
+                self.revoked_at is not None
+                and not self.updated_at <= self.revoked_at <= self.observed_at
+            )
         ):
             raise ValueError("Lease authority timestamps are inconsistent.")
 

@@ -1,7 +1,8 @@
 import asyncio
 import sqlite3
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from pathlib import Path
 from typing import Protocol
@@ -10,8 +11,20 @@ from uuid import UUID
 from devrelay.application.contracts.acknowledgements import WorkerAcknowledgementIntent
 from devrelay.application.contracts.claims import (
     ClaimReplayConflict,
+    LeaseProof,
     LeaseProofVerifier,
     WorkerClaimRequest,
+)
+from devrelay.application.contracts.coding_result_receipts import (
+    CodingResultReceipt,
+    CodingResultStatus,
+)
+from devrelay.application.contracts.coding_result_requests import (
+    WorkerCodingResultIntent,
+)
+from devrelay.application.contracts.coding_result_wire import (
+    decode_coding_result_intent,
+    encode_coding_result_intent,
 )
 from devrelay.application.contracts.executions import WorkerExecutionIntent
 from devrelay.application.contracts.worker_recovery import (
@@ -20,6 +33,9 @@ from devrelay.application.contracts.worker_recovery import (
     WorkerHeartbeatIntent,
     WorkerRecoveryPhase,
     WorkerRecoveryState,
+)
+from devrelay.application.contracts.worker_result_recovery import (
+    WorkerCodingResultState,
 )
 from devrelay.application.contracts.workers import WorkerJournalScope
 from devrelay.application.contracts.workspace_recovery import (
@@ -44,6 +60,10 @@ from devrelay.infrastructure.worker_state.outcomes import (
     save_no_work,
     upgrade_outcome_schema,
 )
+from devrelay.infrastructure.worker_state.results import (
+    read_result_state,
+    save_result_receipts,
+)
 from devrelay.infrastructure.worker_state.workspaces import (
     bind_workspace_state,
     save_workspace_completion,
@@ -51,6 +71,14 @@ from devrelay.infrastructure.worker_state.workspaces import (
 )
 
 _FAILURE = "Worker recovery journal is unavailable."
+
+
+def _capture_claim(request: WorkerClaimRequest) -> WorkerClaimRequest:
+    return WorkerClaimRequest(
+        claim_request_id=request.claim_request_id,
+        proof=LeaseProof(request.proof.reveal()),
+        protocol_version=request.protocol_version,
+    )
 
 
 class PrivateStorage(Protocol):
@@ -125,12 +153,13 @@ class SqliteClaimStore:
                 (4, scope.key),
                 (5, scope.key),
                 (6, scope.key),
+                (7, scope.key),
             ):
                 state = recovery_state(
                     connection, self._scope, self._read_request(), allow_legacy=True
                 )
                 upgrade_outcome_schema(connection, scope, state)
-            elif existing != (7, scope.key):
+            elif existing != (8, scope.key):
                 raise WorkerStateUnavailable(_FAILURE)
             self._read_state()
             connection.execute("COMMIT")
@@ -755,6 +784,177 @@ class SqliteClaimStore:
             except sqlite3.Error:
                 raise WorkerStateUnavailable(_FAILURE) from None
 
+    def load_result_state(self) -> WorkerCodingResultState:
+        connection = self._open()
+        try:
+            self._verify_files()
+            connection.execute("BEGIN")
+            state = read_result_state(connection, self._read_state())
+            connection.execute("COMMIT")
+            return state
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
+    def _result_state(self, request: WorkerClaimRequest) -> WorkerCodingResultState:
+        state = read_result_state(self._open(), self._read_state())
+        original = state.original.request
+        if (
+            not isinstance(request, WorkerClaimRequest)
+            or original is None
+            or request.claim_request_id != original.claim_request_id
+            or request.protocol_version != original.protocol_version
+        ):
+            raise ClaimReplayConflict("Coding result requires the original claim.")
+        verifier = LeaseProofVerifier.from_proof(
+            worker_id=self._scope.worker_id,
+            claim_request_id=original.claim_request_id,
+            proof=original.proof,
+        )
+        if not verifier.matches(
+            request.proof,
+            worker_id=self._scope.worker_id,
+            claim_request_id=request.claim_request_id,
+        ):
+            raise ClaimReplayConflict("Coding result changed its original proof.")
+        return state
+
+    def _bind_result(self, state: WorkerCodingResultState) -> None:
+        original = state.original
+        if (
+            original.request is None
+            or original.assignment is None
+            or original.completion is None
+        ):
+            raise WorkerStateUnavailable(_FAILURE)
+        bind_workspace_state(
+            self._open(),
+            self._scope,
+            original.request,
+            original.assignment,
+            original.completion,
+        )
+
+    def get_or_create_result(
+        self,
+        request: WorkerClaimRequest,
+        candidate: WorkerCodingResultIntent,
+        *,
+        target_branch: str,
+    ) -> WorkerCodingResultIntent:
+        connection = self._open()
+        try:
+            # Full canonicalization precedes the write transaction. The owning
+            # executor does all source-byte work away from the asyncio loop.
+            payload = encode_coding_result_intent(candidate)
+            captured = decode_coding_result_intent(payload)
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._result_state(request)
+            if state.history_unknown:
+                raise WorkerStateUnavailable(
+                    "Legacy result history requires reconciliation."
+                )
+            if state.intent is not None:
+                state.intent.require_same_input(captured)
+                if state.target_branch != target_branch:
+                    raise ClaimReplayConflict(
+                        "Coding result changed its accepted target branch."
+                    )
+                result = state.intent
+            else:
+                try:
+                    proposed = replace(
+                        state, intent=captured, target_branch=target_branch
+                    )
+                except ValueError:
+                    raise ClaimReplayConflict(
+                        "Coding result changed required original execution history."
+                    ) from None
+                connection.execute(
+                    "INSERT INTO coding_result_input VALUES(1,?,?,?)",
+                    (payload, sha256(payload).hexdigest(), target_branch),
+                )
+                self._bind_result(proposed)
+                saved = read_result_state(connection, self._read_state()).intent
+                if saved is None:
+                    raise WorkerStateUnavailable(_FAILURE)
+                result = saved
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
+    def record_result_acceptance(
+        self, request: WorkerClaimRequest, receipt: CodingResultReceipt
+    ) -> WorkerCodingResultState:
+        connection = self._open()
+        try:
+            receipt = replace(receipt)
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._result_state(request)
+            if state.receipt is not None and state.receipt != receipt:
+                raise ClaimReplayConflict(
+                    "Acceptance changed the recorded result receipt."
+                )
+            try:
+                proposed = replace(state, receipt=receipt)
+            except ValueError:
+                raise ClaimReplayConflict(
+                    "Acceptance changed the retained result association."
+                ) from None
+            save_result_receipts(connection, proposed)
+            self._bind_result(proposed)
+            result = read_result_state(connection, self._read_state())
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
+    def record_result_terminal(
+        self, request: WorkerClaimRequest, status: CodingResultStatus
+    ) -> WorkerCodingResultState:
+        connection = self._open()
+        try:
+            status = deepcopy(status)
+            self._verify_files()
+            connection.execute("BEGIN IMMEDIATE")
+            state = self._result_state(request)
+            if (state.receipt is not None and state.receipt != status.receipt) or (
+                state.terminal_status is not None and state.terminal_status != status
+            ):
+                raise ClaimReplayConflict(
+                    "Terminal receipt changed recorded result history."
+                )
+            try:
+                proposed = replace(
+                    state, receipt=status.receipt, terminal_status=status
+                )
+            except ValueError:
+                raise ClaimReplayConflict(
+                    "Terminal receipt changed the retained publication association."
+                ) from None
+            save_result_receipts(connection, proposed)
+            self._bind_result(proposed)
+            result = read_result_state(connection, self._read_state())
+            connection.execute("COMMIT")
+            return result
+        except ClaimReplayConflict:
+            self._rollback()
+            raise
+        except sqlite3.Error, OSError, ValueError, WorkerStateUnavailable:
+            self._rollback()
+            raise WorkerStateUnavailable(_FAILURE) from None
+
 
 class AsyncClaimJournal:
     """Serializes SQLite/DPAPI on the thread that owns the process mutex."""
@@ -771,6 +971,62 @@ class AsyncClaimJournal:
                 raise WorkerStateUnavailable(_FAILURE)
             return await asyncio.get_running_loop().run_in_executor(
                 self._executor, self._store.load_state
+            )
+
+    async def load_result_state(self) -> WorkerCodingResultState:
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.load_result_state
+            )
+
+    async def get_or_create_result(
+        self,
+        request: WorkerClaimRequest,
+        candidate: WorkerCodingResultIntent,
+        *,
+        target_branch: str,
+    ) -> WorkerCodingResultIntent:
+        from functools import partial
+
+        captured = deepcopy(candidate)
+        owned = _capture_claim(request)
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor,
+                partial(
+                    self._store.get_or_create_result,
+                    owned,
+                    captured,
+                    target_branch=target_branch,
+                ),
+            )
+
+    async def record_result_acceptance(
+        self, request: WorkerClaimRequest, receipt: CodingResultReceipt
+    ) -> WorkerCodingResultState:
+        captured = replace(receipt)
+        owned = _capture_claim(request)
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.record_result_acceptance, owned, captured
+            )
+
+    async def record_result_terminal(
+        self, request: WorkerClaimRequest, status: CodingResultStatus
+    ) -> WorkerCodingResultState:
+        captured = deepcopy(status)
+        owned = _capture_claim(request)
+        async with self._admission:
+            if self._closed:
+                raise WorkerStateUnavailable(_FAILURE)
+            return await asyncio.get_running_loop().run_in_executor(
+                self._executor, self._store.record_result_terminal, owned, captured
             )
 
     async def load_pending(self) -> WorkerClaimRequest | None:

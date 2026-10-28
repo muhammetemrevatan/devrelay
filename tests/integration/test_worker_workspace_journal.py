@@ -335,6 +335,8 @@ def make_v6(store: SqliteClaimStore, path: Path) -> None:
         row = connection.execute(
             "SELECT scope,prepared,phase,completed FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE workspace_intent")
         connection.execute("DROP TABLE workspace_completion")
@@ -392,7 +394,7 @@ def test_v6_upgrade_preserves_all_input_and_marks_legacy_execution_workspace_amb
     finally:
         upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
-        assert connection.execute("SELECT version FROM metadata").fetchone() == (7,)
+        assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
         assert (
             tuple(
                 connection.execute("SELECT * FROM " + table).fetchall()
@@ -471,6 +473,8 @@ def test_v7_downgrade_and_workspace_erasure_cannot_regain_creation_permission(
         row = connection.execute(
             "SELECT scope,prepared,phase,completed FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE workspace_intent")
         connection.execute("DROP TABLE workspace_completion")

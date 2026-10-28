@@ -22,6 +22,10 @@ from devrelay.application.contracts.claims import (
     InvalidClaimRequest,
     InvalidLeaseProof,
 )
+from devrelay.application.contracts.coding_result_receipts import (
+    CodingResultRejected,
+    CodingResultUnavailable,
+)
 from devrelay.application.contracts.eligibility import (
     ClaimEligibilityRejected,
     WorkerAuthorityExpired,
@@ -64,6 +68,10 @@ from devrelay.application.tasks import TaskImportRejected
 
 
 class ApiErrorCode(StrEnum):
+    CODING_RESULT_BUSY = "coding_result_busy"
+    CODING_RESULT_UNAVAILABLE = "coding_result_unavailable"
+    CODING_RESULT_REJECTED = "coding_result_rejected"
+    CODING_RESULT_NOT_FOUND = "coding_result_not_found"
     BASE_SOURCE_BUSY = "base_source_busy"
     BASE_SOURCE_UNAVAILABLE = "base_source_unavailable"
     BASE_SOURCE_ACCESS_DENIED = "base_source_access_denied"
@@ -145,7 +153,26 @@ class InvalidWorkerClaimRequest(Exception):
     """The bounded claim body does not satisfy its request schema."""
 
 
+class InvalidWorkerCodingResultRequest(Exception):
+    """The bounded result body does not satisfy its versioned canonical schema."""
+
+
 _ERROR_MAP: dict[type[Exception], tuple[int, ApiErrorCode, str]] = {
+    CodingResultRejected: (
+        409,
+        ApiErrorCode.CODING_RESULT_REJECTED,
+        "Coding result was rejected.",
+    ),
+    CodingResultUnavailable: (
+        503,
+        ApiErrorCode.CODING_RESULT_UNAVAILABLE,
+        "Coding results are unavailable.",
+    ),
+    InvalidWorkerCodingResultRequest: (
+        422,
+        ApiErrorCode.INVALID_REQUEST,
+        "Provide only a valid original coding result request.",
+    ),
     BaseSourceAccessDenied: (
         502,
         ApiErrorCode.BASE_SOURCE_ACCESS_DENIED,

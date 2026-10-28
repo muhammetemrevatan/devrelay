@@ -341,6 +341,8 @@ def make_v5(store: SqliteClaimStore, path: Path) -> None:
         row = connection.execute(
             "SELECT scope,prepared,phase,completed FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE execution_input")
         connection.execute("DROP TABLE workspace_intent")
@@ -392,7 +394,7 @@ def test_valid_v5_upgrade_preserves_ciphertext_ack_and_heartbeat_inputs(
     finally:
         upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
-        assert connection.execute("SELECT version FROM metadata").fetchone() == (7,)
+        assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
         assert (
             tuple(
                 connection.execute("SELECT * FROM " + table).fetchall()
@@ -434,6 +436,8 @@ def test_v6_downgrade_cannot_erase_execution_presence_marker(
         row = connection.execute(
             "SELECT scope,prepared,phase,completed FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE execution_input")
         connection.execute("DROP TABLE workspace_intent")

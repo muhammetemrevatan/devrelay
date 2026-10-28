@@ -24,11 +24,15 @@ from devrelay.application.contracts.worker_recovery import (
 from devrelay.application.contracts.workers import WorkerJournalScope
 from devrelay.application.ports.worker_journal import WorkerStateUnavailable
 from devrelay.infrastructure.worker_state import journal
+from devrelay.infrastructure.worker_state.acknowledgements import (
+    acknowledgement_assignment_integrity,
+)
 from devrelay.infrastructure.worker_state.completions import save_completion
 from devrelay.infrastructure.worker_state.journal import (
     AsyncClaimJournal,
     SqliteClaimStore,
 )
+from devrelay.infrastructure.worker_state.outcomes import assignment_integrity
 from tests.acknowledgement_fixtures import (
     acknowledgement_inputs,
     acknowledgement_intent,
@@ -188,11 +192,17 @@ def test_v3_intent_upgrade_is_atomic_and_preserves_ciphertext_and_pins(
     store: SqliteClaimStore, tmp_path: Path, damage: bool
 ) -> None:
     before = store.load_state()
+    assert before.request and before.assignment and before.acknowledgement
+    marker = acknowledgement_assignment_integrity(
+        store._scope, before.request, before.assignment, before.acknowledgement
+    )
     store.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         scope, prepared, phase, completed = connection.execute(
             "SELECT scope, prepared, phase, completed FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE acknowledgement_completion")
         connection.execute("DROP TABLE heartbeat_input")
@@ -206,9 +216,10 @@ def test_v3_intent_upgrade_is_atomic_and_preserves_ciphertext_and_pins(
             "INSERT INTO metadata VALUES(1,3,?,?,?,?)",
             (scope, prepared, phase, completed),
         )
+        connection.execute("UPDATE assignment SET integrity=?", (marker,))
         rows = tuple(
             connection.execute("SELECT * FROM " + table).fetchall()
-            for table in ("pending_claim", "assignment", "acknowledgement_intent")
+            for table in ("pending_claim", "acknowledgement_intent")
         )
         if damage:
             connection.execute("CREATE TABLE acknowledgement_completion(slot INTEGER)")
@@ -226,12 +237,12 @@ def test_v3_intent_upgrade_is_atomic_and_preserves_ciphertext_and_pins(
             upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         assert connection.execute("SELECT version FROM metadata").fetchone() == (
-            (3,) if damage else (7,)
+            (3,) if damage else (8,)
         )
         assert (
             tuple(
                 connection.execute("SELECT * FROM " + table).fetchall()
-                for table in ("pending_claim", "assignment", "acknowledgement_intent")
+                for table in ("pending_claim", "acknowledgement_intent")
             )
             == rows
         )
@@ -321,11 +332,17 @@ def test_v3_upgrade_preserves_each_existing_recovery_phase(
             ),
         )
     before = local.load_state()
+    marker = None
+    if before.assignment is not None:
+        assert before.request is not None
+        marker = assignment_integrity(scope, before.request, before.assignment)
     local.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         row = connection.execute(
             "SELECT scope, prepared, phase, completed FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE acknowledgement_completion")
         connection.execute("DROP TABLE heartbeat_input")
@@ -336,11 +353,12 @@ def test_v3_upgrade_preserves_each_existing_recovery_phase(
             "CREATE TABLE metadata(slot INTEGER PRIMARY KEY, version INTEGER CHECK(version=3), scope BLOB, prepared INTEGER, phase TEXT, completed INTEGER)"
         )
         connection.execute("INSERT INTO metadata VALUES(1,3,?,?,?,?)", row)
+        if marker is not None:
+            connection.execute("UPDATE assignment SET integrity=?", (marker,))
         rows = tuple(
             connection.execute("SELECT * FROM " + table).fetchall()
             for table in (
                 "pending_claim",
-                "assignment",
                 "completed_no_work",
                 "acknowledgement_intent",
             )
@@ -364,7 +382,6 @@ def test_v3_upgrade_preserves_each_existing_recovery_phase(
                     connection.execute("SELECT * FROM " + table).fetchall()
                     for table in (
                         "pending_claim",
-                        "assignment",
                         "completed_no_work",
                         "acknowledgement_intent",
                     )

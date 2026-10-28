@@ -31,6 +31,7 @@ from devrelay.infrastructure.worker_state.journal import (
     AsyncClaimJournal,
     SqliteClaimStore,
 )
+from devrelay.infrastructure.worker_state.outcomes import assignment_integrity
 from tests.acknowledgement_fixtures import (
     acknowledgement_inputs,
     acknowledgement_intent,
@@ -263,11 +264,19 @@ def test_partial_intent_write_rolls_back_with_assigned_phase(
         ).fetchone() == (0,)
 
 
-def make_v2(path: Path) -> None:
+def make_v2(store: SqliteClaimStore, path: Path) -> None:
+    state = store.load_state()
+    marker = None
+    if state.assignment is not None:
+        assert state.request is not None
+        marker = assignment_integrity(store._scope, state.request, state.assignment)
+    store.close()
     with sqlite3.connect(path / "journal.sqlite3") as connection:
         prepared, phase, completed, scope = connection.execute(
             "SELECT prepared, phase, completed, scope FROM metadata"
         ).fetchone()
+        connection.execute("DROP TABLE coding_result_input")
+        connection.execute("DROP TABLE coding_result_receipts")
         connection.execute("DROP TABLE metadata")
         connection.execute("DROP TABLE acknowledgement_intent")
         connection.execute("DROP TABLE acknowledgement_completion")
@@ -282,6 +291,8 @@ def make_v2(path: Path) -> None:
             "INSERT INTO metadata VALUES(1,2,?,?,?,?)",
             (scope, prepared, phase, completed),
         )
+        if marker is not None:
+            connection.execute("UPDATE assignment SET integrity=?", (marker,))
 
 
 @pytest.mark.parametrize("phase", ["idle", "pending", "assigned", "completed"])
@@ -307,12 +318,11 @@ def test_v2_upgrade_preserves_valid_recovery_rows(tmp_path: Path, phase: str) ->
             ),
         )
     expected = original.load_state()
-    original.close()
-    make_v2(tmp_path)
+    make_v2(original, tmp_path)
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         before = tuple(
             connection.execute("SELECT * FROM " + table).fetchall()
-            for table in ("pending_claim", "assignment", "completed_no_work")
+            for table in ("pending_claim", "completed_no_work")
         )
 
     upgraded = SqliteClaimStore(tmp_path, scope, protector, TestStorage())
@@ -331,10 +341,10 @@ def test_v2_upgrade_preserves_valid_recovery_rows(tmp_path: Path, phase: str) ->
         with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
             after = tuple(
                 connection.execute("SELECT * FROM " + table).fetchall()
-                for table in ("pending_claim", "assignment", "completed_no_work")
+                for table in ("pending_claim", "completed_no_work")
             )
             assert after == before
-            assert connection.execute("SELECT version FROM metadata").fetchone() == (7,)
+            assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
     finally:
         upgraded.close()
 
@@ -350,8 +360,7 @@ def test_failed_v2_upgrade_preserves_old_schema(
     assigned: AssignedJournal, tmp_path: Path, damage: str
 ) -> None:
     store, request, outcome, intent, scope, protector = assigned
-    store.close()
-    make_v2(tmp_path)
+    make_v2(store, tmp_path)
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
         connection.execute(damage)
         before = connection.execute("SELECT * FROM pending_claim").fetchall()

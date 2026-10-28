@@ -32,7 +32,10 @@ class AttemptLeaseAuthorityRecord(Base):
             initially="DEFERRED",
         ),
         CheckConstraint("generation = 1 AND lease_revision > 0 AND receipt_count >= 0"),
-        CheckConstraint("revoked_at IS NULL"),
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= updated_at",
+            name="ck_lease_authority_revocation",
+        ),
         CheckConstraint(
             "current_expires_at > updated_at AND "
             "current_expires_at <= updated_at + interval '300 seconds' AND "

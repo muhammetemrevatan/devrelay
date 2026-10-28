@@ -8,6 +8,7 @@ from devrelay.application.contracts.claims import WorkerClaimRequest
 from devrelay.application.contracts.worker_recovery import WorkerClaimOutcome
 from devrelay.application.contracts.workers import WorkerJournalScope
 from devrelay.application.ports.worker_journal import WorkerStateUnavailable
+from devrelay.infrastructure.worker_state.results import bind_result_integrity
 
 _FAILURE = "Worker recovery journal is unavailable."
 
@@ -150,7 +151,13 @@ def save_acknowledgement(
     )
     connection.execute(
         "UPDATE assignment SET integrity = ? WHERE slot = 1",
-        (acknowledgement_assignment_integrity(scope, request, outcome, intent),),
+        (
+            bind_result_integrity(
+                connection,
+                request,
+                acknowledgement_assignment_integrity(scope, request, outcome, intent),
+            ),
+        ),
     )
     connection.execute(
         "UPDATE metadata SET phase = 'acknowledgement_pending' WHERE slot = 1"
