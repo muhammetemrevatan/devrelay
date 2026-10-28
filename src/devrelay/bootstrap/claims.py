@@ -77,6 +77,8 @@ def _claim_configuration(
         credentials += (settings.job_submission.auth_token,)
     if settings.database is not None:
         credentials += (settings.database.password,)
+    if settings.coding_publication is not None:
+        credentials += (settings.coding_publication.api_token,)
     identities = {
         item.repository_id: item.github_id for item in settings.github.repository_ids
     }

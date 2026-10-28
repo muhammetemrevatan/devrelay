@@ -4,7 +4,12 @@ import json
 import sys
 from dataclasses import dataclass
 from threading import Event, RLock
-from typing import cast
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from devrelay.infrastructure.workspace.windows_candidates import (
+        WindowsCandidateWorkspace,
+    )
 
 from devrelay.application.contracts.base_sources import (
     BaseMaterialization,
@@ -171,6 +176,9 @@ class WindowsWorkspaceReservation:
         self._git_metadata: GitMetadata | None = None
         self._git_preparation: GitWorkspacePreparation | None = None
         self._git_metadata_digest: str | None = None
+        self._editable_workspace: EditableWorkspace | None = None
+        self._candidate_capture_used = False
+        self._candidate_capture: WindowsCandidateWorkspace | None = None
 
     @property
     def binding(self) -> WorkspaceBinding:
@@ -191,6 +199,19 @@ class WindowsWorkspaceReservation:
     @property
     def git_preparation(self) -> GitWorkspacePreparation | None:
         return self._git_preparation
+
+    @property
+    def editable_workspace(self) -> EditableWorkspace | None:
+        return self._editable_workspace
+
+    def prepare_candidate_capture(
+        self, source: GitBaseSourceSnapshot
+    ) -> WindowsCandidateWorkspace:
+        from devrelay.infrastructure.workspace.windows_candidates import (
+            WindowsCandidateWorkspace,
+        )
+
+        return WindowsCandidateWorkspace(self, source)
 
     def seal_materialization(self) -> None:
         self._materialization_sealed.set()
@@ -805,6 +826,7 @@ class WindowsWorkspaceReservation:
                 self._materialization_handles = ()
                 self._git_metadata = None
                 self._git_metadata_digest = None
+                self._editable_workspace = handoff
                 return handoff
             except Exception:
                 self.seal_materialization()
@@ -829,3 +851,5 @@ class WindowsWorkspaceReservation:
                         handles.remove(handle)
             if failed:
                 raise WorkspaceUnavailable(_FAILURE)
+            if self._candidate_capture is not None:
+                self._candidate_capture.clear_source()

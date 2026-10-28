@@ -41,7 +41,25 @@ class DispatchSlotRecord(Base):
         CheckConstraint("name = 'coding'"),
         CheckConstraint("receipt_count >= 0"),
         CheckConstraint("worker_count BETWEEN 0 AND 256"),
-        CheckConstraint("version = receipt_count"),
+        CheckConstraint(
+            "release_count >= 0 AND release_count <= receipt_count",
+            name="ck_dispatch_release_count",
+        ),
+        CheckConstraint(
+            "version = receipt_count + release_count", name="ck_dispatch_slots_version"
+        ),
+        CheckConstraint(
+            "(release_count = 0 AND last_released_result_id IS NULL) OR (release_count > 0 AND last_released_result_id IS NOT NULL)",
+            name="ck_dispatch_slots_release",
+        ),
+        ForeignKeyConstraint(
+            ["last_released_result_id", "release_count"],
+            ["delivery_operations.result_id", "delivery_operations.release_ordinal"],
+            name="fk_dispatch_last_release",
+            deferrable=True,
+            initially="DEFERRED",
+            use_alter=True,
+        ),
         CheckConstraint("worker_count <= receipt_count"),
         CheckConstraint("heartbeat_receipt_count >= 0"),
         ForeignKeyConstraint(["reserved_attempt_id"], ["execution_attempts.id"]),
@@ -52,6 +70,9 @@ class DispatchSlotRecord(Base):
     worker_count: Mapped[int] = mapped_column(BigInteger)
     version: Mapped[int] = mapped_column(BigInteger)
     heartbeat_receipt_count: Mapped[int] = mapped_column(BigInteger, server_default="0")
+
+    release_count: Mapped[int] = mapped_column(BigInteger, server_default="0")
+    last_released_result_id: Mapped[UUID | None] = mapped_column(Uuid)
 
 
 class ExecutionAttemptRecord(Base):
@@ -76,10 +97,12 @@ class ExecutionAttemptRecord(Base):
         CheckConstraint("attempt_number = 1"),
         CheckConstraint("generation = 1"),
         CheckConstraint(
-            "expires_at > issued_at AND revoked_at IS NULL AND ended_at IS NULL "
-            "AND ((status = 'claimed' AND updated_at = issued_at AND acknowledged_at IS NULL) "
-            "OR (status = 'running' AND acknowledged_at IS NOT NULL AND updated_at = acknowledged_at "
-            "AND acknowledged_at >= issued_at AND acknowledged_at < expires_at))",
+            "expires_at > issued_at AND "
+            "((status = 'claimed' AND updated_at = issued_at AND acknowledged_at IS NULL AND revoked_at IS NULL AND ended_at IS NULL) "
+            "OR (acknowledged_at IS NOT NULL AND acknowledged_at >= issued_at AND acknowledged_at < expires_at "
+            "AND updated_at >= acknowledged_at AND ((status IN ('running', 'publishing_pr') AND revoked_at IS NULL AND ended_at IS NULL) "
+            "OR (status = 'succeeded' AND revoked_at IS NOT NULL AND ended_at IS NOT NULL AND revoked_at = ended_at "
+            "AND ended_at = updated_at AND ended_at >= acknowledged_at))))",
             name="ck_execution_attempts_ack_state",
         ),
         Index(

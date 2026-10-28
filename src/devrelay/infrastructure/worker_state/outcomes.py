@@ -34,6 +34,11 @@ from devrelay.infrastructure.worker_state.heartbeats import (
     heartbeat_integrity,
     read_heartbeats,
 )
+from devrelay.infrastructure.worker_state.results import (
+    create_result_schema,
+    require_absent_result,
+    result_integrity,
+)
 from devrelay.infrastructure.worker_state.workspaces import (
     bind_workspace_state,
     create_workspace_schema,
@@ -53,22 +58,24 @@ def _create_metadata(
     phase: str,
     completed: int,
     history_unknown: bool = False,
+    result_unknown: bool = False,
 ) -> None:
     connection.execute("""
       CREATE TABLE metadata (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
-        version INTEGER NOT NULL CHECK (version = 7),
+        version INTEGER NOT NULL CHECK (version = 8),
         scope BLOB NOT NULL CHECK (length(scope) = 32),
         prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
         phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned', 'acknowledgement_pending', 'acknowledged')),
         completed INTEGER NOT NULL CHECK (completed IN (0, 1)),
         workspace_history_unknown INTEGER NOT NULL CHECK (workspace_history_unknown IN (0, 1)),
+        result_history_unknown INTEGER NOT NULL CHECK (result_history_unknown IN (0, 1)),
         CHECK ((phase = 'idle' AND prepared = 0) OR (phase IN ('pending', 'assigned', 'acknowledgement_pending', 'acknowledged') AND prepared = 1))
       )
     """)
     connection.execute(
-        "INSERT INTO metadata VALUES (1, 7, ?, ?, ?, ?, ?)",
-        (scope, prepared, phase, completed, int(history_unknown)),
+        "INSERT INTO metadata VALUES (1, 8, ?, ?, ?, ?, ?, ?)",
+        (scope, prepared, phase, completed, int(history_unknown), int(result_unknown)),
     )
 
 
@@ -92,7 +99,10 @@ def upgrade_outcome_schema(
         prepared=row[0],
         phase=row[1],
         completed=row[2],
-        history_unknown=state.execution is not None,
+        history_unknown=state.workspace_history_unknown
+        if version == (7,)
+        else state.execution is not None,
+        result_unknown=state.execution is not None,
     )
     if version == (2,):
         create_acknowledgement_schema(connection)
@@ -102,12 +112,26 @@ def upgrade_outcome_schema(
         create_heartbeat_schema(connection)
     if version in ((2,), (3,), (4,), (5,)):
         create_execution_schema(connection)
-    create_workspace_schema(connection)
+    if version != (7,):
+        create_workspace_schema(connection)
+    create_result_schema(connection)
     if state.completion is not None:
         if state.request is None or state.assignment is None:
             raise WorkerStateUnavailable(_FAILURE)
         bind_workspace_state(
             connection, scope, state.request, state.assignment, state.completion
+        )
+    elif state.assignment is not None and state.request is not None:
+        marker = (
+            assignment_integrity(scope, state.request, state.assignment)
+            if state.acknowledgement is None
+            else acknowledgement_assignment_integrity(
+                scope, state.request, state.assignment, state.acknowledgement
+            )
+        )
+        connection.execute(
+            "UPDATE assignment SET integrity=? WHERE slot=1",
+            (result_integrity(connection, state.request, marker),),
         )
 
 
@@ -126,6 +150,7 @@ def create_outcome_schema(
     create_heartbeat_schema(connection)
     create_execution_schema(connection)
     create_workspace_schema(connection)
+    create_result_schema(connection)
     connection.execute("""
       CREATE TABLE assignment (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
@@ -185,7 +210,7 @@ def recovery_state(
     ).fetchone()
     if (
         header is None
-        or header[0] not in ((2, 3, 4, 5, 6, 7) if allow_legacy else (7,))
+        or header[0] not in ((2, 3, 4, 5, 6, 7, 8) if allow_legacy else (8,))
         or header[1] != scope.key
     ):
         raise WorkerStateUnavailable(_FAILURE)
@@ -311,6 +336,10 @@ def recovery_state(
                 scope, request, outcome, acknowledgement
             )
         )
+        if header[0] == 8:
+            expected_integrity = result_integrity(
+                connection, request, expected_integrity
+            )
         if (
             type(integrity) is not bytes
             or len(integrity) != 32
@@ -329,6 +358,8 @@ def recovery_state(
             workspace_intent, workspace_completion = read_workspace(
                 connection, execution
             )
+        if header[0] == 8:
+            require_absent_result(connection)
     return WorkerRecoveryState(
         phase=WorkerRecoveryPhase(phase),
         request=request,
@@ -398,6 +429,16 @@ def save_assignment(
         ),
     )
     connection.execute("UPDATE metadata SET phase = 'assigned' WHERE slot = 1")
+    from devrelay.infrastructure.worker_state.results import bind_result_integrity
+
+    connection.execute(
+        "UPDATE assignment SET integrity=? WHERE slot=1",
+        (
+            bind_result_integrity(
+                connection, request, assignment_integrity(scope, request, outcome)
+            ),
+        ),
+    )
 
 
 def save_no_work(

@@ -2,6 +2,7 @@ import asyncio
 from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from functools import partial
 from typing import Annotated, Protocol
 from uuid import UUID
 
@@ -17,6 +18,13 @@ from devrelay.application.contracts.assignment_delivery import AssignmentDeliver
 from devrelay.application.contracts.assignments import ClaimResult
 from devrelay.application.contracts.base_source_delivery import BaseSourceDelivery
 from devrelay.application.contracts.claims import WorkerClaimRequest
+from devrelay.application.contracts.coding_result_receipts import (
+    CodingResultAcceptance,
+    CodingResultStatus,
+)
+from devrelay.application.contracts.coding_result_requests import (
+    WorkerCodingResultRequest,
+)
 from devrelay.application.contracts.heartbeats import HeartbeatRequest, HeartbeatResult
 from devrelay.application.contracts.submissions import (
     SavedJobSubmission,
@@ -55,6 +63,23 @@ type HeartbeatOperation = Callable[
 type BaseSourceOperation = Callable[
     [UUID, WorkerClaimRequest, WorkerAuthorization], Awaitable[BaseSourceDelivery]
 ]
+
+type CodingResultAcceptOperation = Callable[
+    [WorkerCodingResultRequest, WorkerAuthorization], Awaitable[CodingResultAcceptance]
+]
+type CodingResultRecoverOperation = Callable[
+    [WorkerCodingResultRequest, WorkerAuthorization],
+    Awaitable[CodingResultStatus | None],
+]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CodingResultOperations:
+    accept: CodingResultAcceptOperation
+    recover: CodingResultRecoverOperation
+    require_ready: Callable[[], None] | None = None
+
+
 type BaseSourceVerification = Callable[
     [UUID, WorkerClaimRequest, WorkerAuthorization, BaseSourceDelivery], Awaitable[None]
 ]
@@ -169,6 +194,98 @@ class WorkerBaseSourceServices(RequestAdmission):
         finally:
             if future.done() and self._pending_encode is future:
                 self._pending_encode = None
+
+
+@dataclass(slots=True, kw_only=True)
+class WorkerCodingResultServices(RequestAdmission):
+    accept_result: CodingResultAcceptOperation
+    recover_result: CodingResultRecoverOperation
+    request_timeout_seconds: float
+    require_ready: Callable[[], None] | None = None
+    busy_code: ApiErrorCode = ApiErrorCode.CODING_RESULT_BUSY
+    busy_message: str = "Worker coding results are busy."
+    _pending_decode: asyncio.Future[WorkerCodingResultRequest] | None = field(
+        default=None, init=False, repr=False
+    )
+    _closed: bool = field(default=False, init=False, repr=False)
+
+    def _require_admission(self) -> None:
+        if self.require_ready is not None:
+            self.require_ready()
+        if self._closed or (
+            self._pending_decode is not None and not self._pending_decode.done()
+        ):
+            raise api_error(
+                503,
+                self.busy_code,
+                self.busy_message,
+                headers={"Retry-After": "1", "Cache-Control": "no-store"},
+            )
+
+    @contextmanager
+    def admit_request(self) -> Iterator[None]:
+        self._require_admission()
+        with RequestAdmission.admit_request(self):
+            yield
+
+    async def decode(
+        self, body: bytes, *, attempt_id: UUID
+    ) -> WorkerCodingResultRequest:
+        from devrelay.api.errors import InvalidWorkerCodingResultRequest
+        from devrelay.application.contracts.coding_result_wire import (
+            decode_coding_result_request,
+        )
+
+        self._require_admission()
+        future = asyncio.get_running_loop().run_in_executor(
+            None, partial(decode_coding_result_request, body, attempt_id=attempt_id)
+        )
+        self._pending_decode = future
+        future.add_done_callback(
+            lambda done: None if done.cancelled() else done.exception()
+        )
+        try:
+            value = await asyncio.shield(future)
+            if self._closed:
+                raise api_error(
+                    503,
+                    ApiErrorCode.CODING_RESULT_UNAVAILABLE,
+                    "Coding results are unavailable.",
+                )
+            return value
+        except ValueError:
+            raise InvalidWorkerCodingResultRequest from None
+        finally:
+            if future.done() and self._pending_decode is future:
+                self._pending_decode = None
+
+    async def aclose(self) -> None:
+        self._closed = True
+        future = self._pending_decode
+        if future is not None:
+            try:
+                await asyncio.shield(future)
+            except Exception:
+                # A failed decoder is already classified for its request. Close
+                # only settles retained work and never adopts its result.
+                pass
+            finally:
+                if future.done() and self._pending_decode is future:
+                    self._pending_decode = None
+
+
+async def require_worker_coding_result_services(
+    request: Request,
+) -> WorkerCodingResultServices:
+    services = getattr(request.app.state, "worker_coding_result_services", None)
+    if not isinstance(services, WorkerCodingResultServices):
+        raise api_error(
+            503,
+            ApiErrorCode.CODING_RESULT_UNAVAILABLE,
+            "Coding results are unavailable.",
+            headers={"Cache-Control": "no-store"},
+        )
+    return services
 
 
 async def require_worker_base_source_services(

@@ -411,7 +411,7 @@ def test_v1_upgrade_preserves_original_proof_and_identity(
             )
             assert state.request.proof.reveal() == pending.proof.reveal()
         with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
-            assert connection.execute("SELECT version FROM metadata").fetchone() == (7,)
+            assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
             row = connection.execute(
                 "SELECT ciphertext, verifier FROM pending_claim"
             ).fetchone()

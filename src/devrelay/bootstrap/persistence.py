@@ -10,6 +10,7 @@ from devrelay.application.contracts.submissions import RepositoryPolicy
 from devrelay.application.ports.acknowledgement_persistence import AcknowledgementStore
 from devrelay.application.ports.claim_eligibility import QueuedJobReader
 from devrelay.application.ports.claim_persistence import ClaimStore
+from devrelay.application.ports.coding_result_persistence import CodingPublicationStore
 from devrelay.application.ports.heartbeat_persistence import HeartbeatStore
 from devrelay.application.ports.job_persistence import (
     JobBranchReader,
@@ -115,6 +116,19 @@ def acknowledgement_store(
 ) -> AcknowledgementStore:
     return SqlAlchemyClaimStore(
         async_sessionmaker(engine, expire_on_commit=False, autoflush=False), policies
+    )
+
+
+def coding_result_store(
+    engine: AsyncEngine,
+    policies: tuple[RepositoryPolicy, ...],
+) -> CodingPublicationStore:
+    # Keep optional result coordination out of ordinary disabled startup imports.
+    from devrelay.infrastructure.persistence.result_store import SqlAlchemyResultStore
+
+    return SqlAlchemyResultStore(
+        async_sessionmaker(engine, expire_on_commit=False, autoflush=False),
+        policies,
     )
 
 

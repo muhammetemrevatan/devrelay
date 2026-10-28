@@ -187,7 +187,12 @@ def bind_workspace_state(
         recorded,
         workspace_history_unknown(connection),
     )
-    connection.execute("UPDATE assignment SET integrity = ? WHERE slot = 1", (marker,))
+    from devrelay.infrastructure.worker_state.results import bind_result_integrity
+
+    connection.execute(
+        "UPDATE assignment SET integrity = ? WHERE slot = 1",
+        (bind_result_integrity(connection, request, marker),),
+    )
 
 
 def save_workspace_intent(

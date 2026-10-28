@@ -19,6 +19,7 @@ class WorkerSettings(BaseSettings):
     auth_token: SecretStr = Field(min_length=43, max_length=128)
     workspace_root: Path = Path("workspaces")
     poll_interval_seconds: int = Field(default=5, ge=1, le=300)
+    coding_results_enabled: bool = False
 
     @field_validator("auth_token")
     @classmethod

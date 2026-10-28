@@ -3,6 +3,7 @@ from collections.abc import Awaitable, Callable
 from time import monotonic
 from uuid import uuid4
 
+from devrelay.application.candidate_workspaces import PrepareCandidateCapture
 from devrelay.application.contracts.acknowledgements import (
     AcknowledgementResult,
     WorkerAcknowledgementIntent,
@@ -22,6 +23,13 @@ from devrelay.application.contracts.claims import (
     ClaimReplayConflict,
     LeaseProof,
     WorkerClaimRequest,
+)
+from devrelay.application.contracts.coding_result_receipts import (
+    CodingResultAcceptance,
+    CodingResultStatus,
+)
+from devrelay.application.contracts.coding_result_requests import (
+    WorkerCodingResultIntent,
 )
 from devrelay.application.contracts.editable_workspaces import EditableWorkspace
 from devrelay.application.contracts.executions import (
@@ -49,6 +57,8 @@ from devrelay.application.git_workspaces import PrepareMaterializedGit
 from devrelay.application.materialize_base import MaterializeAssignedBase
 from devrelay.application.ports.base_materialization import BaseMaterializationPort
 from devrelay.application.ports.base_source import BaseSourcePort
+from devrelay.application.ports.candidate_workspace import CandidateWorkspacePort
+from devrelay.application.ports.control_coding_results import ControlCodingResultGateway
 from devrelay.application.ports.control_gateway import (
     ControlClaimRejected,
     ControlGateway,
@@ -64,11 +74,13 @@ from devrelay.application.ports.worker_journal import (
     WorkerStateBusy,
     WorkerStateUnavailable,
 )
+from devrelay.application.ports.worker_result_journal import WorkerResultJournal
 from devrelay.application.ports.worker_workspace_journal import WorkerWorkspaceJournal
 from devrelay.application.ports.workspace_reservation import (
     WorkspaceReservationPort,
     WorkspaceUnavailable,
 )
+from devrelay.application.worker_coding_results import WorkerCodingResultExchange
 from devrelay.application.worker_executions import PrepareAssignedExecution
 from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSupervisor
 from devrelay.application.worker_workspaces import (
@@ -95,14 +107,17 @@ class PrepareWorkerClaim:
         heartbeat_journal: WorkerHeartbeatJournal | None = None,
         execution_journal: WorkerExecutionJournal | None = None,
         workspace_journal: WorkerWorkspaceJournal | None = None,
+        result_journal: WorkerResultJournal | None = None,
     ) -> None:
         self._journal = journal
         self._heartbeat_journal = heartbeat_journal
         self._execution_journal = execution_journal
         self._workspace_journal = workspace_journal
+        self._result_journal = result_journal
         self._base_materialization_started = False
         self._editable_handoff_started = False
         self._git_preparation_started = False
+        self._candidate_capture_started = False
 
     async def reserve_workspace(
         self,
@@ -162,6 +177,24 @@ class PrepareWorkerClaim:
             self._workspace_journal, supervisor, workspace, policy
         ).execute(delivery, materialization)
 
+    async def prepare_candidate_capture(
+        self,
+        delivery: AssignmentDelivery,
+        supervisor: HeartbeatSupervisor,
+        workspace: CandidateWorkspacePort,
+        materialization: BaseMaterialization,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> GitWorkspacePreparation:
+        if self._workspace_journal is None:
+            raise WorkerStateUnavailable("Workspace recovery is not configured.")
+        if self._candidate_capture_started:
+            raise WorkspaceUnavailable("Candidate preparation already started.")
+        self._candidate_capture_started = True
+        return await PrepareCandidateCapture(
+            self._workspace_journal, supervisor, workspace, policy
+        ).execute(delivery, materialization)
+
     async def prepare_execution(
         self,
         delivery: AssignmentDelivery,
@@ -203,6 +236,13 @@ class PrepareWorkerClaim:
 
     async def recover(self) -> WorkerRecoveryState:
         return await self._journal.load_state()
+
+    def coding_result_exchange(
+        self, gateway: ControlCodingResultGateway, authorization: WorkerAuthorization
+    ) -> WorkerCodingResultExchange:
+        if self._result_journal is None:
+            raise WorkerStateUnavailable("Coding result recovery is not configured.")
+        return WorkerCodingResultExchange(self._result_journal, gateway, authorization)
 
     async def prepare_heartbeat(
         self, request: WorkerClaimRequest, intent: WorkerHeartbeatIntent
@@ -293,6 +333,7 @@ class RequestWorkerClaim:
         heartbeat_gateway: ControlHeartbeatGateway | None = None,
         monotonic_clock: Callable[[], float] | None = None,
         base_source_binding: BaseSourceBinding | None = None,
+        coding_result_gateway: ControlCodingResultGateway | None = None,
     ) -> None:
         self._preparation = preparation
         self._gateway = gateway
@@ -304,6 +345,33 @@ class RequestWorkerClaim:
         self._heartbeat_observation: WorkerHeartbeatExchange | None = None
         self._supervisor: HeartbeatSupervisor | None = None
         self._base_source_binding = base_source_binding
+        self._coding_result_gateway = coding_result_gateway
+        self._coding_results: WorkerCodingResultExchange | None = None
+
+    def coding_result_exchange(self) -> WorkerCodingResultExchange:
+        if self._coding_result_gateway is None:
+            raise WorkerStateUnavailable("Coding result delivery is not enabled.")
+        if self._coding_results is None:
+            self._coding_results = self._preparation.coding_result_exchange(
+                self._coding_result_gateway, self._authorization
+            )
+        return self._coding_results
+
+    async def submit_coding_result(
+        self, delivery: AssignmentDelivery, candidate: WorkerCodingResultIntent
+    ) -> CodingResultAcceptance:
+        # This separate exchange never occupies the claim/heartbeat lock/client.
+        return await self.coding_result_exchange().submit(
+            delivery, candidate, guard=self.heartbeat_supervisor()
+        )
+
+    async def recover_coding_result(self) -> CodingResultStatus | None:
+        # Historical lookup does not construct or restart heartbeat supervision.
+        return await self.coding_result_exchange().recover()
+
+    async def close_coding_results(self) -> None:
+        if self._coding_results is not None:
+            await self._coding_results.aclose()
 
     async def reserve_workspace(
         self, delivery: AssignmentDelivery, workspace: WorkspaceReservationPort
@@ -379,6 +447,22 @@ class RequestWorkerClaim:
             return await self._preparation.prepare_execution(
                 delivery, self.heartbeat_supervisor(), policy
             )
+
+    async def prepare_candidate_capture(
+        self,
+        delivery: AssignmentDelivery,
+        workspace: CandidateWorkspacePort,
+        materialization: BaseMaterialization,
+        *,
+        policy: BaseMaterializationPolicy = _DEFAULT_MATERIALIZATION_POLICY,
+    ) -> GitWorkspacePreparation:
+        return await self._preparation.prepare_candidate_capture(
+            delivery,
+            self.heartbeat_supervisor(),
+            workspace,
+            materialization,
+            policy=policy,
+        )
 
     async def handoff_materialized_base(
         self,

@@ -111,6 +111,10 @@ class ExecutionAttempt:
 
     Application coordinates this value with Job in one versioned transaction.
     Expiry/revocation alone cannot establish that a worker or child process died.
+    For runtime transitions the caller constructs Lease from the separate current
+    authority row, including its renewed expiry. Historical claim replay retains
+    its original assignment anchors and must not supply that historical Lease as
+    current runtime authority.
     """
 
     id: UUID
@@ -216,6 +220,69 @@ class ExecutionAttempt:
             now=timestamp,
         )
         return replace(self, lease=lease, updated_at=timestamp)
+
+    def accept_coding_result(
+        self,
+        *,
+        worker_id: UUID,
+        generation: int,
+        result_attempt_id: UUID,
+        now: datetime,
+    ) -> ExecutionAttempt:
+        """Accept validated coding/check evidence for this current assignment.
+
+        The trusted caller independently validates the result, candidate and
+        complete check policy, then persists this transition with Job and result
+        evidence atomically. An association UUID is correlation, not that proof.
+        """
+        self._require_open()
+        if self.status is not AttemptStatus.RUNNING:
+            raise InvalidJobTransition("Only running work can accept a coding result.")
+        _uuid(result_attempt_id)
+        if result_attempt_id != self.id:
+            raise StaleAttempt("The coding result must name the current attempt.")
+        timestamp = self._time(now)
+        self.lease.require_authority(
+            worker_id=worker_id, generation=generation, now=timestamp
+        )
+        return replace(self, status=AttemptStatus.PUBLISHING_PR, updated_at=timestamp)
+
+    def complete_publication(
+        self,
+        *,
+        worker_id: UUID,
+        generation: int,
+        published_attempt_id: UUID,
+        stopped_attempt_id: UUID,
+        now: datetime,
+    ) -> ExecutionAttempt:
+        """Complete a verified publication and stopped assignment under authority.
+
+        The caller independently verifies process settlement and exact accepted
+        result/candidate/provider association. IDs bind that evidence to this
+        attempt; they neither verify it nor release a dispatch slot. Persist with
+        Job.record_publication, authority revocation and slot release atomically.
+        Attempt success ends coding; the Job continues at AWAITING_REVIEW. Expired
+        or uncertain publication requires separate trusted reconciliation.
+        """
+        self._require_open()
+        if self.status is not AttemptStatus.PUBLISHING_PR:
+            raise InvalidJobTransition("Only publishing work can complete publication.")
+        _uuid(published_attempt_id)
+        _uuid(stopped_attempt_id)
+        if published_attempt_id != self.id or stopped_attempt_id != self.id:
+            raise StaleAttempt("Publication and stop must name the current attempt.")
+        timestamp = self._time(now)
+        self.lease.require_authority(
+            worker_id=worker_id, generation=generation, now=timestamp
+        )
+        return replace(
+            self,
+            lease=self.lease.revoke(now=timestamp),
+            status=AttemptStatus.SUCCEEDED,
+            updated_at=timestamp,
+            ended_at=timestamp,
+        )
 
     def revoke(self, *, now: datetime) -> ExecutionAttempt:
         self._require_open()

@@ -117,7 +117,7 @@ def test_initial_authority_revision_retains_original_lease() -> None:
     assert initial.current_expires_at == initial.reference.expires_at
 
 
-@pytest.mark.parametrize("change", ["expiry", "update", "revocation"])
+@pytest.mark.parametrize("change", ["expiry", "update"])
 def test_initial_revision_cannot_include_authority_mutation(change: str) -> None:
     observed = observation()
     initial = replace(
@@ -131,11 +131,37 @@ def test_initial_revision_cannot_include_authority_mutation(change: str) -> None
             "current_expires_at": initial.current_expires_at + timedelta(seconds=1)
         },
         "update": {"updated_at": initial.updated_at + timedelta(seconds=1)},
-        "revocation": {"revoked_at": initial.updated_at},
     }
 
     with pytest.raises(ValueError):
         replace(initial, **mutations[change])
+
+
+@pytest.mark.parametrize("revision", [1, 2])
+def test_revocation_preserves_original_or_latest_renewal_fields(revision: int) -> None:
+    original = observation()
+    if revision == 1:
+        original = replace(
+            original,
+            lease_revision=1,
+            updated_at=original.reference.issued_at,
+            current_expires_at=original.reference.expires_at,
+        )
+    revoked = replace(original, revoked_at=original.observed_at)
+    assert revoked.updated_at == original.updated_at
+    assert revoked.lease_revision == original.lease_revision
+    assert revoked.current_expires_at == original.current_expires_at
+    assert revoked.revoked_at is not None
+    assert revoked.revoked_at > revoked.updated_at
+    heartbeat = HeartbeatResult(
+        heartbeat_request_id=UUID(int=4),
+        authority=revoked,
+        renewed=False,
+        stop_required=True,
+    )
+    assert heartbeat.stop_required
+    with pytest.raises(ValueError):
+        replace(heartbeat, stop_required=False)
 
 
 @pytest.mark.parametrize(

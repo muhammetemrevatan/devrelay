@@ -5,6 +5,7 @@ from pydantic import Field, IPvAnyAddress, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from devrelay.config.broker_git import BrokerGitSettings
+from devrelay.config.coding_publication import CodingPublicationSettings
 from devrelay.config.database import DatabaseSettings
 from devrelay.config.github import GitHubSettings
 from devrelay.config.jira import JiraSettings
@@ -15,6 +16,7 @@ from devrelay.config.task_import import TaskImportSettings
 from devrelay.config.worker_authentication import WorkerRegistrationSettings
 from devrelay.config.worker_base_sources import WorkerBaseSourcesSettings
 from devrelay.config.worker_claims import WorkerClaimsSettings
+from devrelay.config.worker_coding_results import WorkerCodingResultsSettings
 
 
 class RuntimeEnvironment(StrEnum):
@@ -45,10 +47,44 @@ class ControlSettings(BaseSettings):
     workers: tuple[WorkerRegistrationSettings, ...] = Field(default=(), max_length=32)
     worker_claims: WorkerClaimsSettings | None = None
     worker_base_sources: WorkerBaseSourcesSettings | None = None
+    worker_coding_results: WorkerCodingResultsSettings | None = None
+    coding_publication: CodingPublicationSettings | None = None
     broker_git: BrokerGitSettings | None = None
 
     @model_validator(mode="after")
+    def require_publication_scope(self) -> ControlSettings:
+        publication = self.coding_publication
+        if publication is None:
+            return self
+        if self.worker_coding_results is None or self.github is None:
+            raise ValueError(
+                "Publication requires explicitly enabled result coordination."
+            )
+        enabled = {repo.repository_id for repo in self.repositories if repo.enabled}
+        if not publication.allowed_repository_ids <= enabled:
+            raise ValueError(
+                "Publication scope must contain only enabled repository policies."
+            )
+        other_secrets = (
+            self.github.api_token,
+            self.jira.api_token if self.jira else None,
+            self.database.password if self.database else None,
+            self.task_import.auth_token if self.task_import else None,
+            self.job_submission.auth_token if self.job_submission else None,
+            *(worker.auth_token for worker in self.workers),
+        )
+        if any(
+            publication.api_token == secret
+            for secret in other_secrets
+            if secret is not None
+        ):
+            raise ValueError("Publication requires a separate server credential.")
+        return self
+
+    @model_validator(mode="after")
     def require_base_source_claims(self) -> ControlSettings:
+        if self.worker_coding_results is not None and self.worker_claims is None:
+            raise ValueError("Worker coding results require explicitly enabled claims.")
         if self.broker_git is not None and self.worker_base_sources is None:
             raise ValueError("Broker Git requires explicitly enabled base delivery.")
         if self.worker_base_sources is not None and self.worker_claims is None:

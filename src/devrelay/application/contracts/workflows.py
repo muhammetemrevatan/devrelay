@@ -11,6 +11,10 @@ class WorkflowEventType(StrEnum):
     SUBMITTED = "submitted"
     CLAIMED = "claimed"
     ACKNOWLEDGED = "acknowledged"
+    TESTED = "tested"
+    REPAIR_REQUESTED = "repair_requested"
+    CHECKS_ACCEPTED = "checks_accepted"
+    PUBLISHED = "published"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

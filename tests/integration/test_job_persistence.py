@@ -575,7 +575,7 @@ def test_workflow_downgrade_refuses_inconsistent_history(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0008_heartbeat_authorities"
+                ).scalar_one() == "0009_coding_results"
                 assert (
                     await connection.execute(
                         text("SELECT count(*) FROM job_workflow_events")
@@ -829,7 +829,7 @@ def test_downgrade_cannot_discard_accepted_provider_bindings(
                     await connection.execute(
                         text("SELECT version_num FROM alembic_version")
                     )
-                ).scalar_one() == "0008_heartbeat_authorities"
+                ).scalar_one() == "0009_coding_results"
 
     run(scenario())
 
