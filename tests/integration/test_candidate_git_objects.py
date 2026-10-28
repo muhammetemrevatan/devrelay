@@ -60,6 +60,9 @@ def test_actual_git_observes_candidate_parent_tree_clean_index_literal_bytes_and
         "GIT_WORK_TREE": str(worktree),
         "GIT_NO_LAZY_FETCH": "1",
     }
+    creation_flags = 0
+    if sys.platform == "win32":
+        creation_flags = subprocess.CREATE_NO_WINDOW
 
     def git(*args: str) -> bytes:
         result = subprocess.run(
@@ -68,7 +71,7 @@ def test_actual_git_observes_candidate_parent_tree_clean_index_literal_bytes_and
             env=env,
             capture_output=True,
             stdin=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=creation_flags,
             timeout=10,
             check=False,
         )
