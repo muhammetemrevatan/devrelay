@@ -40,7 +40,9 @@ def test_kernel_observation_is_independent_and_never_a_readiness_receipt(
         unshare = Unshare()
 
     monkeypatch.setattr(module["ctypes"], "CDLL", lambda *args, **kwargs: Library())
-    assert module["probe"]({"phase": "kernel_namespace"}) == 0
+    result = module["probe"]({"phase": "kernel_namespace"})
+
+    assert result == 0
     value = json.loads(capsys.readouterr().out)
     assert value == expected
     assert "accepted" not in value and "ready" not in value
