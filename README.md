@@ -38,12 +38,13 @@ valid version-1 pending, version-2 recovery and version-3 intent records without
 ciphertext, original request identity or assignment anchors;
 damaged records fail closed. Recorded assignment metadata is authenticated with a
 local proof-bound integrity tag. Acknowledgement completion retains historical
-evidence without launch authority; the worker CLI still validates configuration only. An opt-in claim
+evidence without launch authority. An opt-in claim
 API and bounded worker HTTP adapter now connect durable claims to local recovery.
 An assigned worker can also retrieve its complete immutable task/check inputs
 using the original protected claim proof. Payload reads never claim another Job.
-Live account validation, automatic polling, agent execution, PR publication and
-deployment automation are not implemented yet.
+Explicit one-task Linux execution and scoped result publication are implemented.
+Live account/model acceptance, automatic polling, terminal claim rotation and
+deployment automation remain outstanding.
 
 Control-side claim preparation can now read one scoped queued candidate and
 recheck Jira requirements, current repository policy, numeric repository identity,
@@ -498,15 +499,15 @@ and [approximately 10–16 ms resolution](https://learn.microsoft.com/en-us/wind
 Native tests verify the binding; controlled clock jumps test delayed wake-ups.
 Tests do not suspend the host. Direct application composition must explicitly
 provide a clock with these elapsed-time semantics before creating a supervisor.
-The CLI still validates configuration only. Process containment and Codex execution
-remain separate integrations.
+The explicit Docker consumer below uses this supervisor; heartbeat evidence alone
+does not establish process containment or sandbox isolation.
 
 ## Durable worker execution preparation
 
 The composed worker client exposes explicit `prepare_execution(delivery, policy)`.
 It verifies the delivered definition against the original durable acknowledgement
-and pins one execution UUID with the Codex runtime, restricted Windows execution
-direction and trusted policy digest. A new intent requires fresh matching authority
+and pins one execution UUID with the Codex runtime, selected isolation backend
+and trusted policy digest. A new intent requires fresh matching authority
 from the retained heartbeat supervisor, checked with its shared clock before and
 after journal commit. Preparation never starts supervision or a subprocess.
 
@@ -518,9 +519,9 @@ responses and heartbeat maintenance preserve the execution UUID and policy.
 Recovery returns the original instance and pins even after restart or stop. It is
 historical evidence, never permission to launch or proof that an earlier process
 did not start. Cancellation or expiry during commit can leave a recoverable intent.
-A changed definition or policy cannot replace it. Native process containment,
-credential separation, Git workspace materialization and the Codex launch adapter remain
-required before actual execution. The worker CLI still validates configuration only.
+A changed definition or policy cannot replace it. The Docker consumer below adds
+effective isolation, Git workspace preparation and original-container settlement
+before accepting a real command result.
 
 ## Windows process-scope management
 
@@ -678,8 +679,8 @@ and returns no usable handoff result. Sealing cannot undo already-released guard
 Cleanup preserves filesystem contents, and uncertain work never releases capacity.
 
 This is an explicit same-process transition without journal/schema changes. It
-creates no Git metadata, process, sandbox or restart-reuse permission. The worker
-CLI still checks configuration only; actual Codex/check launch remains disabled.
+creates no Git metadata, process, sandbox or restart-reuse permission. The explicit
+Docker consumer below composes the separate preparation and launch boundaries.
 
 ## Verified shallow Git workspaces
 
@@ -741,8 +742,8 @@ the Job Object and is separate from verified containment evidence.
 
 This bridge does not establish a restricted execution identity, denied secret
 reads or network isolation. It is not composed into worker startup, recovery or
-Codex/check execution. Those integrations require their effective isolation and
-authentication policy; the CLI still checks configuration only.
+Codex/check execution. The Docker consumer below supplies its own isolated runtime
+and never uses this harmless host-command bridge for agent/check execution.
 
 ## Control acknowledgement persistence
 
@@ -883,7 +884,7 @@ definitions are backfilled without changing fingerprints or guessing numeric
 repository identity. The unresolved task/repository guard belongs to the workflow;
 submission responses use its materialized status. Missing or inconsistent
 workflow/history fails closed. Migration 0004 supports queued creation only;
-migration 0006 adds initial claims, while worker execution remains disabled.
+migration 0006 adds initial claims. These migrations do not enable worker execution.
 
 Schema and code must be rolled out together: stop control writers, explicitly
 migrate, deploy the matching code, then restart. Old writers that omit workflow
@@ -894,8 +895,8 @@ explicit trusted observer; the optional GitHub implementation supplies verified
 read-only observations and never a permissive default.
 Import authentication grants import only.
 
-Worker execution is not implemented. Preparation/candidate values
-alone do not start work; submission records a durable Job and opt-in claims
+Preparation/candidate values alone do not start work. The explicit Docker consumer
+below requires separate runtime enablement; submission records a durable Job and opt-in claims
 reserve its initial assignment.
 Repository configuration alone exposes no new route or provider adapter.
 
@@ -1051,9 +1052,81 @@ trusted recovery before normal processing can advance.
 Controlled GitHub transport fixtures and disposable PostgreSQL verify this flow,
 including repair history and response loss for each write kind. They do not
 certify live GitHub byte compatibility or provision a real write credential. The
-native Codex/check consumer, known-stopped failure handling and verified local
-settlement/claim rotation remain separate work; publication configuration alone
+live account/model acceptance, known-stopped failure handling and verified local
+settlement/claim rotation remain separate work. Publication configuration alone
 does not start coding or deployment.
+
+## Windows worker with Linux execution
+
+The explicit `--run-one` path claims at most one task, acknowledges it, maintains
+heartbeats, prepares its broker-delivered Git base and runs bounded coding/check
+cycles in disposable Docker Desktop Linux containers. Windows retains the private
+journal and native candidate handles. Only the task UUID directory is shared;
+checks receive a read-only mount. Each container uses a read-only root, non-root
+user, no added capabilities, no-new-privileges, 2 CPUs, 2 GiB and 128 PIDs.
+The pinned Codex Linux sandbox stays enabled inside the container.
+The host must permit its unprivileged user namespaces; an incompatible kernel or
+AppArmor policy fails readiness. An independent, account-free syscall diagnostic
+distinguishes explicit namespace denial from application failure. CI verifies
+refusal on restricted hosts; positive sandbox tests run only on capable hosts.
+The complete positive suite is also tested on Windows Docker Desktop. No CI host
+policy or container privileges are relaxed to make an incompatible host pass.
+
+Journal version 9 preserves version-8 proof, execution, workspace and result bytes
+while adding the `docker_linux` isolation value; it never repins an old execution.
+
+Build the image and run account-free diagnostics first (PowerShell):
+
+```powershell
+docker build -f Dockerfile.worker -t devrelay-worker:local .
+$workerImage = docker image inspect --format '{{.Id}}' devrelay-worker:local
+devrelay-worker --check-runtime --runtime-image $workerImage
+```
+
+Diagnostics use fake files and a scripted loopback Responses server, with no
+authentication or model request. They test private/auth read and write denial,
+network and parent-process denial, writable coding versus read-only checks,
+project-configuration rejection, command/patch/image tools and bounded JSONL
+completion. Passing diagnostics is not evidence of account/model compatibility.
+
+`DEVRELAY_WORKER_DOCKER_RUNTIME` accepts an explicit JSON object containing
+`image_id` (the immutable `sha256:` ID), optional `auth_volume`, optional `model`,
+`model_calls_enabled` (default false), `coding_timeout_seconds` (default 900) and
+`maximum_runtime_seconds` (default 3600). Only the configured local Docker pipe
+or Unix socket is accepted. No Docker configuration, auth file or environment
+proxy is loaded. Set `DEVRELAY_WORKER_CODING_RESULTS_ENABLED=true`, an absolute
+workspace root and `DEVRELAY_WORKER_COMMIT_AUTHOR_NAME` / `_EMAIL` before running.
+The author identity must be the configured human identity.
+
+Real execution additionally requires separately provisioned authentication in a
+dedicated Docker volume labelled `devrelay.auth=1` and `devrelay.image=<image_id>`,
+and explicit `model_calls_enabled=true`. The worker never copies desktop auth,
+creates a login, provisions a volume or enables model access automatically. The
+auth volume is mounted only for coding and denied to sandboxed tools; checks
+receive no authentication volume and no network. Real login/model acceptance is
+still outstanding.
+
+```powershell
+devrelay-worker --run-one --env-file C:\DevRelay\worker.env --state-directory C:\DevRelayPrivate\worker
+```
+
+The first image supports Linux Python checks beginning with `python`, `python3`,
+`pytest`, `ruff`, `mypy` or `lint-imports`. Check arguments are used exactly as
+accepted by control. Configure cache output under `/tmp` or disable it, such as
+`pytest -p no:cacheprovider` and `ruff --no-cache`. Windows commands and `uv run`
+are rejected rather than translated. Dependencies come from the image; candidate
+packages are built offline into temporary storage and imported from that build.
+The trusted check shim reports actual command settlement separately from sandbox
+startup. Missing executables, namespace failures and signals never become invented
+check exit codes; a genuine exit 125 remains an ordinary failed command.
+
+Containers are observed and removed by their original IDs before a candidate is
+captured or a check result is accepted. Cancellation seals admission and drains
+owned work. A missing/changed owner, lost mutation reply, expired lease or failed
+isolation check retains the coding reservation. Restarting the worker can recover
+an existing result but never launches an existing execution again. Automatic
+failure release, local terminal archival and next-claim rotation remain deferred;
+do not clear the journal or reuse a reserved workspace to work around them.
 
 ## Container
 

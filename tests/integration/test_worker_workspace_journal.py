@@ -394,7 +394,7 @@ def test_v6_upgrade_preserves_all_input_and_marks_legacy_execution_workspace_amb
     finally:
         upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
-        assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
+        assert connection.execute("SELECT version FROM metadata").fetchone() == (9,)
         assert (
             tuple(
                 connection.execute("SELECT * FROM " + table).fetchall()

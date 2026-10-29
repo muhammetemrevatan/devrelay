@@ -1,6 +1,6 @@
 import asyncio
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack, asynccontextmanager
 from pathlib import Path
@@ -39,6 +39,7 @@ async def open_worker_claim_client(
     transport: httpx.AsyncBaseTransport | None = None,
     source_transport: httpx.AsyncBaseTransport | None = None,
     result_transport: httpx.AsyncBaseTransport | None = None,
+    monotonic_clock: Callable[[], float] | None = None,
 ) -> AsyncIterator[RequestWorkerClaim]:
     """Verify control identity before opening its journal; perform no claim on startup."""
     async with httpx.AsyncClient(
@@ -51,7 +52,9 @@ async def open_worker_claim_client(
     ) as client:
         gateway = HttpControlGateway(client)
         authorization = await gateway.identify()
-        clock = await asyncio.to_thread(WindowsLeaseClock)
+        clock = monotonic_clock
+        if clock is None:
+            clock = await asyncio.to_thread(WindowsLeaseClock)
         async with open_worker_journal(
             settings,
             worker_id=authorization.worker_id,
@@ -111,6 +114,53 @@ async def open_worker_claim_client(
 def validate_worker_configuration(env_file: Path | None = None) -> None:
     # Pylance omits _env_file and treats environment-sourced fields as required args.
     WorkerSettings(_env_file=env_file)  # pyright: ignore[reportCallIssue]
+
+
+async def check_worker_runtime(
+    env_file: Path | None = None, image_id: str | None = None
+) -> None:
+    """Model-free diagnostics need no control token or real authentication."""
+    from devrelay.bootstrap.worker_coding import check_runtime
+    from devrelay.config.docker_runtime import (
+        DockerRuntimeSettings,
+        WorkerRuntimeSettings,
+    )
+
+    configured = WorkerRuntimeSettings(_env_file=env_file).docker_runtime
+    if image_id is not None:
+        configured = DockerRuntimeSettings(image_id=image_id)
+    if configured is None:
+        raise WorkerStateUnavailable("Configure a pinned Docker image for diagnostics.")
+    await check_runtime(configured)
+
+
+async def run_worker_once(env_file: Path | None, state_directory: Path) -> str:
+    from devrelay.bootstrap.worker_coding import (
+        check_engine,
+        drain_cleanup,
+        run_claimed_task,
+        validate_run_configuration,
+    )
+    from devrelay.infrastructure.containers import DockerEngine
+    from devrelay.infrastructure.docker_coding import probe_runtime
+
+    settings = WorkerSettings(_env_file=env_file)  # pyright: ignore[reportCallIssue]
+    # Reject disabled real execution before connecting to control or claiming.
+    profile = validate_run_configuration(settings, state_directory)
+    assert settings.docker_runtime is not None
+    clock = await asyncio.to_thread(WindowsLeaseClock)
+    engine = DockerEngine(settings.docker_runtime.endpoint)
+    try:
+        await check_engine(engine, profile)
+        await probe_runtime(engine, profile, clock)
+        async with open_worker_claim_client(
+            settings, state_directory=state_directory, monotonic_clock=clock
+        ) as worker:
+            return await run_claimed_task(
+                worker, settings, state_directory, engine, profile, clock
+            )
+    finally:
+        await drain_cleanup(engine.aclose())
 
 
 @asynccontextmanager

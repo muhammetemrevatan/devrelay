@@ -19,6 +19,7 @@ from devrelay.application.contracts.base_sources import (
     BaseSourceRequest,
     BaseSourceSnapshot,
 )
+from devrelay.application.contracts.candidates import CandidateCommitSpec
 from devrelay.application.contracts.claims import (
     ClaimReplayConflict,
     LeaseProof,
@@ -48,6 +49,9 @@ from devrelay.application.contracts.worker_recovery import (
     WorkerHeartbeatIntent,
     WorkerRecoveryPhase,
     WorkerRecoveryState,
+)
+from devrelay.application.contracts.worker_result_recovery import (
+    WorkerCodingResultState,
 )
 from devrelay.application.contracts.workers import WorkerAuthorization
 from devrelay.application.contracts.workspace_recovery import WorkspaceRecovery
@@ -80,6 +84,7 @@ from devrelay.application.ports.workspace_reservation import (
     WorkspaceReservationPort,
     WorkspaceUnavailable,
 )
+from devrelay.application.worker_coding import RunAssignedCoding
 from devrelay.application.worker_coding_results import WorkerCodingResultExchange
 from devrelay.application.worker_executions import PrepareAssignedExecution
 from devrelay.application.worker_heartbeats import HeartbeatPolicy, HeartbeatSupervisor
@@ -95,6 +100,34 @@ type BaseSourceBinding = Callable[
     [WorkerClaimRequest, WorkerAuthorization, AssignmentDelivery],
     Awaitable[BaseSourcePort],
 ]
+
+
+def _require_new_coding_input(
+    state: WorkerCodingResultState,
+    delivery: AssignmentDelivery,
+    execution: WorkerExecutionIntent,
+    editable: EditableWorkspace,
+) -> None:
+    if not isinstance(state, WorkerCodingResultState):
+        raise WorkerStateUnavailable("Protected coding history is unavailable.")
+    if state.history_unknown or state.intent is not None:
+        raise WorkerStateUnavailable("Retained coding history requires recovery.")
+    state.__post_init__()
+    original = state.original
+    _validate_original_input(original, delivery)
+    editable.__post_init__()
+    intent, completion = original.workspace_intent, original.workspace_completion
+    if (
+        original.execution != execution
+        or original.workspace_history_unknown
+        or intent is None
+        or completion is None
+        or completion.intent != intent
+        or intent.execution != execution
+        or intent.location != editable.location
+        or completion.identity != editable.materialization.reservation.identity
+    ):
+        raise ClaimReplayConflict("Coding changed its protected workspace input.")
 
 
 class PrepareWorkerClaim:
@@ -237,6 +270,19 @@ class PrepareWorkerClaim:
     async def recover(self) -> WorkerRecoveryState:
         return await self._journal.load_state()
 
+    async def require_new_coding_input(
+        self,
+        delivery: AssignmentDelivery,
+        execution: WorkerExecutionIntent,
+        editable: EditableWorkspace,
+    ) -> None:
+        if self._result_journal is None:
+            raise WorkerStateUnavailable("Coding result recovery is not configured.")
+        state = await self._result_journal.load_result_state()
+        await asyncio.to_thread(
+            _require_new_coding_input, state, delivery, execution, editable
+        )
+
     def coding_result_exchange(
         self, gateway: ControlCodingResultGateway, authorization: WorkerAuthorization
     ) -> WorkerCodingResultExchange:
@@ -347,6 +393,7 @@ class RequestWorkerClaim:
         self._base_source_binding = base_source_binding
         self._coding_result_gateway = coding_result_gateway
         self._coding_results: WorkerCodingResultExchange | None = None
+        self._coding_run_started = False
 
     def coding_result_exchange(self) -> WorkerCodingResultExchange:
         if self._coding_result_gateway is None:
@@ -364,6 +411,48 @@ class RequestWorkerClaim:
         return await self.coding_result_exchange().submit(
             delivery, candidate, guard=self.heartbeat_supervisor()
         )
+
+    async def run_coding_result(
+        self,
+        delivery: AssignmentDelivery,
+        runner: RunAssignedCoding,
+        execution: WorkerExecutionIntent,
+        preparation: GitWorkspacePreparation,
+        editable: EditableWorkspace,
+        *,
+        commit: CandidateCommitSpec,
+    ) -> CodingResultAcceptance:
+        """Run one original live capability and durably report its checked result.
+
+        Startup/recovery cannot create the supplied native capabilities. Existing
+        report history must use recovery instead, even when no server receipt is
+        available. This latch never occupies the heartbeat exchange lock.
+        """
+        if self._coding_run_started:
+            raise WorkerStateUnavailable("Coding has already been requested.")
+        self._coding_run_started = True
+        self.coding_result_exchange()
+        if not isinstance(runner, RunAssignedCoding):
+            raise WorkerStateUnavailable("A live coding runner is required.")
+        delivery.__post_init__()
+        reference = delivery.outcome.assignment
+        assert reference is not None
+        guard = self.heartbeat_supervisor()
+        guard.require_current_assignment(reference)
+        await self._preparation.require_new_coding_input(delivery, execution, editable)
+        guard.require_current_assignment(reference)
+        report = await runner.execute(
+            delivery, execution, preparation, editable, commit=commit
+        )
+        guard.require_current_assignment(reference)
+        candidate = await asyncio.to_thread(
+            WorkerCodingResultIntent,
+            result_request_id=uuid4(),
+            execution=execution,
+            result=report,
+        )
+        guard.require_current_assignment(reference)
+        return await self.submit_coding_result(delivery, candidate)
 
     async def recover_coding_result(self) -> CodingResultStatus | None:
         # Historical lookup does not construct or restart heartbeat supervision.

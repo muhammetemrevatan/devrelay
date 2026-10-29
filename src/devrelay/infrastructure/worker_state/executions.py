@@ -28,10 +28,20 @@ def create_execution_schema(connection: sqlite3.Connection) -> None:
             slot INTEGER PRIMARY KEY CHECK(slot = 1),
             execution_id TEXT NOT NULL CHECK(length(execution_id) = 36),
             runtime TEXT NOT NULL CHECK(runtime = 'codex'),
-            isolation TEXT NOT NULL CHECK(isolation = 'windows_restricted'),
+            isolation TEXT NOT NULL CHECK(isolation IN ('windows_restricted', 'docker_linux')),
             policy_digest TEXT NOT NULL CHECK(length(policy_digest) = 64)
         )
     """)
+
+
+def upgrade_execution_schema(connection: sqlite3.Connection) -> None:
+    """Preserve every original execution pin; only admit the new backend value."""
+    connection.execute("ALTER TABLE execution_input RENAME TO execution_input_previous")
+    create_execution_schema(connection)
+    connection.execute(
+        "INSERT INTO execution_input SELECT * FROM execution_input_previous"
+    )
+    connection.execute("DROP TABLE execution_input_previous")
 
 
 def read_execution(

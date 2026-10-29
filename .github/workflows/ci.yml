@@ -94,6 +94,19 @@ jobs:
           docker run --rm --read-only --tmpfs /tmp --cap-drop ALL \
             --security-opt no-new-privileges --entrypoint python devrelay-control:git-ci \
             -c 'import json,os,subprocess; from pathlib import Path; from devrelay.config.broker_git import BrokerGitSettings; from devrelay.infrastructure.github.git_commit_source import BrokerGitPolicy,_verify_profile; value=json.loads(Path("/app/broker-git-profile.json").read_text()); BrokerGitSettings.model_validate(value); value.update(executable=Path(value["executable"]),exec_directory=Path(value["exec_directory"]),private_directory=Path(value["private_directory"])); profile=BrokerGitPolicy(**value); _verify_profile(profile); assert os.geteuid()==10001; assert subprocess.check_output([str(profile.executable),"--version"],text=True).strip()==profile.version'
+      - name: Build pinned Linux worker image
+        run: docker build --file Dockerfile.worker --tag devrelay-worker:ci .
+      - uses: actions/setup-python@v7
+        with:
+          python-version-file: .python-version
+      - name: Install worker test dependencies
+        run: |
+          python -m pip install uv==0.12.24
+          uv sync --locked
+      - name: Verify runtime admission and supported sandbox behavior with fake data
+        run: |
+          export DEVRELAY_TEST_WORKER_IMAGE=$(docker image inspect --format '{{.Id}}' devrelay-worker:ci)
+          uv run --locked python -m pytest -q tests/integration/test_docker_worker_runtime.py
       - name: Show container diagnostics
         if: failure()
         run: docker logs devrelay-control-smoke || true

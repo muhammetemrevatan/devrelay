@@ -2,12 +2,13 @@ from ipaddress import ip_address
 from pathlib import Path
 
 from pydantic import AnyHttpUrl, Field, SecretStr, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import SettingsConfigDict
 
+from devrelay.config.docker_runtime import WorkerRuntimeSettings
 from devrelay.config.security import validate_bearer_token
 
 
-class WorkerSettings(BaseSettings):
+class WorkerSettings(WorkerRuntimeSettings):
     model_config = SettingsConfigDict(
         env_prefix="DEVRELAY_WORKER_",
         extra="ignore",
@@ -20,6 +21,8 @@ class WorkerSettings(BaseSettings):
     workspace_root: Path = Path("workspaces")
     poll_interval_seconds: int = Field(default=5, ge=1, le=300)
     coding_results_enabled: bool = False
+    commit_author_name: str | None = None
+    commit_author_email: str | None = None
 
     @field_validator("auth_token")
     @classmethod

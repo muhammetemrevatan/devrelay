@@ -145,7 +145,9 @@ def bind_result_integrity(
 ) -> bytes:
     version = connection.execute("SELECT version FROM metadata WHERE slot=1").fetchone()
     return (
-        result_integrity(connection, request, previous) if version == (8,) else previous
+        result_integrity(connection, request, previous)
+        if version in ((8,), (9,))
+        else previous
     )
 
 

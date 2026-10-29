@@ -73,10 +73,16 @@ def inputs(store: SqliteClaimStore) -> tuple[WorkerClaimRequest, WorkerExecution
     )
 
 
+@pytest.mark.parametrize("isolation", list(ExecutionIsolation))
 def test_execution_reopens_with_exact_original_identity_policy_and_protected_proof(
-    store: SqliteClaimStore, tmp_path: Path
+    store: SqliteClaimStore,
+    tmp_path: Path,
+    isolation: ExecutionIsolation,
 ) -> None:
     request, candidate = inputs(store)
+    candidate = replace(
+        candidate, policy=replace(candidate.policy, isolation=isolation)
+    )
     before = store.load_state()
     intent = store.get_or_create_execution(request, candidate)
     store.close()
@@ -394,7 +400,7 @@ def test_valid_v5_upgrade_preserves_ciphertext_ack_and_heartbeat_inputs(
     finally:
         upgraded.close()
     with sqlite3.connect(tmp_path / "journal.sqlite3") as connection:
-        assert connection.execute("SELECT version FROM metadata").fetchone() == (8,)
+        assert connection.execute("SELECT version FROM metadata").fetchone() == (9,)
         assert (
             tuple(
                 connection.execute("SELECT * FROM " + table).fetchall()

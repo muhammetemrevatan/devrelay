@@ -13,6 +13,7 @@ class ExecutionRuntime(StrEnum):
 
 class ExecutionIsolation(StrEnum):
     WINDOWS_RESTRICTED = "windows_restricted"
+    DOCKER_LINUX = "docker_linux"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

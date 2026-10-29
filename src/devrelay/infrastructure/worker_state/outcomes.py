@@ -28,6 +28,7 @@ from devrelay.infrastructure.worker_state.executions import (
     create_execution_schema,
     execution_integrity,
     read_execution,
+    upgrade_execution_schema,
 )
 from devrelay.infrastructure.worker_state.heartbeats import (
     create_heartbeat_schema,
@@ -63,7 +64,7 @@ def _create_metadata(
     connection.execute("""
       CREATE TABLE metadata (
         slot INTEGER PRIMARY KEY CHECK (slot = 1),
-        version INTEGER NOT NULL CHECK (version = 8),
+        version INTEGER NOT NULL CHECK (version = 9),
         scope BLOB NOT NULL CHECK (length(scope) = 32),
         prepared INTEGER NOT NULL CHECK (prepared IN (0, 1)),
         phase TEXT NOT NULL CHECK (phase IN ('idle', 'pending', 'assigned', 'acknowledgement_pending', 'acknowledged')),
@@ -74,7 +75,7 @@ def _create_metadata(
       )
     """)
     connection.execute(
-        "INSERT INTO metadata VALUES (1, 8, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO metadata VALUES (1, 9, ?, ?, ?, ?, ?, ?)",
         (scope, prepared, phase, completed, int(history_unknown), int(result_unknown)),
     )
 
@@ -92,6 +93,24 @@ def upgrade_outcome_schema(
     ).fetchone()
     if row is None:
         raise WorkerStateUnavailable(_FAILURE)
+    if version == (8,):
+        flags = connection.execute(
+            "SELECT workspace_history_unknown, result_history_unknown FROM metadata WHERE slot=1"
+        ).fetchone()
+        if flags is None or flags[0] not in (0, 1) or flags[1] not in (0, 1):
+            raise WorkerStateUnavailable(_FAILURE)
+        connection.execute("DROP TABLE metadata")
+        _create_metadata(
+            connection,
+            scope.key,
+            prepared=row[0],
+            phase=row[1],
+            completed=row[2],
+            history_unknown=bool(flags[0]),
+            result_unknown=bool(flags[1]),
+        )
+        upgrade_execution_schema(connection)
+        return
     connection.execute("DROP TABLE metadata")
     _create_metadata(
         connection,
@@ -112,6 +131,8 @@ def upgrade_outcome_schema(
         create_heartbeat_schema(connection)
     if version in ((2,), (3,), (4,), (5,)):
         create_execution_schema(connection)
+    else:
+        upgrade_execution_schema(connection)
     if version != (7,):
         create_workspace_schema(connection)
     create_result_schema(connection)
@@ -210,7 +231,7 @@ def recovery_state(
     ).fetchone()
     if (
         header is None
-        or header[0] not in ((2, 3, 4, 5, 6, 7, 8) if allow_legacy else (8,))
+        or header[0] not in ((2, 3, 4, 5, 6, 7, 8, 9) if allow_legacy else (9,))
         or header[1] != scope.key
     ):
         raise WorkerStateUnavailable(_FAILURE)
@@ -336,7 +357,7 @@ def recovery_state(
                 scope, request, outcome, acknowledgement
             )
         )
-        if header[0] == 8:
+        if header[0] >= 8:
             expected_integrity = result_integrity(
                 connection, request, expected_integrity
             )
@@ -358,7 +379,7 @@ def recovery_state(
             workspace_intent, workspace_completion = read_workspace(
                 connection, execution
             )
-        if header[0] == 8:
+        if header[0] >= 8:
             require_absent_result(connection)
     return WorkerRecoveryState(
         phase=WorkerRecoveryPhase(phase),
