@@ -211,3 +211,53 @@ def test_detached_workspace_values_or_disabled_model_cannot_reach_docker(
             await runtime.aclose()
 
     asyncio.run(scenario())
+
+
+def test_failed_runtime_readiness_never_opens_control_identity_or_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import devrelay.infrastructure.containers as containers
+    import devrelay.infrastructure.docker_coding as docker_coding
+
+    calls: list[str] = []
+    settings = WorkerSettings(
+        control_url="http://127.0.0.1:8000",
+        auth_token=SecretStr("test_only_worker_token_0123456789abcdefghijklmnop"),
+        docker_runtime=DockerRuntimeSettings(
+            image_id=IMAGE, model_calls_enabled=True, auth_volume="fixture"
+        ),
+    )
+    assert settings.docker_runtime is not None
+    profile = worker_coding.runtime_profile(settings.docker_runtime)
+    monkeypatch.setattr(composition, "WorkerSettings", lambda **kwargs: settings)
+    monkeypatch.setattr(composition, "WindowsLeaseClock", lambda: monotonic)
+    monkeypatch.setattr(
+        worker_coding, "validate_run_configuration", lambda *args: profile
+    )
+
+    class Engine:
+        def __init__(self, endpoint: str) -> None:
+            pass
+
+        async def aclose(self) -> None:
+            calls.append("closed")
+
+    async def check(*args: object) -> None:
+        calls.append("engine")
+
+    async def rejected(*args: object) -> None:
+        calls.append("readiness")
+        raise ContainerUnavailable("Required namespaces are unavailable.")
+
+    def unexpected(*args: object, **kwargs: object) -> None:
+        raise AssertionError(
+            "Failed admission must not open control identity or claim."
+        )
+
+    monkeypatch.setattr(containers, "DockerEngine", Engine)
+    monkeypatch.setattr(worker_coding, "check_engine", check)
+    monkeypatch.setattr(docker_coding, "probe_runtime", rejected)
+    monkeypatch.setattr(composition, "open_worker_claim_client", unexpected)
+    with pytest.raises(ContainerUnavailable):
+        asyncio.run(composition.run_worker_once(None, Path("/private")))
+    assert calls == ["engine", "readiness", "closed"]

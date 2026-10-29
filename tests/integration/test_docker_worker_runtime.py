@@ -27,6 +27,7 @@ from devrelay.infrastructure.containers import (
     ContainerUnavailable,
     DockerEngine,
     OwnedContainer,
+    decode_json,
 )
 from devrelay.infrastructure.docker_coding import (
     DockerCodingProfile,
@@ -54,11 +55,69 @@ def engine() -> DockerEngine:
     )
 
 
-def test_pinned_codex_runtime_preflight_without_model() -> None:
+@pytest.fixture(scope="module")
+def namespace_available() -> bool:
+    async def scenario() -> bool:
+        docker = engine()
+        spec = ContainerSpec(
+            image=IMAGE, execution_id=uuid4(), invocation_id=uuid4(), mode="probe"
+        )
+        owned = OwnedContainer(docker, spec, lambda: None, monotonic)
+        try:
+            result = await owned.run(
+                json.dumps(
+                    dict(
+                        version=1,
+                        mode="probe",
+                        execution_id=str(spec.execution_id),
+                        invocation_id=str(spec.invocation_id),
+                        cycle=0,
+                        timeout_seconds=30,
+                        phase="kernel_namespace",
+                    )
+                ).encode(),
+                timeout_seconds=60,
+            )
+            assert result.exit_code == 0, result.stderr
+            value = decode_json(result.stdout)
+            assert value in (
+                {"version": 1, "available": True, "errno": 0},
+                {"version": 1, "available": False, "errno": 1},
+                {"version": 1, "available": False, "errno": 13},
+            )
+            return bool(value["available"])
+        finally:
+            await owned.aclose()
+            await docker.aclose()
+
+    return asyncio.run(scenario())
+
+
+@pytest.fixture
+def supported_runtime(namespace_available: bool) -> None:
+    if not namespace_available:
+        pytest.skip(
+            "Kernel denies required namespaces; fail-closed admission is tested separately."
+        )
+
+
+def test_pinned_runtime_admission_matches_kernel_capability(
+    namespace_available: bool,
+) -> None:
     async def scenario() -> None:
         docker = engine()
         try:
-            await probe_runtime(docker, DockerCodingProfile(image_id=IMAGE), monotonic)
+            if namespace_available:
+                await probe_runtime(
+                    docker, DockerCodingProfile(image_id=IMAGE), monotonic
+                )
+            else:
+                # A denied syscall is observed independently before asserting
+                # refusal. Other failures cannot silently select this branch.
+                with pytest.raises(ContainerUnavailable):
+                    await probe_runtime(
+                        docker, DockerCodingProfile(image_id=IMAGE), monotonic
+                    )
         except ContainerUnavailable as error:
             raise AssertionError(
                 "Local Docker diagnostic transport failure: "
@@ -73,7 +132,9 @@ def test_pinned_codex_runtime_preflight_without_model() -> None:
 @pytest.mark.skipif(
     sys.platform != "win32", reason="Actual Windows native candidate handles."
 )
-def test_actual_frozen_windows_candidate_checked_in_linux() -> None:
+def test_actual_frozen_windows_candidate_checked_in_linux(
+    supported_runtime: None,
+) -> None:
     async def scenario(root: Path) -> None:
         _, delivery, binding, fixture = git_workspace_inputs()
         fixed = CheckPolicy(
@@ -170,7 +231,9 @@ def test_actual_frozen_windows_candidate_checked_in_linux() -> None:
         asyncio.run(scenario(root))
 
 
-def test_fixed_check_imports_actual_candidate_package(tmp_path: Path) -> None:
+def test_fixed_check_imports_actual_candidate_package(
+    tmp_path: Path, supported_runtime: None
+) -> None:
     execution = uuid4()
     workspace = tmp_path / str(execution)
     (workspace / "src" / "probe_candidate").mkdir(parents=True)
@@ -224,7 +287,9 @@ def test_fixed_check_imports_actual_candidate_package(tmp_path: Path) -> None:
     asyncio.run(scenario())
 
 
-def test_cancellation_kills_original_container_with_descendants(tmp_path: Path) -> None:
+def test_cancellation_kills_original_container_with_descendants(
+    tmp_path: Path, supported_runtime: None
+) -> None:
     async def scenario() -> None:
         docker = engine()
         execution = uuid4()
@@ -338,7 +403,10 @@ def test_cancellation_kills_original_container_with_descendants(tmp_path: Path) 
     ],
 )
 def test_actual_check_exit_is_distinct_from_setup_or_signal_failure(
-    tmp_path: Path, argv: list[str], actual_exit: int | None
+    tmp_path: Path,
+    argv: list[str],
+    actual_exit: int | None,
+    supported_runtime: None,
 ) -> None:
     async def scenario() -> None:
         docker = engine()

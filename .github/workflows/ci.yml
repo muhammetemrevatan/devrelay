@@ -52,9 +52,7 @@ jobs:
 
   container:
     needs: checks
-    # The inner sandbox requires unprivileged user namespaces. Keep host policy
-    # intact; Ubuntu 24.04's default AppArmor restriction rejects this backend.
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -105,7 +103,7 @@ jobs:
         run: |
           python -m pip install uv==0.12.24
           uv sync --locked
-      - name: Verify Linux sandbox and container settlement with fake data
+      - name: Verify runtime admission and supported sandbox behavior with fake data
         run: |
           export DEVRELAY_TEST_WORKER_IMAGE=$(docker image inspect --format '{{.Id}}' devrelay-worker:ci)
           uv run --locked python -m pytest -q tests/integration/test_docker_worker_runtime.py

@@ -1066,8 +1066,11 @@ checks receive a read-only mount. Each container uses a read-only root, non-root
 user, no added capabilities, no-new-privileges, 2 CPUs, 2 GiB and 128 PIDs.
 The pinned Codex Linux sandbox stays enabled inside the container.
 The host must permit its unprivileged user namespaces; an incompatible kernel or
-AppArmor policy fails readiness. The container CI job pins Ubuntu 22.04 for this
-capability without changing host security policy or adding container privileges.
+AppArmor policy fails readiness. An independent, account-free syscall diagnostic
+distinguishes explicit namespace denial from application failure. CI verifies
+refusal on restricted hosts; positive sandbox tests run only on capable hosts.
+The complete positive suite is also tested on Windows Docker Desktop. No CI host
+policy or container privileges are relaxed to make an incompatible host pass.
 
 Journal version 9 preserves version-8 proof, execution, workspace and result bytes
 while adding the `docker_linux` isolation value; it never repins an old execution.

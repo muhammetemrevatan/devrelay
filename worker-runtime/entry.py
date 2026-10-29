@@ -1,6 +1,7 @@
 """Fixed container entry; trusted input and OS policy stay outside task control."""
 
 import base64
+import ctypes
 import hashlib
 import json
 import os
@@ -275,6 +276,22 @@ def run_fixed_check(
 
 
 def probe(spec: dict[str, Any]) -> int:
+    if spec["phase"] == "kernel_namespace":
+        # Observe required kernel operations independently of Codex and its
+        # configuration. This diagnostic is never a runtime readiness receipt.
+        unshare = ctypes.CDLL(None, use_errno=True).unshare
+        unshare.argtypes = [ctypes.c_int]
+        unshare.restype = ctypes.c_int
+        for flags in (0x10000000, 0x20000 | 0x20000000 | 0x40000000):
+            result = unshare(flags)  # USER, then MOUNT/PID/NET namespaces.
+            error = ctypes.get_errno() if result == -1 else 0
+            if result not in (0, -1) or (result == -1 and error not in (1, 13)):
+                raise ValueError("Unexpected namespace prerequisite result.")
+            if result == -1:
+                print(json.dumps({"version": 1, "available": False, "errno": error}))
+                return 0
+        print(json.dumps({"version": 1, "available": True, "errno": 0}))
+        return 0
     from probe import hostile_project
 
     marker = hostile_project()
